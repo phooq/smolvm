@@ -1,0 +1,37 @@
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Build artifacts
+*.so
+*.a
+*.dylib
+
+# Distribution build output
+/dist/smolvm-*/
+/dist/*.tar.gz
+
+# Bundled libraries (large binaries - install via Homebrew)
+/lib/
+
+# Helper rootfs (downloaded/generated content)
+/helper-rootfs/rootfs/
+/helper-rootfs/rootfs.tar.gz
+
+# Local config
+.env
+.env.local
+
+# Test artifacts
+/tmp/
+*.log

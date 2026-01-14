@@ -1,0 +1,22 @@
+[package]
+name = "smolvm-helper"
+version = "0.1.0"
+edition = "2021"
+description = "Helper daemon for smolvm (runs inside helper VM)"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "smolvm-helper"
+path = "src/main.rs"
+
+[dependencies]
+smolvm-protocol = { path = "../smolvm-protocol" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+
+# Linux-specific dependencies for vsock
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.27", features = ["socket", "fs"] }

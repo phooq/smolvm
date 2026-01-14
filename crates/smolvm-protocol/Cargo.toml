@@ -1,0 +1,10 @@
+[package]
+name = "smolvm-protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Protocol types for smolvm host-guest communication"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
