@@ -122,6 +122,33 @@ pub enum AgentRequest {
         /// Each tuple is (virtiofs_tag, container_path, read_only).
         #[serde(default)]
         mounts: Vec<(String, String, bool)>,
+        /// Timeout in milliseconds. If the command exceeds this duration,
+        /// it will be killed and return exit code 124.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+        /// Interactive mode - stream I/O instead of buffering.
+        /// When true, output is streamed via Stdout/Stderr responses,
+        /// and stdin can be sent via the Stdin request.
+        #[serde(default)]
+        interactive: bool,
+        /// Allocate a pseudo-TTY for the command.
+        /// Enables terminal features like colors, line editing, and signal handling.
+        #[serde(default)]
+        tty: bool,
+    },
+
+    /// Send stdin data to a running interactive command.
+    Stdin {
+        /// Input data to send to the command's stdin.
+        data: Vec<u8>,
+    },
+
+    /// Resize the PTY window (for TTY mode).
+    Resize {
+        /// New width in columns.
+        cols: u16,
+        /// New height in rows.
+        rows: u16,
     },
 }
 
@@ -163,7 +190,7 @@ pub enum AgentResponse {
         code: Option<String>,
     },
 
-    /// Command execution completed.
+    /// Command execution completed (non-interactive mode).
     Completed {
         /// Exit code from the command.
         exit_code: i32,
@@ -171,6 +198,28 @@ pub enum AgentResponse {
         stdout: String,
         /// Standard error (may be truncated).
         stderr: String,
+    },
+
+    /// Command started (interactive mode).
+    /// Indicates the command is running and ready to receive stdin.
+    Started,
+
+    /// Stdout data from a running command (interactive mode).
+    Stdout {
+        /// Output data.
+        data: Vec<u8>,
+    },
+
+    /// Stderr data from a running command (interactive mode).
+    Stderr {
+        /// Error output data.
+        data: Vec<u8>,
+    },
+
+    /// Command exited (interactive mode).
+    Exited {
+        /// Exit code from the command.
+        exit_code: i32,
     },
 }
 

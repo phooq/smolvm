@@ -264,10 +264,41 @@ impl AgentClient {
         workdir: Option<String>,
         mounts: Vec<(String, String, bool)>,
     ) -> Result<(i32, String, String)> {
-        // Set longer timeout for command execution
-        self.stream
-            .set_read_timeout(Some(Duration::from_secs(3600)))
-            .ok();
+        self.run_with_mounts_and_timeout(image, command, env, workdir, mounts, None)
+    }
+
+    /// Run a command in an image's rootfs with volume mounts and optional timeout.
+    ///
+    /// # Arguments
+    ///
+    /// * `image` - Image reference (must be pulled first)
+    /// * `command` - Command and arguments
+    /// * `env` - Environment variables
+    /// * `workdir` - Working directory inside the rootfs
+    /// * `mounts` - Volume mounts as (virtiofs_tag, container_path, read_only)
+    /// * `timeout` - Optional timeout duration. If exceeded, command is killed with exit code 124.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (exit_code, stdout, stderr)
+    pub fn run_with_mounts_and_timeout(
+        &mut self,
+        image: &str,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        mounts: Vec<(String, String, bool)>,
+        timeout: Option<Duration>,
+    ) -> Result<(i32, String, String)> {
+        // Set socket read timeout based on command timeout (with buffer for response)
+        let socket_timeout = match timeout {
+            Some(t) => t + Duration::from_secs(5), // Add buffer for response
+            None => Duration::from_secs(3600),     // Default 1 hour
+        };
+        self.stream.set_read_timeout(Some(socket_timeout)).ok();
+
+        // Convert timeout to milliseconds for protocol
+        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
 
         let resp = self.request(&AgentRequest::Run {
             image: image.to_string(),
@@ -275,6 +306,9 @@ impl AgentClient {
             env,
             workdir,
             mounts,
+            timeout_ms,
+            interactive: false,
+            tty: false,
         })?;
 
         // Reset timeout
@@ -291,5 +325,130 @@ impl AgentClient {
             AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
             _ => Err(Error::AgentError("unexpected response".into())),
         }
+    }
+
+    /// Run a command interactively with streaming I/O.
+    ///
+    /// This method streams output directly to stdout/stderr and forwards stdin.
+    /// It blocks until the command exits.
+    ///
+    /// # Arguments
+    ///
+    /// * `image` - Image reference (must be pulled first)
+    /// * `command` - Command and arguments
+    /// * `env` - Environment variables
+    /// * `workdir` - Working directory inside the rootfs
+    /// * `mounts` - Volume mounts as (virtiofs_tag, container_path, read_only)
+    /// * `timeout` - Optional timeout duration
+    /// * `tty` - Whether to allocate a PTY
+    ///
+    /// # Returns
+    ///
+    /// The exit code of the command
+    pub fn run_interactive(
+        &mut self,
+        image: &str,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        mounts: Vec<(String, String, bool)>,
+        timeout: Option<Duration>,
+        tty: bool,
+    ) -> Result<i32> {
+        use std::io::{stdout, stderr, Write};
+
+        // Set long socket timeout for interactive sessions
+        self.stream.set_read_timeout(Some(Duration::from_secs(3600))).ok();
+
+        // Convert timeout to milliseconds for protocol
+        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+
+        // Send the run request with interactive mode
+        self.send(&AgentRequest::Run {
+            image: image.to_string(),
+            command,
+            env,
+            workdir,
+            mounts,
+            timeout_ms,
+            interactive: true,
+            tty,
+        })?;
+
+        // Wait for Started response
+        let started = self.receive()?;
+        match started {
+            AgentResponse::Started => {}
+            AgentResponse::Error { message, .. } => {
+                return Err(Error::AgentError(message));
+            }
+            _ => {
+                return Err(Error::AgentError("expected Started response".into()));
+            }
+        }
+
+        // Stream I/O until we get an Exited response
+        loop {
+            let resp = self.receive()?;
+            match resp {
+                AgentResponse::Stdout { data } => {
+                    stdout().write_all(&data)?;
+                    stdout().flush()?;
+                }
+                AgentResponse::Stderr { data } => {
+                    stderr().write_all(&data)?;
+                    stderr().flush()?;
+                }
+                AgentResponse::Exited { exit_code } => {
+                    return Ok(exit_code);
+                }
+                AgentResponse::Error { message, .. } => {
+                    return Err(Error::AgentError(message));
+                }
+                _ => {
+                    // Ignore unexpected responses
+                    tracing::warn!("unexpected response during interactive session");
+                }
+            }
+        }
+    }
+
+    /// Send stdin data to a running interactive command.
+    pub fn send_stdin(&mut self, data: &[u8]) -> Result<()> {
+        self.send(&AgentRequest::Stdin {
+            data: data.to_vec(),
+        })
+    }
+
+    /// Send a window resize event to a running interactive command.
+    pub fn send_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        self.send(&AgentRequest::Resize { cols, rows })
+    }
+
+    /// Low-level send without waiting for response.
+    fn send(&mut self, request: &AgentRequest) -> Result<()> {
+        let json = serde_json::to_vec(request)
+            .map_err(|e| Error::AgentError(format!("serialize error: {}", e)))?;
+        let len = json.len() as u32;
+
+        self.stream.write_all(&len.to_be_bytes())?;
+        self.stream.write_all(&json)?;
+        self.stream.flush()?;
+
+        Ok(())
+    }
+
+    /// Low-level receive a single response.
+    fn receive(&mut self) -> Result<AgentResponse> {
+        let mut header = [0u8; 4];
+        self.stream.read_exact(&mut header)?;
+        let len = u32::from_be_bytes(header) as usize;
+
+        let mut buf = vec![0u8; len];
+        self.stream.read_exact(&mut buf)?;
+
+        let resp: AgentResponse = serde_json::from_slice(&buf)
+            .map_err(|e| Error::AgentError(format!("deserialize error: {}", e)))?;
+        Ok(resp)
     }
 }

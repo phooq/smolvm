@@ -20,6 +20,27 @@ pub const DEFAULT_CPUS: u8 = 1;
 /// Agent VM name.
 pub const AGENT_VM_NAME: &str = "smolvm-agent";
 
+/// TCP port mapping from host to guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortMapping {
+    /// Port on the host.
+    pub host: u16,
+    /// Port inside the guest.
+    pub guest: u16,
+}
+
+impl PortMapping {
+    /// Create a new port mapping.
+    pub fn new(host: u16, guest: u16) -> Self {
+        Self { host, guest }
+    }
+
+    /// Create a port mapping where host and guest ports are the same.
+    pub fn same(port: u16) -> Self {
+        Self { host: port, guest: port }
+    }
+}
+
 /// VM configuration for the agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmResources {

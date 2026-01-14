@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::launcher::{launch_agent_vm, HostMount};
-use super::VmResources;
+use super::{PortMapping, VmResources};
 
 /// State of the agent VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +34,8 @@ struct AgentInner {
     child: Option<ChildProcess>,
     /// Currently configured mounts.
     mounts: Vec<HostMount>,
+    /// Currently configured port mappings.
+    ports: Vec<PortMapping>,
     /// Currently configured VM resources.
     resources: VmResources,
 }
@@ -115,6 +117,7 @@ impl AgentManager {
                 state: AgentState::Stopped,
                 child: None,
                 mounts: Vec::new(),
+                ports: Vec::new(),
                 resources: VmResources::default(),
             })),
         })
@@ -234,20 +237,39 @@ impl AgentManager {
         inner.resources == resources
     }
 
+    /// Check if the given port mappings match the currently running agent's ports.
+    pub fn ports_match(&self, ports: &[PortMapping]) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.ports == ports
+    }
+
     /// Ensure the agent is running with the specified mounts.
     ///
     /// If the agent is running with different mounts, it will be restarted.
     pub fn ensure_running_with_mounts(&self, mounts: Vec<HostMount>) -> Result<()> {
-        self.ensure_running_with_config(mounts, VmResources::default())
+        self.ensure_running_with_full_config(mounts, Vec::new(), VmResources::default())
     }
 
     /// Ensure the agent is running with the specified mounts and resources.
     ///
     /// If the agent is running with different mounts or resources, it will be restarted.
     pub fn ensure_running_with_config(&self, mounts: Vec<HostMount>, resources: VmResources) -> Result<()> {
+        self.ensure_running_with_full_config(mounts, Vec::new(), resources)
+    }
+
+    /// Ensure the agent is running with the specified mounts, ports, and resources.
+    ///
+    /// If the agent is running with different configuration, it will be restarted.
+    pub fn ensure_running_with_full_config(
+        &self,
+        mounts: Vec<HostMount>,
+        ports: Vec<PortMapping>,
+        resources: VmResources,
+    ) -> Result<()> {
         // Check if agent is already running with the same configuration
         if self.try_connect_existing().is_some()
             && self.mounts_match(&mounts)
+            && self.ports_match(&ports)
             && self.resources_match(resources)
         {
             return Ok(());
@@ -257,7 +279,7 @@ impl AgentManager {
         let needs_restart = {
             let inner = self.inner.lock().unwrap();
             inner.state == AgentState::Running
-                && (inner.mounts != mounts || inner.resources != resources)
+                && (inner.mounts != mounts || inner.ports != ports || inner.resources != resources)
         };
 
         if needs_restart {
@@ -266,7 +288,7 @@ impl AgentManager {
         }
 
         // Start with new config
-        self.start_with_config(mounts, resources)
+        self.start_with_full_config(mounts, ports, resources)
     }
 
     /// Ensure the agent is running.
@@ -295,16 +317,26 @@ impl AgentManager {
 
     /// Start the agent VM.
     pub fn start(&self) -> Result<()> {
-        self.start_with_config(Vec::new(), VmResources::default())
+        self.start_with_full_config(Vec::new(), Vec::new(), VmResources::default())
     }
 
     /// Start the agent VM with specified mounts.
     pub fn start_with_mounts(&self, mounts: Vec<HostMount>) -> Result<()> {
-        self.start_with_config(mounts, VmResources::default())
+        self.start_with_full_config(mounts, Vec::new(), VmResources::default())
     }
 
     /// Start the agent VM with specified mounts and resources.
     pub fn start_with_config(&self, mounts: Vec<HostMount>, resources: VmResources) -> Result<()> {
+        self.start_with_full_config(mounts, Vec::new(), resources)
+    }
+
+    /// Start the agent VM with specified mounts, ports, and resources.
+    pub fn start_with_full_config(
+        &self,
+        mounts: Vec<HostMount>,
+        ports: Vec<PortMapping>,
+        resources: VmResources,
+    ) -> Result<()> {
         // Check and update state
         {
             let mut inner = self.inner.lock().unwrap();
@@ -315,6 +347,7 @@ impl AgentManager {
             }
             inner.state = AgentState::Starting;
             inner.mounts = mounts.clone();
+            inner.ports = ports.clone();
             inner.resources = resources;
         }
 
@@ -380,6 +413,7 @@ impl AgentManager {
                     &vsock_socket,
                     console_log.as_deref(),
                     &mounts,
+                    &ports,
                     resources,
                 );
 

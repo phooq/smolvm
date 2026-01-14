@@ -1,9 +1,27 @@
 //! Run command implementation.
 
 use clap::Args;
-use smolvm::agent::{AgentClient, AgentManager, HostMount, VmResources};
+use smolvm::agent::{AgentClient, AgentManager, HostMount, PortMapping, VmResources};
 use smolvm::config::SmolvmConfig;
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// Parse a duration string (e.g., "30s", "5m", "1h").
+fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
+    humantime::parse_duration(s)
+}
+
+/// Parse a port mapping specification (HOST:GUEST or PORT).
+fn parse_port(s: &str) -> Result<PortMapping, String> {
+    if let Some((host, guest)) = s.split_once(':') {
+        let host: u16 = host.parse().map_err(|_| format!("invalid host port: {}", host))?;
+        let guest: u16 = guest.parse().map_err(|_| format!("invalid guest port: {}", guest))?;
+        Ok(PortMapping::new(host, guest))
+    } else {
+        let port: u16 = s.parse().map_err(|_| format!("invalid port: {}", s))?;
+        Ok(PortMapping::same(port))
+    }
+}
 
 /// Parse an environment variable specification (KEY=VALUE).
 fn parse_env_spec(spec: &str) -> Option<(String, String)> {
@@ -52,13 +70,38 @@ pub struct RunCmd {
     #[arg(short = 'v', long = "volume")]
     pub volume: Vec<String>,
 
-    /// Enable network egress (not yet supported in agent mode).
+    /// Enable network egress (auto-enabled when -p is used).
     #[arg(long)]
     pub net: bool,
 
     /// Custom DNS server (requires --net).
     #[arg(long)]
     pub dns: Option<String>,
+
+    /// Port mapping from host to guest (HOST:GUEST or PORT).
+    ///
+    /// Examples: -p 8080:80, -p 3000. Enables network egress automatically.
+    #[arg(short = 'p', long = "port", value_parser = parse_port)]
+    pub port: Vec<PortMapping>,
+
+    /// Timeout for command execution (e.g., "30s", "5m").
+    ///
+    /// If the command exceeds this duration, it will be killed
+    /// and exit with code 124.
+    #[arg(long, value_parser = parse_duration)]
+    pub timeout: Option<std::time::Duration>,
+
+    /// Keep stdin open (interactive mode).
+    ///
+    /// Allows sending input to the container. Combine with -t for a full terminal.
+    #[arg(short = 'i', long)]
+    pub interactive: bool,
+
+    /// Allocate a pseudo-TTY.
+    ///
+    /// Enables terminal features like colors and line editing. Usually combined with -i.
+    #[arg(short = 't', long)]
+    pub tty: bool,
 }
 
 impl RunCmd {
@@ -67,13 +110,11 @@ impl RunCmd {
         use smolvm::Error;
         use std::io::Write;
 
-        // Warn about unsupported options
-        if self.net {
-            eprintln!("Warning: --net is not yet supported in agent mode");
-        }
-
         // Parse volume mounts
         let mounts = self.parse_mounts()?;
+
+        // Get port mappings
+        let ports = self.port.clone();
 
         // Start agent VM
         let manager = AgentManager::default().map_err(|e| {
@@ -85,13 +126,20 @@ impl RunCmd {
             mem: self.memory,
         };
 
-        if !mounts.is_empty() {
-            println!("Starting agent VM with {} mount(s)...", mounts.len());
+        // Show startup message
+        let mount_info = if !mounts.is_empty() {
+            format!(" with {} mount(s)", mounts.len())
         } else {
-            println!("Starting agent VM...");
-        }
+            String::new()
+        };
+        let port_info = if !ports.is_empty() {
+            format!(" and {} port mapping(s)", ports.len())
+        } else {
+            String::new()
+        };
+        println!("Starting agent VM{}{}...", mount_info, port_info);
 
-        manager.ensure_running_with_config(mounts.clone(), resources).map_err(|e| {
+        manager.ensure_running_with_full_config(mounts.clone(), ports, resources).map_err(|e| {
             Error::AgentError(format!("failed to start agent: {}", e))
         })?;
 
@@ -132,25 +180,42 @@ impl RunCmd {
             .collect();
 
         // Run command
-        let (exit_code, stdout, stderr) = client.run_with_mounts(
-            &self.source,
-            command,
-            env,
-            self.workdir.clone(),
-            mount_bindings,
-        )?;
+        let exit_code = if self.interactive || self.tty {
+            // Interactive mode - stream I/O
+            client.run_interactive(
+                &self.source,
+                command,
+                env,
+                self.workdir.clone(),
+                mount_bindings,
+                self.timeout,
+                self.tty,
+            )?
+        } else {
+            // Non-interactive mode - buffer output
+            let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
+                &self.source,
+                command,
+                env,
+                self.workdir.clone(),
+                mount_bindings,
+                self.timeout,
+            )?;
 
-        // Print output
-        if !stdout.is_empty() {
-            print!("{}", stdout);
-        }
-        if !stderr.is_empty() {
-            eprint!("{}", stderr);
-        }
+            // Print output
+            if !stdout.is_empty() {
+                print!("{}", stdout);
+            }
+            if !stderr.is_empty() {
+                eprint!("{}", stderr);
+            }
 
-        // Flush output
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
+            // Flush output
+            let _ = std::io::stdout().flush();
+            let _ = std::io::stderr().flush();
+
+            exit_code
+        };
 
         // Stop the agent VM (ephemeral mode - unlike exec which keeps it running)
         if let Err(e) = manager.stop() {

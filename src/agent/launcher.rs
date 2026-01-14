@@ -10,7 +10,7 @@ use crate::storage::StorageDisk;
 use std::ffi::CString;
 use std::path::Path;
 
-use super::VmResources;
+use super::{PortMapping, VmResources};
 
 // FFI bindings to libkrun
 extern "C" {
@@ -73,6 +73,7 @@ pub fn launch_agent_vm(
     vsock_socket: &Path,
     console_log: Option<&Path>,
     mounts: &[HostMount],
+    port_mappings: &[PortMapping],
     resources: VmResources,
 ) -> Result<()> {
     // Raise file descriptor limits
@@ -102,11 +103,26 @@ pub fn launch_agent_vm(
             return Err(Error::AgentError("failed to set root filesystem".into()));
         }
 
-        // Set empty port map (required by libkrun)
-        let empty_ports: Vec<*const libc::c_char> = vec![std::ptr::null()];
-        if krun_set_port_map(ctx, empty_ports.as_ptr()) < 0 {
+        // Set port map for TCP port forwarding
+        // Format: "host_port:guest_port" null-terminated strings
+        let port_cstrings: Vec<CString> = port_mappings
+            .iter()
+            .map(|p| CString::new(format!("{}:{}", p.host, p.guest)).unwrap())
+            .collect();
+        let mut port_ptrs: Vec<*const libc::c_char> =
+            port_cstrings.iter().map(|s| s.as_ptr()).collect();
+        port_ptrs.push(std::ptr::null()); // Null-terminate the array
+
+        if krun_set_port_map(ctx, port_ptrs.as_ptr()) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::AgentError("failed to set port map".into()));
+        }
+
+        if !port_mappings.is_empty() {
+            tracing::debug!(
+                port_count = port_mappings.len(),
+                "configured port forwarding"
+            );
         }
 
         // Add storage disk

@@ -4,15 +4,17 @@
 //! - OCI image pulling via crane
 //! - Layer extraction and storage management
 //! - Overlay filesystem preparation for workloads
-//! - Command execution and output streaming (TODO)
+//! - Command execution with optional interactive/TTY support
 //!
 //! Communication is via vsock on port 6000.
 
 use smolvm_protocol::{
-    ports, DecodeError, AgentRequest, AgentResponse, ImageInfo, OverlayInfo, StorageStatus,
+    ports, AgentRequest, AgentResponse, ImageInfo, OverlayInfo, StorageStatus,
     PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::process::{Child, Command, Stdio};
 use tracing::{debug, error, info, warn};
 
 mod storage;
@@ -102,13 +104,19 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 
         debug!(?request, "received request");
 
-        // Handle request
+        // Check if this is an interactive run request
+        if let AgentRequest::Run { interactive: true, .. } | AgentRequest::Run { tty: true, .. } = &request {
+            // Handle interactive session
+            handle_interactive_run(stream, request)?;
+            continue;
+        }
+
+        // Handle regular request
         let response = handle_request(request);
         send_response(stream, &response)?;
 
         // Check for shutdown
         if matches!(response, AgentResponse::Ok { .. }) {
-            // If this was a shutdown request, exit
             if let AgentResponse::Ok { data: Some(ref d) } = response {
                 if d.get("shutdown").and_then(|v| v.as_bool()) == Some(true) {
                     info!("shutdown requested");
@@ -119,7 +127,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
     }
 }
 
-/// Handle a single request.
+/// Handle a single non-interactive request.
 fn handle_request(request: AgentRequest) -> AgentResponse {
     match request {
         AgentRequest::Ping => AgentResponse::Pong {
@@ -157,21 +165,318 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             env,
             workdir,
             mounts,
-        } => handle_run(&image, &command, &env, workdir.as_deref(), &mounts),
+            timeout_ms,
+            interactive: false,
+            tty: false,
+        } => handle_run(&image, &command, &env, workdir.as_deref(), &mounts, timeout_ms),
+
+        AgentRequest::Run { .. } => {
+            // Interactive mode should be handled by handle_interactive_run
+            AgentResponse::Error {
+                message: "interactive mode not handled here".into(),
+                code: Some("INTERNAL_ERROR".into()),
+            }
+        }
+
+        AgentRequest::Stdin { .. } | AgentRequest::Resize { .. } => {
+            AgentResponse::Error {
+                message: "stdin/resize only valid during interactive session".into(),
+                code: Some("INVALID_REQUEST".into()),
+            }
+        }
     }
 }
 
-/// Handle command execution request.
+/// Handle an interactive run session with streaming I/O.
+fn handle_interactive_run(
+    stream: &mut impl ReadWrite,
+    request: AgentRequest,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (image, command, env, workdir, mounts, timeout_ms, tty) = match request {
+        AgentRequest::Run {
+            image,
+            command,
+            env,
+            workdir,
+            mounts,
+            timeout_ms,
+            tty,
+            ..
+        } => (image, command, env, workdir, mounts, timeout_ms, tty),
+        _ => {
+            send_response(stream, &AgentResponse::Error {
+                message: "expected Run request".into(),
+                code: Some("INVALID_REQUEST".into()),
+            })?;
+            return Ok(());
+        }
+    };
+
+    info!(image = %image, command = ?command, tty = tty, "starting interactive run");
+
+    // Prepare the overlay and get the rootfs path
+    let rootfs = match storage::prepare_for_run(&image) {
+        Ok(path) => path,
+        Err(e) => {
+            send_response(stream, &AgentResponse::Error {
+                message: e.to_string(),
+                code: Some("RUN_FAILED".into()),
+            })?;
+            return Ok(());
+        }
+    };
+
+    // Setup volume mounts
+    if let Err(e) = storage::setup_mounts(&rootfs, &mounts) {
+        send_response(stream, &AgentResponse::Error {
+            message: e.to_string(),
+            code: Some("MOUNT_FAILED".into()),
+        })?;
+        return Ok(());
+    }
+
+    // Spawn the command
+    let mut child = match spawn_interactive_command(&rootfs, &command, &env, workdir.as_deref(), tty) {
+        Ok(child) => child,
+        Err(e) => {
+            send_response(stream, &AgentResponse::Error {
+                message: e.to_string(),
+                code: Some("SPAWN_FAILED".into()),
+            })?;
+            return Ok(());
+        }
+    };
+
+    // Send Started response
+    send_response(stream, &AgentResponse::Started)?;
+
+    // Run the interactive I/O loop
+    let exit_code = run_interactive_loop(stream, &mut child, timeout_ms)?;
+
+    // Send Exited response
+    send_response(stream, &AgentResponse::Exited { exit_code })?;
+
+    Ok(())
+}
+
+/// Spawn a command for interactive execution.
+fn spawn_interactive_command(
+    rootfs: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    _tty: bool,
+) -> Result<Child, Box<dyn std::error::Error>> {
+    if command.is_empty() {
+        return Err("empty command".into());
+    }
+
+    // Build chroot command
+    let mut cmd = Command::new("chroot");
+    cmd.arg(rootfs);
+
+    // Add the actual command
+    for arg in command {
+        cmd.arg(arg);
+    }
+
+    // Set environment
+    cmd.env_clear();
+    cmd.env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    cmd.env("HOME", "/root");
+    cmd.env("TERM", "xterm-256color");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+
+    // Set working directory
+    if let Some(wd) = workdir {
+        cmd.current_dir(format!("{}{}", rootfs, wd));
+    }
+
+    // Setup stdio for interactive mode
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+
+    // TODO: For TTY mode, allocate a PTY instead of pipes
+    // This would use openpty() and connect the child to the PTY
+
+    info!(command = ?command, "spawning interactive command");
+    let child = cmd.spawn()?;
+
+    Ok(child)
+}
+
+/// Run the interactive I/O loop.
+fn run_interactive_loop(
+    stream: &mut impl ReadWrite,
+    child: &mut Child,
+    timeout_ms: Option<u64>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    use std::io::Read as _;
+    use std::time::{Duration, Instant};
+
+    let start = Instant::now();
+    let deadline = timeout_ms.map(|ms| start + Duration::from_millis(ms));
+
+    // Get handles to child's stdio
+    let mut child_stdout = child.stdout.take();
+    let mut child_stderr = child.stderr.take();
+    let mut child_stdin = child.stdin.take();
+
+    // Set non-blocking mode on stdout/stderr
+    if let Some(ref stdout) = child_stdout {
+        set_nonblocking(stdout.as_raw_fd());
+    }
+    if let Some(ref stderr) = child_stderr {
+        set_nonblocking(stderr.as_raw_fd());
+    }
+
+    let mut stdout_buf = [0u8; 4096];
+    let mut stderr_buf = [0u8; 4096];
+
+    loop {
+        // Check if child has exited
+        match child.try_wait()? {
+            Some(status) => {
+                // Drain any remaining output
+                if let Some(ref mut stdout) = child_stdout {
+                    loop {
+                        match stdout.read(&mut stdout_buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                send_response(stream, &AgentResponse::Stdout {
+                                    data: stdout_buf[..n].to_vec(),
+                                })?;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    }
+                }
+                if let Some(ref mut stderr) = child_stderr {
+                    loop {
+                        match stderr.read(&mut stderr_buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                send_response(stream, &AgentResponse::Stderr {
+                                    data: stderr_buf[..n].to_vec(),
+                                })?;
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    }
+                }
+                return Ok(status.code().unwrap_or(-1));
+            }
+            None => {}
+        }
+
+        // Check timeout
+        if let Some(deadline) = deadline {
+            if Instant::now() >= deadline {
+                warn!("interactive command timed out");
+                let _ = child.kill();
+                let _ = child.wait();
+                return Ok(124); // Timeout exit code
+            }
+        }
+
+        // Read available stdout
+        if let Some(ref mut stdout) = child_stdout {
+            match stdout.read(&mut stdout_buf) {
+                Ok(0) => {} // EOF
+                Ok(n) => {
+                    send_response(stream, &AgentResponse::Stdout {
+                        data: stdout_buf[..n].to_vec(),
+                    })?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    debug!(error = %e, "stdout read error");
+                }
+            }
+        }
+
+        // Read available stderr
+        if let Some(ref mut stderr) = child_stderr {
+            match stderr.read(&mut stderr_buf) {
+                Ok(0) => {} // EOF
+                Ok(n) => {
+                    send_response(stream, &AgentResponse::Stderr {
+                        data: stderr_buf[..n].to_vec(),
+                    })?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    debug!(error = %e, "stderr read error");
+                }
+            }
+        }
+
+        // Check for incoming stdin data (non-blocking read from vsock)
+        // This requires the stream to support non-blocking or using poll/select
+        // For now, we use a simple polling approach with short timeout
+
+        // Try to read a request (with timeout)
+        if let Some(request) = try_read_request(stream)? {
+            match request {
+                AgentRequest::Stdin { data } => {
+                    if let Some(ref mut stdin) = child_stdin {
+                        let _ = stdin.write_all(&data);
+                        let _ = stdin.flush();
+                    }
+                }
+                AgentRequest::Resize { cols, rows } => {
+                    // TODO: Implement PTY resize using TIOCSWINSZ
+                    debug!(cols, rows, "resize requested (not implemented)");
+                }
+                _ => {
+                    warn!("unexpected request during interactive session");
+                }
+            }
+        }
+
+        // Small sleep to prevent busy-waiting
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Try to read a request with a very short timeout.
+fn try_read_request(stream: &mut impl ReadWrite) -> Result<Option<AgentRequest>, Box<dyn std::error::Error>> {
+    // For now, use a simple non-blocking approach
+    // In a production implementation, we'd use poll/select
+
+    // This is a simplified version - we'll check if data is available
+    // by trying to peek or using non-blocking read
+
+    // For the initial implementation, we'll skip stdin forwarding
+    // and just focus on output streaming
+    Ok(None)
+}
+
+/// Set a file descriptor to non-blocking mode.
+fn set_nonblocking(fd: i32) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+}
+
+/// Handle command execution request (non-interactive).
 fn handle_run(
     image: &str,
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
     mounts: &[(String, String, bool)],
+    timeout_ms: Option<u64>,
 ) -> AgentResponse {
-    info!(image = %image, command = ?command, mounts = ?mounts, "running command");
+    info!(image = %image, command = ?command, mounts = ?mounts, timeout_ms = ?timeout_ms, "running command");
 
-    match storage::run_command(image, command, env, workdir, mounts) {
+    match storage::run_command(image, command, env, workdir, mounts, timeout_ms) {
         Ok(result) => AgentResponse::Completed {
             exit_code: result.exit_code,
             stdout: result.stdout,

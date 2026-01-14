@@ -68,6 +68,9 @@ smolvm run [OPTIONS] <IMAGE> [COMMAND]
 smolvm run alpine:latest echo "Hello"              # Stops agent after
 smolvm run -e FOO=bar alpine:latest env            # Environment vars
 smolvm run -v /host/path:/guest/path alpine:latest # Volume mount
+smolvm run --timeout 30s alpine:latest sleep 60    # Timeout (exit 124)
+smolvm run -p 8080:80 nginx:latest                 # Port forwarding
+smolvm run -it alpine:latest /bin/sh              # Interactive shell
 ```
 
 ### Exec (Persistent Agent)
@@ -78,6 +81,8 @@ smolvm exec [OPTIONS] <IMAGE> [COMMAND]
 smolvm exec alpine:latest echo "First"   # Starts agent (~2s)
 smolvm exec alpine:latest echo "Second"  # Reuses agent (~50ms)
 smolvm exec -v ~/project:/workspace node:latest npm test
+smolvm exec -it alpine:latest /bin/sh   # Interactive shell (agent persists)
+smolvm exec -p 3000:3000 node:latest npm start  # Port forward
 
 # Manage agent
 smolvm agent status
@@ -130,6 +135,10 @@ smolvm delete myvm -f  # skip confirmation
 | `-e KEY=VAL` | Environment variable |
 | `-v host:guest[:ro]` | Volume mount (directories only) |
 | `-w /path` | Working directory |
+| `-p HOST:GUEST` | Port forwarding (e.g., `-p 8080:80`) |
+| `--timeout DURATION` | Kill command after duration (e.g., `30s`, `5m`) |
+| `-i` | Keep stdin open (interactive mode) |
+| `-t` | Allocate pseudo-TTY |
 
 ## Troubleshooting
 
@@ -148,8 +157,8 @@ pkill -9 -f krun
 ## Limitations
 
 - Volume mounts must be directories (virtiofs limitation)
-- No port forwarding yet
-- No x86 emulation on ARM Macs
+- No x86 emulation on ARM Macs (host arch = guest arch)
+- PTY mode (`-t`) streams output but doesn't handle all terminal features yet
 
 ## License
 

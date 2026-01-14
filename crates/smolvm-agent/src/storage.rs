@@ -488,6 +488,7 @@ pub fn run_command(
     env: &[(String, String)],
     workdir: Option<&str>,
     mounts: &[(String, String, bool)],
+    timeout_ms: Option<u64>,
 ) -> Result<RunResult> {
     // Use consistent workload ID per image for overlay reuse
     let workload_id = format!("persistent-{}", sanitize_image_name(image));
@@ -500,12 +501,31 @@ pub fn run_command(
     let _mounted_paths = setup_volume_mounts(&overlay.rootfs_path, mounts)?;
 
     // Run the command
-    let result = run_in_chroot(&overlay.rootfs_path, command, env, workdir);
+    let result = run_in_chroot(&overlay.rootfs_path, command, env, workdir, timeout_ms);
 
     // Note: We don't unmount the virtiofs mounts here since they may be reused
     // The mounts will be cleaned up when the overlay is cleaned up or the VM shuts down
 
     result
+}
+
+/// Prepare for running a command - returns the rootfs path.
+/// This is used by interactive mode which spawns the command separately.
+pub fn prepare_for_run(image: &str) -> Result<String> {
+    // Use consistent workload ID per image for overlay reuse
+    let workload_id = format!("persistent-{}", sanitize_image_name(image));
+
+    // Check if overlay is already mounted
+    let overlay = get_or_create_overlay(image, &workload_id)?;
+    debug!(rootfs = %overlay.rootfs_path, "prepared overlay for interactive run");
+
+    Ok(overlay.rootfs_path)
+}
+
+/// Setup volume mounts for a rootfs (public wrapper).
+pub fn setup_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Result<()> {
+    let _mounted_paths = setup_volume_mounts(rootfs, mounts)?;
+    Ok(())
 }
 
 /// Directory where virtiofs mounts are mounted in the guest.
@@ -614,13 +634,21 @@ fn is_mountpoint(path: &Path) -> bool {
     false
 }
 
-/// Run a command inside a chroot.
+/// Exit code used when command is killed due to timeout.
+const TIMEOUT_EXIT_CODE: i32 = 124;
+
+/// Run a command inside a chroot with optional timeout.
 fn run_in_chroot(
     rootfs: &str,
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
+    timeout_ms: Option<u64>,
 ) -> Result<RunResult> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
     if command.is_empty() {
         return Err(StorageError("empty command".into()));
     }
@@ -648,21 +676,76 @@ fn run_in_chroot(
         cmd.current_dir(format!("{}{}", rootfs, wd));
     }
 
-    info!(command = ?command, "executing command in chroot");
+    // Setup stdio for capturing output
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
 
-    let output = cmd.output()?;
+    info!(command = ?command, timeout_ms = ?timeout_ms, "executing command in chroot");
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
+    let mut child = cmd.spawn()?;
+    let start = Instant::now();
 
-    info!(exit_code = exit_code, "command completed");
+    // Calculate timeout deadline
+    let deadline = timeout_ms.map(|ms| start + Duration::from_millis(ms));
 
-    Ok(RunResult {
-        exit_code,
-        stdout,
-        stderr,
-    })
+    // Poll for completion
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                // Process completed - read output
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+
+                if let Some(mut out) = child.stdout.take() {
+                    let _ = out.read_to_string(&mut stdout);
+                }
+                if let Some(mut err) = child.stderr.take() {
+                    let _ = err.read_to_string(&mut stderr);
+                }
+
+                let exit_code = status.code().unwrap_or(-1);
+                info!(exit_code = exit_code, "command completed");
+
+                return Ok(RunResult {
+                    exit_code,
+                    stdout,
+                    stderr,
+                });
+            }
+            None => {
+                // Still running - check timeout
+                if let Some(deadline) = deadline {
+                    if Instant::now() >= deadline {
+                        warn!(timeout_ms = ?timeout_ms, "command timed out, killing process");
+
+                        // Kill the process
+                        let _ = child.kill();
+                        let _ = child.wait(); // Clean up zombie
+
+                        // Collect any partial output
+                        let mut stdout = String::new();
+                        let mut stderr = String::new();
+
+                        if let Some(mut out) = child.stdout.take() {
+                            let _ = out.read_to_string(&mut stdout);
+                        }
+                        if let Some(mut err) = child.stderr.take() {
+                            let _ = err.read_to_string(&mut stderr);
+                        }
+
+                        return Ok(RunResult {
+                            exit_code: TIMEOUT_EXIT_CODE,
+                            stdout,
+                            stderr: format!("{}\ncommand timed out after {}ms", stderr, timeout_ms.unwrap_or(0)),
+                        });
+                    }
+                }
+
+                // Sleep briefly before checking again
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
 }
 
 // ============================================================================
