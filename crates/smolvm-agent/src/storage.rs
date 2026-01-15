@@ -27,7 +27,14 @@ const OVERLAYS_DIR: &str = "overlays";
 
 /// Error type for storage operations.
 #[derive(Debug)]
-pub struct StorageError(String);
+pub struct StorageError(pub(crate) String);
+
+impl StorageError {
+    /// Create a new storage error with the given message.
+    pub fn new(message: impl Into<String>) -> Self {
+        StorageError(message.into())
+    }
+}
 
 impl std::fmt::Display for StorageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

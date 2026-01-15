@@ -157,6 +157,74 @@ pub enum AgentRequest {
         /// New height in rows.
         rows: u16,
     },
+
+    // ========================================================================
+    // Container Lifecycle (Phase 2/3)
+    // ========================================================================
+
+    /// Create a long-running container from an image.
+    ///
+    /// The container is created but not started. Use StartContainer to start it.
+    /// This enables exec'ing into the same container multiple times.
+    CreateContainer {
+        /// Image reference (must be pulled first).
+        image: String,
+        /// Command and arguments to run (e.g., ["sleep", "infinity"]).
+        command: Vec<String>,
+        /// Environment variables.
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        /// Working directory inside the container.
+        workdir: Option<String>,
+        /// Volume mounts (virtiofs_tag, container_path, read_only).
+        #[serde(default)]
+        mounts: Vec<(String, String, bool)>,
+    },
+
+    /// Start a created container.
+    StartContainer {
+        /// Container ID (full or prefix).
+        container_id: String,
+    },
+
+    /// Stop a running container.
+    StopContainer {
+        /// Container ID (full or prefix).
+        container_id: String,
+        /// Timeout in seconds before force killing (default: 10).
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+
+    /// Delete a container.
+    DeleteContainer {
+        /// Container ID (full or prefix).
+        container_id: String,
+        /// Force delete even if running.
+        #[serde(default)]
+        force: bool,
+    },
+
+    /// List all containers.
+    ListContainers,
+
+    /// Execute a command in a running container.
+    ///
+    /// Unlike Run, this executes in an existing container created with CreateContainer.
+    Exec {
+        /// Container ID (full or prefix).
+        container_id: String,
+        /// Command and arguments to execute.
+        command: Vec<String>,
+        /// Environment variables for this exec.
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        /// Working directory for this exec.
+        workdir: Option<String>,
+        /// Timeout in milliseconds.
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
 }
 
 /// Agent response types.
@@ -284,6 +352,21 @@ pub struct StorageStatus {
     pub layer_count: usize,
     /// Number of cached images.
     pub image_count: usize,
+}
+
+/// Container information returned by ListContainers/CreateContainer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerInfo {
+    /// Unique container ID.
+    pub id: String,
+    /// Image the container was created from.
+    pub image: String,
+    /// Current container state (created, running, stopped).
+    pub state: String,
+    /// Creation timestamp (Unix epoch seconds).
+    pub created_at: u64,
+    /// Command the container is running.
+    pub command: Vec<String>,
 }
 
 // ============================================================================

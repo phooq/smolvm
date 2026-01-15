@@ -9,7 +9,7 @@
 //! Communication is via vsock on port 6000.
 
 use smolvm_protocol::{
-    ports, AgentRequest, AgentResponse, ImageInfo, OverlayInfo, StorageStatus,
+    ports, AgentRequest, AgentResponse, ContainerInfo, ImageInfo, OverlayInfo, StorageStatus,
     PROTOCOL_VERSION,
 };
 use std::io::{Read, Write};
@@ -17,6 +17,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::process::{Child, Command, Stdio};
 use tracing::{debug, error, info, warn};
 
+mod container;
 mod oci;
 mod storage;
 mod vsock;
@@ -243,6 +244,36 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
                 code: Some("INVALID_REQUEST".into()),
             }
         }
+
+        // Container lifecycle (Phase 2/3)
+        AgentRequest::CreateContainer {
+            image,
+            command,
+            env,
+            workdir,
+            mounts,
+        } => handle_create_container(&image, &command, &env, workdir.as_deref(), &mounts),
+
+        AgentRequest::StartContainer { container_id } => handle_start_container(&container_id),
+
+        AgentRequest::StopContainer {
+            container_id,
+            timeout_secs,
+        } => handle_stop_container(&container_id, timeout_secs.unwrap_or(10)),
+
+        AgentRequest::DeleteContainer { container_id, force } => {
+            handle_delete_container(&container_id, force)
+        }
+
+        AgentRequest::ListContainers => handle_list_containers(),
+
+        AgentRequest::Exec {
+            container_id,
+            command,
+            env,
+            workdir,
+            timeout_ms,
+        } => handle_exec(&container_id, &command, &env, workdir.as_deref(), timeout_ms),
     }
 }
 
@@ -864,6 +895,124 @@ fn handle_storage_status() -> AgentResponse {
         Err(e) => AgentResponse::Error {
             message: e.to_string(),
             code: Some("STATUS_FAILED".to_string()),
+        },
+    }
+}
+
+// ============================================================================
+// Container Lifecycle Handlers (Phase 2/3)
+// ============================================================================
+
+fn handle_create_container(
+    image: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    mounts: &[(String, String, bool)],
+) -> AgentResponse {
+    info!(image = %image, command = ?command, "creating container");
+
+    match container::create_container(image, command, env, workdir, mounts) {
+        Ok(info) => {
+            // Also start the container immediately
+            if let Err(e) = container::start_container(&info.id) {
+                warn!(error = %e, "failed to start container after create");
+                return AgentResponse::Error {
+                    message: format!("container created but failed to start: {}", e),
+                    code: Some("START_FAILED".to_string()),
+                };
+            }
+
+            AgentResponse::Ok {
+                data: Some(serde_json::to_value(ContainerInfo {
+                    id: info.id,
+                    image: info.image,
+                    state: "running".to_string(),
+                    created_at: info.created_at,
+                    command: info.command,
+                })
+                .unwrap()),
+            }
+        }
+        Err(e) => AgentResponse::Error {
+            message: e.to_string(),
+            code: Some("CREATE_FAILED".to_string()),
+        },
+    }
+}
+
+fn handle_start_container(container_id: &str) -> AgentResponse {
+    info!(container_id = %container_id, "starting container");
+
+    match container::start_container(container_id) {
+        Ok(()) => AgentResponse::Ok { data: None },
+        Err(e) => AgentResponse::Error {
+            message: e.to_string(),
+            code: Some("START_FAILED".to_string()),
+        },
+    }
+}
+
+fn handle_stop_container(container_id: &str, timeout_secs: u64) -> AgentResponse {
+    info!(container_id = %container_id, timeout_secs = timeout_secs, "stopping container");
+
+    match container::stop_container(container_id, timeout_secs) {
+        Ok(()) => AgentResponse::Ok { data: None },
+        Err(e) => AgentResponse::Error {
+            message: e.to_string(),
+            code: Some("STOP_FAILED".to_string()),
+        },
+    }
+}
+
+fn handle_delete_container(container_id: &str, force: bool) -> AgentResponse {
+    info!(container_id = %container_id, force = force, "deleting container");
+
+    match container::delete_container(container_id, force) {
+        Ok(()) => AgentResponse::Ok { data: None },
+        Err(e) => AgentResponse::Error {
+            message: e.to_string(),
+            code: Some("DELETE_FAILED".to_string()),
+        },
+    }
+}
+
+fn handle_list_containers() -> AgentResponse {
+    let containers = container::list_containers();
+    let infos: Vec<ContainerInfo> = containers
+        .into_iter()
+        .map(|c| ContainerInfo {
+            id: c.id,
+            image: c.image,
+            state: c.state.to_string(),
+            created_at: c.created_at,
+            command: c.command,
+        })
+        .collect();
+
+    AgentResponse::Ok {
+        data: Some(serde_json::to_value(infos).unwrap()),
+    }
+}
+
+fn handle_exec(
+    container_id: &str,
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    timeout_ms: Option<u64>,
+) -> AgentResponse {
+    info!(container_id = %container_id, command = ?command, "executing in container");
+
+    match container::exec_in_container(container_id, command, env, workdir, timeout_ms) {
+        Ok(result) => AgentResponse::Completed {
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+        },
+        Err(e) => AgentResponse::Error {
+            message: e.to_string(),
+            code: Some("EXEC_FAILED".to_string()),
         },
     }
 }

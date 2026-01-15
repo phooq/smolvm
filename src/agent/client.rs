@@ -5,7 +5,8 @@
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    encode_message, AgentRequest, AgentResponse, ImageInfo, OverlayInfo, StorageStatus,
+    encode_message, AgentRequest, AgentResponse, ContainerInfo, ImageInfo, OverlayInfo,
+    StorageStatus,
 };
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -437,6 +438,171 @@ impl AgentClient {
     /// Send a window resize event to a running interactive command.
     pub fn send_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
         self.send(&AgentRequest::Resize { cols, rows })
+    }
+
+    // ========================================================================
+    // Container Lifecycle (Phase 2/3)
+    // ========================================================================
+
+    /// Create a long-running container from an image.
+    ///
+    /// The container is created and started, ready for exec.
+    ///
+    /// # Arguments
+    ///
+    /// * `image` - Image reference (must be pulled first)
+    /// * `command` - Command to run (e.g., ["sleep", "infinity"])
+    /// * `env` - Environment variables
+    /// * `workdir` - Working directory inside the container
+    /// * `mounts` - Volume mounts as (virtiofs_tag, container_path, read_only)
+    ///
+    /// # Returns
+    ///
+    /// ContainerInfo with the container ID
+    pub fn create_container(
+        &mut self,
+        image: &str,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        mounts: Vec<(String, String, bool)>,
+    ) -> Result<ContainerInfo> {
+        let resp = self.request(&AgentRequest::CreateContainer {
+            image: image.to_string(),
+            command,
+            env,
+            workdir,
+            mounts,
+        })?;
+
+        match resp {
+            AgentResponse::Ok { data: Some(data) } => {
+                serde_json::from_value(data).map_err(|e| Error::AgentError(e.to_string()))
+            }
+            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
+            _ => Err(Error::AgentError("unexpected response".into())),
+        }
+    }
+
+    /// Start a created container.
+    pub fn start_container(&mut self, container_id: &str) -> Result<()> {
+        let resp = self.request(&AgentRequest::StartContainer {
+            container_id: container_id.to_string(),
+        })?;
+
+        match resp {
+            AgentResponse::Ok { .. } => Ok(()),
+            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
+            _ => Err(Error::AgentError("unexpected response".into())),
+        }
+    }
+
+    /// Stop a running container.
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - Container ID (full or prefix)
+    /// * `timeout_secs` - Timeout before force kill (default: 10)
+    pub fn stop_container(&mut self, container_id: &str, timeout_secs: Option<u64>) -> Result<()> {
+        let resp = self.request(&AgentRequest::StopContainer {
+            container_id: container_id.to_string(),
+            timeout_secs,
+        })?;
+
+        match resp {
+            AgentResponse::Ok { .. } => Ok(()),
+            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
+            _ => Err(Error::AgentError("unexpected response".into())),
+        }
+    }
+
+    /// Delete a container.
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - Container ID (full or prefix)
+    /// * `force` - Force delete even if running
+    pub fn delete_container(&mut self, container_id: &str, force: bool) -> Result<()> {
+        let resp = self.request(&AgentRequest::DeleteContainer {
+            container_id: container_id.to_string(),
+            force,
+        })?;
+
+        match resp {
+            AgentResponse::Ok { .. } => Ok(()),
+            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
+            _ => Err(Error::AgentError("unexpected response".into())),
+        }
+    }
+
+    /// List all containers.
+    pub fn list_containers(&mut self) -> Result<Vec<ContainerInfo>> {
+        let resp = self.request(&AgentRequest::ListContainers)?;
+
+        match resp {
+            AgentResponse::Ok { data: Some(data) } => {
+                serde_json::from_value(data).map_err(|e| Error::AgentError(e.to_string()))
+            }
+            AgentResponse::Ok { data: None } => Ok(Vec::new()),
+            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
+            _ => Err(Error::AgentError("unexpected response".into())),
+        }
+    }
+
+    /// Execute a command in a running container.
+    ///
+    /// Unlike `run`, this executes in an existing container created with `create_container`.
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - Container ID (full or prefix)
+    /// * `command` - Command and arguments to execute
+    /// * `env` - Environment variables for this exec
+    /// * `workdir` - Working directory for this exec
+    /// * `timeout` - Optional timeout duration
+    ///
+    /// # Returns
+    ///
+    /// A tuple of (exit_code, stdout, stderr)
+    pub fn exec(
+        &mut self,
+        container_id: &str,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+    ) -> Result<(i32, String, String)> {
+        // Set socket read timeout based on command timeout (with buffer for response)
+        let socket_timeout = match timeout {
+            Some(t) => t + Duration::from_secs(5),
+            None => Duration::from_secs(3600),
+        };
+        self.stream.set_read_timeout(Some(socket_timeout)).ok();
+
+        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+
+        let resp = self.request(&AgentRequest::Exec {
+            container_id: container_id.to_string(),
+            command,
+            env,
+            workdir,
+            timeout_ms,
+        })?;
+
+        // Reset timeout
+        self.stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .ok();
+
+        match resp {
+            AgentResponse::Completed {
+                exit_code,
+                stdout,
+                stderr,
+            } => Ok((exit_code, stdout, stderr)),
+            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
+            _ => Err(Error::AgentError("unexpected response".into())),
+        }
     }
 
     /// Low-level send without waiting for response.
