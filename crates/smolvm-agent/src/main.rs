@@ -1049,7 +1049,8 @@ fn handle_vm_exec(
     };
 
     // Handle timeout
-    let deadline = timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
+    let deadline =
+        timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
 
     loop {
         // Check if process has exited
@@ -1138,7 +1139,8 @@ fn handle_interactive_vm_exec(
     }
 
     // Spawn the command directly
-    let mut child = match spawn_direct_interactive_command(&command, &env, workdir.as_deref(), tty) {
+    let mut child = match spawn_direct_interactive_command(&command, &env, workdir.as_deref(), tty)
+    {
         Ok(child) => child,
         Err(e) => {
             send_response(
