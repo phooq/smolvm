@@ -6,7 +6,7 @@
 use crate::error::{Error, Result};
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, ContainerInfo, ImageInfo, OverlayInfo,
-    StorageStatus,
+    StorageStatus, MAX_FRAME_SIZE,
 };
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
@@ -60,6 +60,14 @@ impl AgentClient {
             .map_err(|e| Error::AgentError(format!("read header failed: {}", e)))?;
 
         let len = u32::from_be_bytes(header) as usize;
+
+        // Validate frame size to prevent OOM from malicious/buggy responses
+        if len > MAX_FRAME_SIZE as usize {
+            return Err(Error::AgentError(format!(
+                "frame too large: {} bytes (max: {} bytes)",
+                len, MAX_FRAME_SIZE
+            )));
+        }
 
         // Read payload
         let mut buf = vec![0u8; len];
@@ -735,6 +743,8 @@ impl AgentClient {
             env,
             workdir,
             timeout_ms,
+            interactive: false,
+            tty: false,
         })?;
 
         // Reset timeout
@@ -750,6 +760,90 @@ impl AgentClient {
             } => Ok((exit_code, stdout, stderr)),
             AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
             _ => Err(Error::AgentError("unexpected response".into())),
+        }
+    }
+
+    /// Execute a command interactively in a running container with streaming I/O.
+    ///
+    /// This method streams output directly to stdout/stderr.
+    /// It blocks until the command exits.
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - Container ID (full or prefix)
+    /// * `command` - Command and arguments to execute
+    /// * `env` - Environment variables for this exec
+    /// * `workdir` - Working directory for this exec
+    /// * `timeout` - Optional timeout duration
+    /// * `tty` - Whether to allocate a PTY
+    ///
+    /// # Returns
+    ///
+    /// The exit code of the command
+    pub fn exec_interactive(
+        &mut self,
+        container_id: &str,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+        tty: bool,
+    ) -> Result<i32> {
+        use std::io::{stderr, stdout, Write};
+
+        // Set long socket timeout for interactive sessions
+        if let Err(e) = self.stream.set_read_timeout(Some(Duration::from_secs(3600))) {
+            tracing::warn!(error = %e, "failed to set socket read timeout for interactive session");
+        }
+
+        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+
+        // Send the exec request with interactive mode
+        self.send(&AgentRequest::Exec {
+            container_id: container_id.to_string(),
+            command,
+            env,
+            workdir,
+            timeout_ms,
+            interactive: true,
+            tty,
+        })?;
+
+        // Wait for Started response
+        let started = self.receive()?;
+        match started {
+            AgentResponse::Started => {}
+            AgentResponse::Error { message, .. } => {
+                return Err(Error::AgentError(message));
+            }
+            _ => {
+                return Err(Error::AgentError("expected Started response".into()));
+            }
+        }
+
+        // Stream I/O until we get an Exited response
+        loop {
+            let resp = self.receive()?;
+            match resp {
+                AgentResponse::Stdout { data } => {
+                    stdout().write_all(&data)?;
+                    stdout().flush()?;
+                }
+                AgentResponse::Stderr { data } => {
+                    stderr().write_all(&data)?;
+                    stderr().flush()?;
+                }
+                AgentResponse::Exited { exit_code } => {
+                    return Ok(exit_code);
+                }
+                AgentResponse::Error { message, .. } => {
+                    return Err(Error::AgentError(message));
+                }
+                _ => {
+                    // Ignore unexpected responses
+                    tracing::warn!("unexpected response during interactive container exec session");
+                }
+            }
         }
     }
 
@@ -771,6 +865,14 @@ impl AgentClient {
         let mut header = [0u8; 4];
         self.stream.read_exact(&mut header)?;
         let len = u32::from_be_bytes(header) as usize;
+
+        // Validate frame size to prevent OOM from malicious/buggy responses
+        if len > MAX_FRAME_SIZE as usize {
+            return Err(Error::AgentError(format!(
+                "frame too large: {} bytes (max: {} bytes)",
+                len, MAX_FRAME_SIZE
+            )));
+        }
 
         let mut buf = vec![0u8; len];
         self.stream.read_exact(&mut buf)?;
