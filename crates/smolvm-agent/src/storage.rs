@@ -7,14 +7,14 @@
 //! - Overlay filesystem management
 //! - Container execution via crun OCI runtime
 
+use crate::crun::CrunCommand;
 use crate::oci::{generate_container_id, OciSpec};
+use crate::paths;
+use crate::process::{wait_with_timeout_and_cleanup, WaitResult, TIMEOUT_EXIT_CODE};
 use smolvm_protocol::{ImageInfo, OverlayInfo, StorageStatus};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tracing::{debug, info, warn};
-
-/// Path to crun binary (static build on Alpine).
-const CRUN_PATH: &str = "/usr/bin/crun";
 
 /// Storage root path (where the ext4 disk is mounted).
 const STORAGE_ROOT: &str = "/storage";
@@ -53,50 +53,147 @@ impl From<std::io::Error> for StorageError {
 type Result<T> = std::result::Result<T, StorageError>;
 
 /// Initialize storage directories.
+///
+/// This function ensures all required storage directories exist and are accessible.
+/// Returns early (successfully) if storage hasn't been formatted yet.
 pub fn init() -> Result<()> {
     let root = Path::new(STORAGE_ROOT);
 
-    // Check if storage is mounted
+    // Check if storage root exists or can be created
     if !root.exists() {
-        // Create mount point
-        std::fs::create_dir_all(root)?;
+        info!(path = %root.display(), "creating storage root directory");
+        std::fs::create_dir_all(root).map_err(|e| {
+            StorageError::new(format!(
+                "failed to create storage root '{}': {} (check permissions and disk space)",
+                root.display(),
+                e
+            ))
+        })?;
+    }
+
+    // Verify storage root is accessible
+    if let Err(e) = std::fs::read_dir(root) {
+        return Err(StorageError::new(format!(
+            "storage root '{}' exists but is not accessible: {} (check permissions)",
+            root.display(),
+            e
+        )));
     }
 
     // Check for marker file to see if formatted
     let marker = root.join(".smolvm_formatted");
     if !marker.exists() {
-        info!("storage not formatted, waiting for format request");
+        info!(path = %root.display(), "storage not formatted, waiting for format request");
         return Ok(());
     }
 
-    // Create directory structure
-    for dir in &[LAYERS_DIR, CONFIGS_DIR, MANIFESTS_DIR, OVERLAYS_DIR] {
+    // Create directory structure with detailed error reporting
+    let required_dirs = [
+        (LAYERS_DIR, "OCI image layers"),
+        (CONFIGS_DIR, "image configurations"),
+        (MANIFESTS_DIR, "image manifests"),
+        (OVERLAYS_DIR, "overlay filesystems"),
+    ];
+
+    let mut created_count = 0;
+    for (dir, description) in &required_dirs {
         let path = root.join(dir);
         if !path.exists() {
-            std::fs::create_dir_all(&path)?;
-            debug!(path = %path.display(), "created directory");
+            std::fs::create_dir_all(&path).map_err(|e| {
+                StorageError::new(format!(
+                    "failed to create {} directory '{}': {}",
+                    description,
+                    path.display(),
+                    e
+                ))
+            })?;
+            debug!(path = %path.display(), description = %description, "created directory");
+            created_count += 1;
         }
     }
 
-    info!("storage initialized");
+    // Create container runtime directories
+    let container_dirs = [
+        (paths::CONTAINERS_RUN_DIR, "container runtime state"),
+        (paths::CONTAINERS_LOGS_DIR, "container logs"),
+        (paths::CONTAINERS_EXIT_DIR, "container exit codes"),
+    ];
+
+    for (dir, description) in &container_dirs {
+        let path = Path::new(dir);
+        if !path.exists() {
+            std::fs::create_dir_all(path).map_err(|e| {
+                StorageError::new(format!(
+                    "failed to create {} directory '{}': {}",
+                    description,
+                    path.display(),
+                    e
+                ))
+            })?;
+            debug!(path = %path.display(), description = %description, "created directory");
+            created_count += 1;
+        }
+    }
+
+    info!(
+        path = %root.display(),
+        dirs_created = created_count,
+        "storage initialized"
+    );
     Ok(())
 }
 
 /// Format the storage disk.
+///
+/// Creates all required directories and writes the format marker file.
+/// If directories already exist, they are left as-is.
 pub fn format() -> Result<()> {
     let root = Path::new(STORAGE_ROOT);
 
-    // Create directory structure
-    for dir in &[LAYERS_DIR, CONFIGS_DIR, MANIFESTS_DIR, OVERLAYS_DIR] {
-        let path = root.join(dir);
-        std::fs::create_dir_all(&path)?;
+    // Ensure storage root exists
+    if !root.exists() {
+        std::fs::create_dir_all(root).map_err(|e| {
+            StorageError::new(format!(
+                "failed to create storage root '{}': {}",
+                root.display(),
+                e
+            ))
+        })?;
+    }
+
+    // Create all storage directories
+    let all_dirs = [
+        (root.join(LAYERS_DIR), "layers"),
+        (root.join(CONFIGS_DIR), "configs"),
+        (root.join(MANIFESTS_DIR), "manifests"),
+        (root.join(OVERLAYS_DIR), "overlays"),
+        (PathBuf::from(paths::CONTAINERS_RUN_DIR), "container run"),
+        (PathBuf::from(paths::CONTAINERS_LOGS_DIR), "container logs"),
+        (PathBuf::from(paths::CONTAINERS_EXIT_DIR), "container exit"),
+    ];
+
+    for (path, name) in &all_dirs {
+        std::fs::create_dir_all(path).map_err(|e| {
+            StorageError::new(format!(
+                "failed to create {} directory '{}': {}",
+                name,
+                path.display(),
+                e
+            ))
+        })?;
     }
 
     // Create marker file
     let marker = root.join(".smolvm_formatted");
-    std::fs::write(&marker, "1")?;
+    std::fs::write(&marker, "1").map_err(|e| {
+        StorageError::new(format!(
+            "failed to write format marker '{}': {}",
+            marker.display(),
+            e
+        ))
+    })?;
 
-    info!("storage formatted");
+    info!(path = %root.display(), "storage formatted");
     Ok(())
 }
 
@@ -125,6 +222,9 @@ pub fn status() -> Result<StorageStatus> {
 
 /// Pull an OCI image using crane.
 pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
+    // Validate image reference before any operations
+    crate::oci::validate_image_reference(image).map_err(StorageError)?;
+
     // Check if already cached - skip network call entirely
     if let Ok(Some(info)) = query_image(image) {
         debug!(image = %image, "image already cached, skipping pull");
@@ -459,6 +559,20 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
 
     let lowerdir = lowerdirs.join(":");
 
+    // Verify layer paths exist before mounting
+    for layer_path in &lowerdirs {
+        let path = Path::new(layer_path);
+        if !path.exists() {
+            return Err(StorageError(format!("layer path does not exist: {}", layer_path)));
+        }
+        // Check if layer has contents
+        if let Ok(mut entries) = std::fs::read_dir(path) {
+            if entries.next().is_none() {
+                warn!(layer = %layer_path, "layer directory is empty");
+            }
+        }
+    }
+
     // Mount overlay
     let mount_opts = format!(
         "lowerdir={},upperdir={},workdir={}",
@@ -467,16 +581,40 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
         work_path.display()
     );
 
-    let status = Command::new("mount")
+    debug!(mount_opts = %mount_opts, merged_path = %merged_path.display(), "mounting overlay");
+
+    let output = Command::new("mount")
         .args(["-t", "overlay", "overlay", "-o", &mount_opts])
         .arg(&merged_path)
-        .status()?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
 
-    if !status.success() {
-        return Err(StorageError("failed to mount overlay".into()));
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(StorageError(format!("failed to mount overlay: {}", stderr)));
     }
 
-    info!(workload_id = %workload_id, "overlay mounted");
+    // Verify mount succeeded by checking if merged directory has contents
+    let merged_entry_count = std::fs::read_dir(&merged_path)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+
+    if merged_entry_count == 0 {
+        warn!(
+            workload_id = %workload_id,
+            merged_path = %merged_path.display(),
+            "overlay mount returned success but merged directory is empty"
+        );
+        // Try to get more info about the mount state
+        if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
+            let merged_str = merged_path.to_string_lossy();
+            let is_mounted = mounts.lines().any(|line| line.contains(&*merged_str));
+            warn!(is_mounted = is_mounted, "mount point status");
+        }
+    }
+
+    info!(workload_id = %workload_id, entry_count = merged_entry_count, "overlay mounted");
 
     // Create OCI bundle directory structure
     // crun will use this bundle to run containers
@@ -536,6 +674,10 @@ pub fn run_command(
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
 ) -> Result<RunResult> {
+    // Validate inputs
+    crate::oci::validate_image_reference(image).map_err(StorageError::new)?;
+    crate::oci::validate_env_vars(env).map_err(StorageError::new)?;
+
     // Use consistent workload ID per image for overlay reuse
     let workload_id = format!("persistent-{}", sanitize_image_name(image));
 
@@ -688,22 +830,10 @@ fn get_or_create_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> 
 }
 
 /// Check if a path is a mountpoint.
+/// Check if a path is a mountpoint (delegates to paths::is_mount_point).
 fn is_mountpoint(path: &Path) -> bool {
-    // Read /proc/mounts to check if path is mounted
-    if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-        let path_str = path.to_string_lossy();
-        for line in mounts.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 && parts[1] == path_str {
-                return true;
-            }
-        }
-    }
-    false
+    paths::is_mount_point(path)
 }
-
-/// Exit code used when command is killed due to timeout.
-const TIMEOUT_EXIT_CODE: i32 = 124;
 
 /// Run a command using crun OCI runtime (one-shot execution).
 ///
@@ -714,9 +844,6 @@ fn run_with_crun(
     container_id: &str,
     timeout_ms: Option<u64>,
 ) -> Result<RunResult> {
-    use std::io::Read as _;
-    use std::time::{Duration, Instant};
-
     info!(
         container_id = %container_id,
         bundle = %bundle_dir.display(),
@@ -724,106 +851,57 @@ fn run_with_crun(
         "running container with crun"
     );
 
-    // Build crun run command
-    let mut cmd = Command::new(CRUN_PATH);
-    cmd.args([
-        "run",
-        "--bundle",
-        &bundle_dir.to_string_lossy(),
-        container_id,
-    ]);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    // Spawn the container using CrunCommand
+    let mut child = CrunCommand::run(bundle_dir, container_id)
+        .capture_output()
+        .spawn()
+        .map_err(|e| {
+            StorageError(format!(
+                "failed to spawn crun: {}. Is crun installed at {}?",
+                e, paths::CRUN_PATH
+            ))
+        })?;
 
-    // Spawn the container
-    let mut child = cmd.spawn().map_err(|e| {
-        StorageError(format!(
-            "failed to spawn crun: {}. Is crun installed at {}?",
-            e, CRUN_PATH
-        ))
+    // Capture container_id for the cleanup closure
+    let cid = container_id.to_string();
+
+    // Wait with timeout, cleaning up container on timeout
+    let result = wait_with_timeout_and_cleanup(&mut child, timeout_ms, || {
+        // Kill and delete the container on timeout
+        let _ = CrunCommand::kill(&cid, "SIGKILL").status();
+        let _ = CrunCommand::delete(&cid, true).status();
     })?;
 
-    let start = Instant::now();
-    let deadline = timeout_ms.map(|ms| start + Duration::from_millis(ms));
-
-    // Poll for completion with timeout
-    loop {
-        match child.try_wait()? {
-            Some(status) => {
-                // Container finished - read output
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_string(&mut stdout);
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    let _ = err.read_to_string(&mut stderr);
-                }
-
-                let exit_code = status.code().unwrap_or(-1);
-                info!(
-                    container_id = %container_id,
-                    exit_code = exit_code,
-                    stdout_len = stdout.len(),
-                    stderr_len = stderr.len(),
-                    "container finished"
-                );
-
-                return Ok(RunResult {
-                    exit_code,
-                    stdout,
-                    stderr,
-                });
-            }
-            None => {
-                // Still running - check timeout
-                if let Some(deadline) = deadline {
-                    if Instant::now() >= deadline {
-                        warn!(
-                            container_id = %container_id,
-                            timeout_ms = ?timeout_ms,
-                            "container timed out, killing"
-                        );
-
-                        // Kill the crun process (which will kill the container)
-                        let _ = child.kill();
-                        let _ = child.wait();
-
-                        // Also explicitly kill the container (in case it's orphaned)
-                        let _ = Command::new(CRUN_PATH)
-                            .args(["kill", container_id, "SIGKILL"])
-                            .status();
-                        let _ = Command::new(CRUN_PATH)
-                            .args(["delete", "-f", container_id])
-                            .status();
-
-                        // Collect any partial output
-                        let mut stdout = String::new();
-                        let mut stderr = String::new();
-
-                        if let Some(mut out) = child.stdout.take() {
-                            let _ = out.read_to_string(&mut stdout);
-                        }
-                        if let Some(mut err) = child.stderr.take() {
-                            let _ = err.read_to_string(&mut stderr);
-                        }
-
-                        return Ok(RunResult {
-                            exit_code: TIMEOUT_EXIT_CODE,
-                            stdout,
-                            stderr: format!(
-                                "{}\ncontainer timed out after {}ms",
-                                stderr,
-                                timeout_ms.unwrap_or(0)
-                            ),
-                        });
-                    }
-                }
-
-                // Sleep briefly before checking again
-                std::thread::sleep(Duration::from_millis(10));
-            }
+    // Convert WaitResult to RunResult
+    match result {
+        WaitResult::Completed { exit_code, output } => {
+            info!(
+                container_id = %container_id,
+                exit_code = exit_code,
+                stdout_len = output.stdout.len(),
+                stderr_len = output.stderr.len(),
+                "container finished"
+            );
+            Ok(RunResult {
+                exit_code,
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        }
+        WaitResult::TimedOut { output, timeout_ms } => {
+            warn!(
+                container_id = %container_id,
+                timeout_ms = timeout_ms,
+                "container timed out"
+            );
+            Ok(RunResult {
+                exit_code: TIMEOUT_EXIT_CODE,
+                stdout: output.stdout,
+                stderr: format!(
+                    "{}\ncontainer timed out after {}ms",
+                    output.stderr, timeout_ms
+                ),
+            })
         }
     }
 }
@@ -832,10 +910,10 @@ fn run_with_crun(
 // Helper functions
 // ============================================================================
 
-/// Run crane manifest command.
-fn crane_manifest(image: &str, platform: Option<&str>) -> Result<String> {
+/// Run a crane command with the given operation.
+fn run_crane(operation: &str, image: &str, platform: Option<&str>) -> Result<String> {
     let mut cmd = Command::new("crane");
-    cmd.arg("manifest").arg(image);
+    cmd.arg(operation).arg(image);
 
     if let Some(p) = platform {
         cmd.arg("--platform").arg(p);
@@ -845,29 +923,20 @@ fn crane_manifest(image: &str, platform: Option<&str>) -> Result<String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(StorageError(format!("crane manifest failed: {}", stderr)));
+        return Err(StorageError(format!("crane {} failed: {}", operation, stderr)));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Run crane manifest command.
+fn crane_manifest(image: &str, platform: Option<&str>) -> Result<String> {
+    run_crane("manifest", image, platform)
+}
+
 /// Run crane config command.
 fn crane_config(image: &str, platform: Option<&str>) -> Result<String> {
-    let mut cmd = Command::new("crane");
-    cmd.arg("config").arg(image);
-
-    if let Some(p) = platform {
-        cmd.arg("--platform").arg(p);
-    }
-
-    let output = cmd.output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(StorageError(format!("crane config failed: {}", stderr)));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    run_crane("config", image, platform)
 }
 
 /// Sanitize image name for use as filename.
