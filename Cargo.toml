@@ -37,6 +37,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 humantime = "2"
 
+# HTTP API server
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "timeout"] }
+tokio-stream = "0.1"
+parking_lot = "0.12"
+async-stream = "0.3"
+
 [dev-dependencies]
 tempfile = "3"
 smolvm-protocol = { path = "crates/smolvm-protocol" }
