@@ -153,8 +153,7 @@ test_container_exec_env() {
     fi
 
     local exec_output
-    # Use absolute path for sh because crun --env doesn't search PATH for executables
-    exec_output=$($SMOLVM container exec default "$container_id" -e MY_VAR=test_value -- /bin/sh -c 'echo $MY_VAR' 2>&1)
+    exec_output=$($SMOLVM container exec default "$container_id" -e MY_VAR=test_value -- sh -c 'echo $MY_VAR' 2>&1)
 
     # Cleanup
     cleanup_container "$container_id"

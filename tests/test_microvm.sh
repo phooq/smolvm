@@ -135,33 +135,11 @@ test_microvm_named_vm() {
 test_microvm_exec_when_stopped() {
     cleanup_microvm
 
-    # Run exec in background with timeout since it may hang
-    local output exit_code=0 pid
-    $SMOLVM microvm exec -- echo "should-fail" > /tmp/exec_stopped_output.txt 2>&1 &
-    pid=$!
+    local output exit_code=0
+    output=$($SMOLVM microvm exec -- echo "should-fail" 2>&1) || exit_code=$?
 
-    # Wait up to 5 seconds for the command to complete
-    local waited=0
-    while kill -0 "$pid" 2>/dev/null && [[ $waited -lt 5 ]]; do
-        sleep 1
-        ((waited++))
-    done
-
-    # If still running after timeout, kill it (this is expected behavior for now)
-    if kill -0 "$pid" 2>/dev/null; then
-        kill "$pid" 2>/dev/null || true
-        wait "$pid" 2>/dev/null || true
-        # Command hung - this is acceptable, it means exec on stopped VM doesn't work
-        return 0
-    fi
-
-    # Command completed - check exit code
-    wait "$pid" || exit_code=$?
-    output=$(cat /tmp/exec_stopped_output.txt 2>/dev/null || true)
-    rm -f /tmp/exec_stopped_output.txt
-
-    # Should fail or show error about not running
-    [[ $exit_code -ne 0 ]] || [[ "$output" == *"not running"* ]]
+    # Should fail with error about not running
+    [[ $exit_code -ne 0 ]] && [[ "$output" == *"not running"* ]]
 }
 
 # =============================================================================
