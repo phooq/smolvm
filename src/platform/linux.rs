@@ -25,6 +25,7 @@ impl VmExecutor for LinuxExecutor {
         command: &Option<Vec<String>>,
         _mounts: &[(String, String)], // Ignored on Linux - kernel handles virtiofs
         _rootfs: &Path,
+        _rosetta: bool, // Ignored on Linux - Rosetta is macOS-only
     ) -> Result<(CString, Vec<*const libc::c_char>, Vec<CString>)> {
         // Linux doesn't need mount wrapper; execute command directly
         let default_cmd = vec!["/bin/sh".to_string()];
@@ -134,12 +135,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cmd = Some(vec!["/bin/echo".to_string(), "hello".to_string()]);
         // Linux should ignore mounts - kernel handles virtiofs automatically
-        let mounts = vec![
-            ("smolvm0".to_string(), "/data".to_string()),
-        ];
+        let mounts = vec![("smolvm0".to_string(), "/data".to_string())];
 
         let (exec_path, _argv, cstrings) = executor
-            .build_exec_command(&cmd, &mounts, tmp.path())
+            .build_exec_command(&cmd, &mounts, tmp.path(), false)
             .unwrap();
 
         // Should return direct command, ignoring mounts

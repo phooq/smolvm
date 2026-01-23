@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{Error, Result};
 use crate::platform::{self, VmExecutor};
 use crate::vm::config::{NetworkPolicy, RootfsSource, VmConfig};
+use crate::vm::rosetta;
 use crate::vm::state::{ExitReason, VmState};
 use crate::vm::{VmBackend, VmHandle, VmId};
 
@@ -253,12 +254,24 @@ impl LibkrunVm {
                 })
                 .collect();
 
+            // Determine if Rosetta should be enabled
+            // Only enable if requested in config AND Rosetta is actually available
+            let rosetta_enabled = config.rosetta && rosetta::is_available();
+            if config.rosetta && !rosetta_enabled {
+                tracing::warn!(
+                    "Rosetta requested but not available - x86_64 binaries will not work"
+                );
+            }
+            if rosetta_enabled {
+                tracing::info!("Rosetta enabled for x86_64 binary support");
+            }
+
             // Build exec command using platform-specific executor
             // On macOS, this wraps the command with a mount script for virtiofs
             // On Linux, the kernel handles virtiofs mounting automatically
             let executor = platform::vm_executor();
             let (exec_path, argv, _argv_cstrings) =
-                executor.build_exec_command(&config.command, &mount_specs, rootfs_path)?;
+                executor.build_exec_command(&config.command, &mount_specs, rootfs_path, rosetta_enabled)?;
 
             tracing::debug!("[libkrun] exec_path: {:?}", exec_path);
             tracing::debug!("[libkrun] command: {:?}", config.command);
@@ -284,6 +297,26 @@ impl LibkrunVm {
                         mount.source.display(),
                         mount.target.display()
                     );
+                }
+            }
+
+            // Add Rosetta virtiofs mount if enabled
+            if rosetta_enabled {
+                if let Some(runtime_path) = rosetta::runtime_path() {
+                    let tag = CString::new(rosetta::ROSETTA_TAG)
+                        .map_err(|_| Error::mount("invalid rosetta tag"))?;
+                    let path = CString::new(runtime_path)
+                        .map_err(|_| Error::mount("invalid rosetta path"))?;
+
+                    if krun_add_virtiofs(ctx, tag.as_ptr(), path.as_ptr()) < 0 {
+                        tracing::warn!("failed to add Rosetta virtiofs mount");
+                    } else {
+                        tracing::debug!(
+                            tag = rosetta::ROSETTA_TAG,
+                            path = runtime_path,
+                            "added Rosetta virtiofs mount"
+                        );
+                    }
                 }
             }
 

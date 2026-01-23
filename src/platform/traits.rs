@@ -28,6 +28,7 @@ pub trait VmExecutor: Send + Sync {
     /// * `command` - The user's command to execute (None defaults to /bin/sh)
     /// * `mounts` - List of (virtiofs_tag, guest_path) tuples for virtiofs mounts
     /// * `rootfs` - Path to the rootfs directory on the host
+    /// * `rosetta` - Whether Rosetta is enabled for x86_64 binary support
     ///
     /// # Returns
     ///
@@ -41,6 +42,7 @@ pub trait VmExecutor: Send + Sync {
         command: &Option<Vec<String>>,
         mounts: &[(String, String)],
         rootfs: &Path,
+        rosetta: bool,
     ) -> Result<(CString, Vec<*const libc::c_char>, Vec<CString>)>;
 
     /// Get platform-specific paths for finding system tools.

@@ -29,13 +29,15 @@ impl VmExecutor for MacOsExecutor {
         command: &Option<Vec<String>>,
         mounts: &[(String, String)],
         rootfs: &Path,
+        rosetta: bool,
     ) -> Result<(CString, Vec<*const libc::c_char>, Vec<CString>)> {
-        if mounts.is_empty() {
+        // Need mount wrapper if we have mounts OR if rosetta is enabled
+        if mounts.is_empty() && !rosetta {
             return build_exec_args_direct(command);
         }
 
         // Write mount script and use it as the command
-        let script_path = write_mount_script(rootfs, mounts)?;
+        let script_path = write_mount_script(rootfs, mounts, rosetta)?;
 
         let default_cmd = vec!["/bin/sh".to_string()];
         let user_cmd = command.as_ref().unwrap_or(&default_cmd);
@@ -130,7 +132,8 @@ pub fn rosetta_support() -> MacOsRosetta {
 ///
 /// This script mounts all virtiofs volumes before executing the user's command.
 /// It's written to /tmp inside the rootfs to avoid mutating the container image.
-fn write_mount_script(rootfs: &Path, mounts: &[(String, String)]) -> Result<String> {
+/// If rosetta is enabled, it also mounts the Rosetta runtime and registers binfmt_misc.
+fn write_mount_script(rootfs: &Path, mounts: &[(String, String)], rosetta: bool) -> Result<String> {
     let tmp_dir = rootfs.join("tmp");
     if !tmp_dir.exists() {
         fs::create_dir_all(&tmp_dir)
@@ -152,6 +155,28 @@ fn write_mount_script(rootfs: &Path, mounts: &[(String, String)]) -> Result<Stri
         writeln!(file, "mount -t virtiofs {} \"{}\"", tag, guest_mount).unwrap();
     }
 
+    // If Rosetta is enabled, mount the runtime and register binfmt_misc
+    if rosetta {
+        writeln!(file, "# Mount Rosetta runtime").unwrap();
+        writeln!(
+            file,
+            "mkdir -p \"{}\"",
+            crate::vm::rosetta::ROSETTA_GUEST_PATH
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "mount -t virtiofs {} \"{}\"",
+            crate::vm::rosetta::ROSETTA_TAG,
+            crate::vm::rosetta::ROSETTA_GUEST_PATH
+        )
+        .unwrap();
+
+        // Register Rosetta with binfmt_misc for x86_64 ELF binaries
+        writeln!(file, "# Register Rosetta with binfmt_misc").unwrap();
+        writeln!(file, "{}", crate::vm::rosetta::BINFMT_REGISTER_CMD).unwrap();
+    }
+
     // Clean up the mount script after execution
     writeln!(file, "rm -f \"$0\"").unwrap();
 
@@ -164,7 +189,11 @@ fn write_mount_script(rootfs: &Path, mounts: &[(String, String)]) -> Result<Stri
         Error::vm_creation(format!("failed to set mount script permissions: {}", e))
     })?;
 
-    tracing::debug!("wrote mount script to {:?}", host_path);
+    tracing::debug!(
+        "wrote mount script to {:?} (rosetta={})",
+        host_path,
+        rosetta
+    );
     Ok(guest_path.to_string())
 }
 
@@ -231,7 +260,7 @@ mod tests {
         let cmd = Some(vec!["/bin/echo".to_string(), "hello".to_string()]);
 
         let (exec_path, argv, cstrings) = executor
-            .build_exec_command(&cmd, &[], tmp.path())
+            .build_exec_command(&cmd, &[], tmp.path(), false)
             .unwrap();
 
         // With no mounts, should return direct command
@@ -247,12 +276,10 @@ mod tests {
         let executor = MacOsExecutor;
         let tmp = TempDir::new().unwrap();
         let cmd = Some(vec!["/bin/cat".to_string(), "/data/file.txt".to_string()]);
-        let mounts = vec![
-            ("smolvm0".to_string(), "/data".to_string()),
-        ];
+        let mounts = vec![("smolvm0".to_string(), "/data".to_string())];
 
         let (exec_path, _argv, _cstrings) = executor
-            .build_exec_command(&cmd, &mounts, tmp.path())
+            .build_exec_command(&cmd, &mounts, tmp.path(), false)
             .unwrap();
 
         // With mounts, should return mount script path
@@ -264,9 +291,18 @@ mod tests {
 
         let content = std::fs::read_to_string(&script_path).unwrap();
         assert!(content.contains("#!/bin/sh"), "script should have shebang");
-        assert!(content.contains("mkdir -p \"/data\""), "script should create mount point");
-        assert!(content.contains("mount -t virtiofs smolvm0 \"/data\""), "script should mount virtiofs");
-        assert!(content.contains("exec \"$@\""), "script should exec user command");
+        assert!(
+            content.contains("mkdir -p \"/data\""),
+            "script should create mount point"
+        );
+        assert!(
+            content.contains("mount -t virtiofs smolvm0 \"/data\""),
+            "script should mount virtiofs"
+        );
+        assert!(
+            content.contains("exec \"$@\""),
+            "script should exec user command"
+        );
     }
 
     #[test]
@@ -275,10 +311,38 @@ mod tests {
         let tmp = TempDir::new().unwrap();
 
         let (exec_path, _argv, _cstrings) = executor
-            .build_exec_command(&None, &[], tmp.path())
+            .build_exec_command(&None, &[], tmp.path(), false)
             .unwrap();
 
         // Default command should be /bin/sh
         assert_eq!(exec_path.to_str().unwrap(), "/bin/sh");
+    }
+
+    #[test]
+    fn test_build_exec_with_rosetta_creates_script() {
+        let executor = MacOsExecutor;
+        let tmp = TempDir::new().unwrap();
+        let cmd = Some(vec!["/bin/sh".to_string()]);
+
+        // With rosetta=true but no mounts, should still create wrapper script
+        let (exec_path, _argv, _cstrings) = executor
+            .build_exec_command(&cmd, &[], tmp.path(), true)
+            .unwrap();
+
+        assert_eq!(exec_path.to_str().unwrap(), "/tmp/smolvm-mount.sh");
+
+        // Verify script was created with Rosetta setup
+        let script_path = tmp.path().join("tmp/smolvm-mount.sh");
+        assert!(script_path.exists(), "mount script should be created");
+
+        let content = std::fs::read_to_string(&script_path).unwrap();
+        assert!(
+            content.contains("/mnt/rosetta"),
+            "script should mount Rosetta"
+        );
+        assert!(
+            content.contains("binfmt_misc"),
+            "script should register binfmt_misc"
+        );
     }
 }
