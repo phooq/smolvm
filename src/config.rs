@@ -38,6 +38,63 @@ impl std::fmt::Display for RecordState {
     }
 }
 
+/// Restart policy for a sandbox.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    /// Never restart the sandbox automatically.
+    #[default]
+    Never,
+    /// Always restart the sandbox when it exits.
+    Always,
+    /// Restart only if the sandbox exited with a non-zero exit code.
+    OnFailure,
+    /// Restart unless the user explicitly stopped the sandbox.
+    UnlessStopped,
+}
+
+impl std::fmt::Display for RestartPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RestartPolicy::Never => write!(f, "never"),
+            RestartPolicy::Always => write!(f, "always"),
+            RestartPolicy::OnFailure => write!(f, "on-failure"),
+            RestartPolicy::UnlessStopped => write!(f, "unless-stopped"),
+        }
+    }
+}
+
+impl std::str::FromStr for RestartPolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "never" => Ok(RestartPolicy::Never),
+            "always" => Ok(RestartPolicy::Always),
+            "on-failure" | "onfailure" => Ok(RestartPolicy::OnFailure),
+            "unless-stopped" | "unlessstopped" => Ok(RestartPolicy::UnlessStopped),
+            _ => Err(format!("invalid restart policy: {}", s)),
+        }
+    }
+}
+
+/// Restart configuration for a sandbox.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RestartConfig {
+    /// The restart policy.
+    #[serde(default)]
+    pub policy: RestartPolicy,
+    /// Maximum number of restart attempts (0 = unlimited).
+    #[serde(default)]
+    pub max_retries: u32,
+    /// Current restart count.
+    #[serde(default)]
+    pub restart_count: u32,
+    /// Whether the user explicitly stopped this sandbox.
+    #[serde(default)]
+    pub user_stopped: bool,
+}
+
 /// Global smolvm configuration with database-backed persistence.
 ///
 /// This struct provides backward-compatible access to VM records while
@@ -226,6 +283,14 @@ pub struct VmRecord {
     /// Port mappings (host_port, guest_port).
     #[serde(default)]
     pub ports: Vec<(u16, u16)>,
+
+    /// Restart configuration.
+    #[serde(default)]
+    pub restart: RestartConfig,
+
+    /// Last exit code from the VM process.
+    #[serde(default)]
+    pub last_exit_code: Option<i32>,
 }
 
 fn default_cpus() -> u8 {
@@ -254,6 +319,31 @@ impl VmRecord {
             mem,
             mounts,
             ports,
+            restart: RestartConfig::default(),
+            last_exit_code: None,
+        }
+    }
+
+    /// Create a new VM record with restart configuration.
+    pub fn new_with_restart(
+        name: String,
+        cpus: u8,
+        mem: u32,
+        mounts: Vec<(String, String, bool)>,
+        ports: Vec<(u16, u16)>,
+        restart: RestartConfig,
+    ) -> Self {
+        Self {
+            name,
+            created_at: crate::util::current_timestamp(),
+            state: RecordState::Created,
+            pid: None,
+            cpus,
+            mem,
+            mounts,
+            ports,
+            restart,
+            last_exit_code: None,
         }
     }
 
@@ -301,10 +391,65 @@ mod tests {
     }
 
     #[test]
+    fn test_vm_record_with_restart() {
+        let restart = RestartConfig {
+            policy: RestartPolicy::Always,
+            max_retries: 5,
+            restart_count: 0,
+            user_stopped: false,
+        };
+        let record = VmRecord::new_with_restart(
+            "test".to_string(),
+            2,
+            512,
+            vec![],
+            vec![],
+            restart,
+        );
+
+        let json = serde_json::to_string(&record).unwrap();
+        let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.restart.policy, RestartPolicy::Always);
+        assert_eq!(deserialized.restart.max_retries, 5);
+    }
+
+    #[test]
     fn test_record_state_display() {
         assert_eq!(RecordState::Created.to_string(), "created");
         assert_eq!(RecordState::Running.to_string(), "running");
         assert_eq!(RecordState::Stopped.to_string(), "stopped");
         assert_eq!(RecordState::Failed.to_string(), "failed");
+    }
+
+    #[test]
+    fn test_restart_policy_display_and_parse() {
+        assert_eq!(RestartPolicy::Never.to_string(), "never");
+        assert_eq!(RestartPolicy::Always.to_string(), "always");
+        assert_eq!(RestartPolicy::OnFailure.to_string(), "on-failure");
+        assert_eq!(RestartPolicy::UnlessStopped.to_string(), "unless-stopped");
+
+        assert_eq!("never".parse::<RestartPolicy>().unwrap(), RestartPolicy::Never);
+        assert_eq!("always".parse::<RestartPolicy>().unwrap(), RestartPolicy::Always);
+        assert_eq!("on-failure".parse::<RestartPolicy>().unwrap(), RestartPolicy::OnFailure);
+        assert_eq!("unless-stopped".parse::<RestartPolicy>().unwrap(), RestartPolicy::UnlessStopped);
+    }
+
+    #[test]
+    fn test_restart_policy_serialization() {
+        let policy = RestartPolicy::OnFailure;
+        let json = serde_json::to_string(&policy).unwrap();
+        assert_eq!(json, "\"on-failure\"");
+
+        let deserialized: RestartPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, RestartPolicy::OnFailure);
+    }
+
+    #[test]
+    fn test_restart_config_default() {
+        let config = RestartConfig::default();
+        assert_eq!(config.policy, RestartPolicy::Never);
+        assert_eq!(config.max_retries, 0);
+        assert_eq!(config.restart_count, 0);
+        assert!(!config.user_stopped);
     }
 }

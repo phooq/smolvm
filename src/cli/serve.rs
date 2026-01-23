@@ -59,6 +59,19 @@ impl ServeCmd {
             println!("Reconnected to {} existing sandbox(es): {}", loaded.len(), loaded.join(", "));
         }
 
+        // Create shutdown channel for supervisor
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        // Spawn supervisor task
+        let supervisor_state = state.clone();
+        let supervisor_handle = tokio::spawn(async move {
+            let supervisor = smolvm::api::supervisor::Supervisor::new(
+                supervisor_state,
+                shutdown_rx,
+            );
+            supervisor.run().await;
+        });
+
         // Create router
         let app = smolvm::api::create_router(state);
 
@@ -75,6 +88,15 @@ impl ServeCmd {
             .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|e| smolvm::error::Error::Io(e))?;
+
+        // Signal supervisor to stop
+        let _ = shutdown_tx.send(true);
+
+        // Wait for supervisor to finish (with timeout)
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            supervisor_handle,
+        ).await;
 
         Ok(())
     }
