@@ -168,6 +168,50 @@ impl SmolvmDb {
         Ok(())
     }
 
+    /// Insert a VM record only if it doesn't already exist.
+    ///
+    /// Returns `Ok(true)` if inserted, `Ok(false)` if already exists.
+    /// This provides atomic conflict detection at the database level.
+    pub fn insert_vm_if_not_exists(&self, name: &str, record: &VmRecord) -> Result<bool> {
+        let json = serde_json::to_vec(record)
+            .map_err(|e| Error::Database(format!("failed to serialize VmRecord: {}", e)))?;
+
+        let db_guard = self.db.read();
+        let db = db_guard
+            .as_ref()
+            .ok_or_else(|| Error::Database("database is closed".to_string()))?;
+
+        let write_txn = db.begin_write().map_err(|e| {
+            Error::Database(format!("failed to begin write transaction: {}", e))
+        })?;
+
+        let inserted = {
+            let mut table = write_txn.open_table(VMS_TABLE).map_err(|e| {
+                Error::Database(format!("failed to open vms table: {}", e))
+            })?;
+
+            // Check if key already exists
+            let exists = table.get(name).map_err(|e| {
+                Error::Database(format!("failed to check VM '{}': {}", name, e))
+            })?.is_some();
+
+            if exists {
+                false
+            } else {
+                table.insert(name, json.as_slice()).map_err(|e| {
+                    Error::Database(format!("failed to insert VM '{}': {}", name, e))
+                })?;
+                true
+            }
+        };
+
+        write_txn.commit().map_err(|e| {
+            Error::Database(format!("failed to commit VM insert: {}", e))
+        })?;
+
+        Ok(inserted)
+    }
+
     /// Get a VM record by name.
     pub fn get_vm(&self, name: &str) -> Result<Option<VmRecord>> {
         let db_guard = self.db.read();
@@ -499,5 +543,58 @@ mod tests {
 
         let vms = db.list_vms().unwrap();
         assert_eq!(vms.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_vm_if_not_exists() {
+        let (_dir, db) = temp_db();
+
+        let record = VmRecord::new("test-vm".to_string(), 1, 512, vec![], vec![]);
+
+        // First insert should succeed
+        let inserted = db.insert_vm_if_not_exists("test-vm", &record).unwrap();
+        assert!(inserted, "first insert should succeed");
+
+        // Second insert with same name should return false
+        let inserted = db.insert_vm_if_not_exists("test-vm", &record).unwrap();
+        assert!(!inserted, "second insert should fail (already exists)");
+
+        // Verify only one VM exists
+        let vms = db.list_vms().unwrap();
+        assert_eq!(vms.len(), 1);
+
+        // Different name should succeed
+        let record2 = VmRecord::new("test-vm2".to_string(), 2, 1024, vec![], vec![]);
+        let inserted = db.insert_vm_if_not_exists("test-vm2", &record2).unwrap();
+        assert!(inserted, "different name should succeed");
+
+        let vms = db.list_vms().unwrap();
+        assert_eq!(vms.len(), 2);
+    }
+
+    #[test]
+    fn test_insert_vm_if_not_exists_concurrent() {
+        let (_dir, db) = temp_db();
+
+        // Try to insert the same name from multiple threads
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    let record = VmRecord::new("contested-name".to_string(), 1, 512, vec![], vec![]);
+                    db.insert_vm_if_not_exists("contested-name", &record).unwrap()
+                })
+            })
+            .collect();
+
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Exactly one should have succeeded
+        let success_count = results.iter().filter(|&&r| r).count();
+        assert_eq!(success_count, 1, "exactly one insert should succeed");
+
+        // Verify only one VM exists
+        let vms = db.list_vms().unwrap();
+        assert_eq!(vms.len(), 1);
     }
 }

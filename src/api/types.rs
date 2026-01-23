@@ -6,6 +6,17 @@ use serde::{Deserialize, Serialize};
 // Sandbox Types
 // ============================================================================
 
+/// Restart policy specification for sandbox creation.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct RestartSpec {
+    /// Restart policy: "never", "always", "on-failure", "unless-stopped".
+    #[serde(default)]
+    pub policy: Option<String>,
+    /// Maximum restart attempts (0 = unlimited).
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+}
+
 /// Request to create a new sandbox.
 #[derive(Debug, Deserialize)]
 pub struct CreateSandboxRequest {
@@ -20,6 +31,9 @@ pub struct CreateSandboxRequest {
     /// VM resource configuration.
     #[serde(default)]
     pub resources: Option<ResourceSpec>,
+    /// Restart policy configuration.
+    #[serde(default)]
+    pub restart: Option<RestartSpec>,
 }
 
 /// Mount specification (for requests).
@@ -83,6 +97,9 @@ pub struct SandboxInfo {
     pub ports: Vec<PortSpec>,
     /// VM resources.
     pub resources: ResourceSpec,
+    /// Number of times this sandbox has been automatically restarted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_count: Option<u32>,
 }
 
 /// List sandboxes response.

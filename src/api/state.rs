@@ -2,18 +2,21 @@
 
 use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
 use crate::api::error::ApiError;
-use crate::api::types::{MountInfo, MountSpec, PortSpec, ResourceSpec, SandboxInfo};
-use crate::config::{RecordState, VmRecord};
+use crate::api::types::{MountInfo, MountSpec, PortSpec, ResourceSpec, RestartSpec, SandboxInfo};
+use crate::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
 use crate::db::SmolvmDb;
 use crate::mount::validate_mount;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Shared API server state.
 pub struct ApiState {
     /// Registry of sandbox managers by name.
     sandboxes: RwLock<HashMap<String, Arc<parking_lot::Mutex<SandboxEntry>>>>,
+    /// Reserved sandbox names (creation in progress).
+    /// This prevents race conditions during sandbox creation.
+    reserved_names: RwLock<HashSet<String>>,
     /// Database for persistent state.
     db: SmolvmDb,
 }
@@ -28,6 +31,8 @@ pub struct SandboxEntry {
     pub ports: Vec<PortSpec>,
     /// VM resources configured for this sandbox.
     pub resources: ResourceSpec,
+    /// Restart configuration for this sandbox.
+    pub restart: RestartConfig,
 }
 
 impl ApiState {
@@ -36,6 +41,7 @@ impl ApiState {
         let db = SmolvmDb::open().expect("failed to open database");
         Self {
             sandboxes: RwLock::new(HashMap::new()),
+            reserved_names: RwLock::new(HashSet::new()),
             db,
         }
     }
@@ -98,6 +104,7 @@ impl ApiState {
                                 mounts,
                                 ports,
                                 resources,
+                                restart: record.restart.clone(),
                             })),
                         );
                         loaded.push(name.clone());
@@ -123,6 +130,7 @@ impl ApiState {
         mounts: Vec<MountSpec>,
         ports: Vec<PortSpec>,
         resources: ResourceSpec,
+        restart: RestartConfig,
     ) -> Result<(), ApiError> {
         // Check for conflicts
         {
@@ -136,7 +144,7 @@ impl ApiState {
         }
 
         // Persist to database
-        let record = VmRecord::new(
+        let record = VmRecord::new_with_restart(
             name.clone(),
             resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
             resources.memory_mb.unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
@@ -145,6 +153,7 @@ impl ApiState {
                 .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
                 .collect(),
             ports.iter().map(|p| (p.host, p.guest)).collect(),
+            restart.clone(),
         );
 
         if let Err(e) = self.db.insert_vm(&name, &record) {
@@ -160,6 +169,7 @@ impl ApiState {
                 mounts,
                 ports,
                 resources,
+                restart,
             })),
         );
         Ok(())
@@ -229,6 +239,11 @@ impl ApiState {
                         readonly: m.readonly,
                     })
                     .collect();
+                let restart_count = if entry.restart.restart_count > 0 {
+                    Some(entry.restart.restart_count)
+                } else {
+                    None
+                };
                 SandboxInfo {
                     name: name.clone(),
                     state: state.to_lowercase(),
@@ -236,6 +251,7 @@ impl ApiState {
                     mounts,
                     ports: entry.ports.clone(),
                     resources: entry.resources.clone(),
+                    restart_count,
                 }
             })
             .collect()
@@ -244,6 +260,129 @@ impl ApiState {
     /// Check if a sandbox exists.
     pub fn sandbox_exists(&self, name: &str) -> bool {
         self.sandboxes.read().contains_key(name)
+    }
+
+    // ========================================================================
+    // Atomic Sandbox Creation (Reservation Pattern)
+    // ========================================================================
+
+    /// Reserve a sandbox name atomically.
+    ///
+    /// This prevents race conditions where two concurrent requests try to create
+    /// a sandbox with the same name. The name is reserved until either:
+    /// - `complete_sandbox_registration()` is called (success)
+    /// - `release_sandbox_reservation()` is called (failure/cleanup)
+    ///
+    /// Returns `Err(Conflict)` if the name is already taken or reserved.
+    pub fn reserve_sandbox_name(&self, name: &str) -> Result<(), ApiError> {
+        // Check both sandboxes and reservations atomically
+        let sandboxes = self.sandboxes.read();
+        let mut reserved = self.reserved_names.write();
+
+        // Check if sandbox already exists
+        if sandboxes.contains_key(name) {
+            return Err(ApiError::Conflict(format!(
+                "sandbox '{}' already exists",
+                name
+            )));
+        }
+
+        // Check if name is already reserved (creation in progress)
+        if reserved.contains(name) {
+            return Err(ApiError::Conflict(format!(
+                "sandbox '{}' is being created by another request",
+                name
+            )));
+        }
+
+        // Also check database for persisted sandboxes not yet loaded
+        if let Ok(Some(_)) = self.db.get_vm(name) {
+            return Err(ApiError::Conflict(format!(
+                "sandbox '{}' already exists in database",
+                name
+            )));
+        }
+
+        // Reserve the name
+        reserved.insert(name.to_string());
+        tracing::debug!(sandbox = %name, "reserved sandbox name");
+        Ok(())
+    }
+
+    /// Release a sandbox name reservation.
+    ///
+    /// Call this if sandbox creation fails after `reserve_sandbox_name()`.
+    pub fn release_sandbox_reservation(&self, name: &str) {
+        let mut reserved = self.reserved_names.write();
+        if reserved.remove(name) {
+            tracing::debug!(sandbox = %name, "released sandbox name reservation");
+        }
+    }
+
+    /// Complete sandbox registration after successful creation.
+    ///
+    /// This converts a reserved name into a fully registered sandbox.
+    /// The reservation is released and the sandbox entry is added.
+    pub fn complete_sandbox_registration(
+        &self,
+        name: String,
+        manager: AgentManager,
+        mounts: Vec<MountSpec>,
+        ports: Vec<PortSpec>,
+        resources: ResourceSpec,
+        restart: RestartConfig,
+    ) -> Result<(), ApiError> {
+        // Remove from reservations
+        {
+            let mut reserved = self.reserved_names.write();
+            if !reserved.remove(&name) {
+                // Name wasn't reserved - this is a programming error
+                tracing::warn!(sandbox = %name, "completing registration for non-reserved name");
+            }
+        }
+
+        // Persist to database (with conflict detection)
+        let record = VmRecord::new_with_restart(
+            name.clone(),
+            resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
+            resources.memory_mb.unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
+            mounts
+                .iter()
+                .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
+                .collect(),
+            ports.iter().map(|p| (p.host, p.guest)).collect(),
+            restart.clone(),
+        );
+
+        // Use insert_vm_if_not_exists for atomic database insert
+        match self.db.insert_vm_if_not_exists(&name, &record) {
+            Ok(true) => {
+                // Successfully inserted, now add to in-memory registry
+                let mut sandboxes = self.sandboxes.write();
+                sandboxes.insert(
+                    name,
+                    Arc::new(parking_lot::Mutex::new(SandboxEntry {
+                        manager,
+                        mounts,
+                        ports,
+                        resources,
+                        restart,
+                    })),
+                );
+                Ok(())
+            }
+            Ok(false) => {
+                // Name already exists in database (shouldn't happen with reservation)
+                Err(ApiError::Conflict(format!(
+                    "sandbox '{}' already exists in database",
+                    name
+                )))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, sandbox = %name, "database error during registration");
+                Err(ApiError::Internal(format!("database error: {}", e)))
+            }
+        }
     }
 
     /// Stop all sandboxes (for graceful shutdown).
@@ -263,6 +402,85 @@ impl ApiState {
     /// Get the underlying database handle.
     pub fn db(&self) -> &SmolvmDb {
         &self.db
+    }
+
+    // ========================================================================
+    // Restart Management Methods
+    // ========================================================================
+
+    /// List all sandbox names.
+    pub fn list_sandbox_names(&self) -> Vec<String> {
+        self.sandboxes.read().keys().cloned().collect()
+    }
+
+    /// Get restart config for a sandbox from the in-memory registry.
+    pub fn get_restart_config(&self, name: &str) -> Option<RestartConfig> {
+        let sandboxes = self.sandboxes.read();
+        sandboxes.get(name).map(|entry| {
+            let entry = entry.lock();
+            entry.restart.clone()
+        })
+    }
+
+    /// Increment restart count for a sandbox.
+    pub fn increment_restart_count(&self, name: &str) {
+        // Update in-memory
+        if let Some(entry) = self.sandboxes.read().get(name) {
+            let mut entry = entry.lock();
+            entry.restart.restart_count += 1;
+        }
+        // Update in database
+        if let Err(e) = self.db.update_vm(name, |r| r.restart.restart_count += 1) {
+            tracing::warn!(error = %e, sandbox = %name, "failed to persist restart count");
+        }
+    }
+
+    /// Mark sandbox as user-stopped.
+    pub fn mark_user_stopped(&self, name: &str, stopped: bool) {
+        // Update in-memory
+        if let Some(entry) = self.sandboxes.read().get(name) {
+            let mut entry = entry.lock();
+            entry.restart.user_stopped = stopped;
+        }
+        // Update in database
+        if let Err(e) = self.db.update_vm(name, |r| r.restart.user_stopped = stopped) {
+            tracing::warn!(error = %e, sandbox = %name, "failed to persist user_stopped");
+        }
+    }
+
+    /// Reset restart count (on successful start).
+    pub fn reset_restart_count(&self, name: &str) {
+        // Update in-memory
+        if let Some(entry) = self.sandboxes.read().get(name) {
+            let mut entry = entry.lock();
+            entry.restart.restart_count = 0;
+        }
+        // Update in database
+        if let Err(e) = self.db.update_vm(name, |r| r.restart.restart_count = 0) {
+            tracing::warn!(error = %e, sandbox = %name, "failed to reset restart count");
+        }
+    }
+
+    /// Update last exit code for a sandbox.
+    pub fn set_last_exit_code(&self, name: &str, exit_code: Option<i32>) {
+        if let Err(e) = self.db.update_vm(name, |r| r.last_exit_code = exit_code) {
+            tracing::warn!(error = %e, sandbox = %name, "failed to persist exit code");
+        }
+    }
+
+    /// Get last exit code for a sandbox.
+    pub fn get_last_exit_code(&self, name: &str) -> Option<i32> {
+        self.db.get_vm(name).ok().flatten().and_then(|r| r.last_exit_code)
+    }
+
+    /// Check if a sandbox process is alive.
+    pub fn is_sandbox_alive(&self, name: &str) -> bool {
+        if let Some(entry) = self.sandboxes.read().get(name) {
+            let entry = entry.lock();
+            entry.manager.is_running()
+        } else {
+            false
+        }
     }
 
     /// Temporarily close the database to release file locks before forking.
@@ -338,6 +556,26 @@ pub fn port_mapping_to_spec(mapping: &PortMapping) -> PortSpec {
     PortSpec {
         host: mapping.host,
         guest: mapping.guest,
+    }
+}
+
+/// Convert RestartSpec to RestartConfig.
+pub fn restart_spec_to_config(spec: Option<&RestartSpec>) -> RestartConfig {
+    match spec {
+        Some(spec) => {
+            let policy = spec
+                .policy
+                .as_ref()
+                .and_then(|p| p.parse::<RestartPolicy>().ok())
+                .unwrap_or_default();
+            RestartConfig {
+                policy,
+                max_retries: spec.max_retries.unwrap_or(0),
+                restart_count: 0,
+                user_stopped: false,
+            }
+        }
+        None => RestartConfig::default(),
     }
 }
 
