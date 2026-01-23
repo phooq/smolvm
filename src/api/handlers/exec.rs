@@ -6,7 +6,7 @@ use axum::{
     Json,
 };
 use std::convert::Infallible;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,22 +29,26 @@ pub async fn exec_command(
 
     let entry = state.get_sandbox(&id)?;
 
-    // Ensure sandbox is running
+    // Ensure sandbox is running (blocking operation)
     {
-        let entry = entry.lock();
-        let mounts_result: Result<Vec<_>, _> = entry
-            .mounts
-            .iter()
-            .map(mount_spec_to_host_mount)
-            .collect();
-        let mounts = mounts_result.map_err(|e| ApiError::Internal(e.to_string()))?;
-        let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-        let resources = resource_spec_to_vm_resources(&entry.resources);
+        let entry_clone = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let entry = entry_clone.lock();
+            let mounts_result: Result<Vec<_>, _> = entry
+                .mounts
+                .iter()
+                .map(mount_spec_to_host_mount)
+                .collect();
+            let mounts = mounts_result?;
+            let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
+            let resources = resource_spec_to_vm_resources(&entry.resources);
 
-        entry
-            .manager
-            .ensure_running_with_full_config(mounts, ports, resources)
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
+            entry
+                .manager
+                .ensure_running_with_full_config(mounts, ports, resources)
+        })
+        .await?
+        .map_err(|e| ApiError::BadRequest(format!("mount validation failed: {}", e)))?;
     }
 
     // Prepare execution parameters
@@ -88,22 +92,26 @@ pub async fn run_command(
 
     let entry = state.get_sandbox(&id)?;
 
-    // Ensure sandbox is running
+    // Ensure sandbox is running (blocking operation)
     {
-        let entry = entry.lock();
-        let mounts_result: Result<Vec<_>, _> = entry
-            .mounts
-            .iter()
-            .map(mount_spec_to_host_mount)
-            .collect();
-        let mounts = mounts_result.map_err(|e| ApiError::Internal(e.to_string()))?;
-        let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-        let resources = resource_spec_to_vm_resources(&entry.resources);
+        let entry_clone = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let entry = entry_clone.lock();
+            let mounts_result: Result<Vec<_>, _> = entry
+                .mounts
+                .iter()
+                .map(mount_spec_to_host_mount)
+                .collect();
+            let mounts = mounts_result?;
+            let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
+            let resources = resource_spec_to_vm_resources(&entry.resources);
 
-        entry
-            .manager
-            .ensure_running_with_full_config(mounts, ports, resources)
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
+            entry
+                .manager
+                .ensure_running_with_full_config(mounts, ports, resources)
+        })
+        .await?
+        .map_err(|e| ApiError::BadRequest(format!("mount validation failed: {}", e)))?;
     }
 
     // Prepare execution parameters
@@ -118,14 +126,15 @@ pub async fn run_command(
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
     // Get mounts from sandbox config (converted to protocol format)
+    // Tags are "smolvm0", "smolvm1", etc. based on mount index
     let mounts_config = {
         let entry = entry.lock();
         entry
             .mounts
             .iter()
-            .map(|m| {
-                // Create virtiofs tag from source path
-                let tag = format!("mount{}", m.source.replace('/', "_"));
+            .enumerate()
+            .map(|(i, m)| {
+                let tag = format!("smolvm{}", i);
                 (tag, m.target.clone(), m.readonly)
             })
             .collect::<Vec<_>>()
@@ -170,8 +179,13 @@ pub async fn stream_logs(
             .to_path_buf()
     };
 
-    // Check if file exists
-    if !log_path.exists() {
+    // Check if file exists (blocking check is acceptable here since it's fast)
+    let path_check = log_path.clone();
+    let exists = tokio::task::spawn_blocking(move || path_check.exists())
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+
+    if !exists {
         return Err(ApiError::NotFound(format!(
             "log file not found: {}",
             log_path.display()
@@ -181,73 +195,124 @@ pub async fn stream_logs(
     let follow = query.follow;
     let tail = query.tail;
 
+    // For tail, read last N lines upfront using spawn_blocking with bounded memory
+    let (initial_lines, start_pos) = if let Some(n) = tail {
+        let path = log_path.clone();
+        tokio::task::spawn_blocking(move || read_last_n_lines_bounded(&path, n))
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+    } else {
+        (Vec::new(), 0)
+    };
+
     // Create the SSE stream
     let stream = async_stream::stream! {
-        // Open the log file
-        let file = match std::fs::File::open(&log_path) {
-            Ok(f) => f,
-            Err(e) => {
-                yield Ok(Event::default().data(format!("error: failed to open log file: {}", e)));
-                return;
-            }
-        };
-
-        let mut reader = BufReader::new(file);
-
-        // If tail is specified, seek to show only last N lines
-        if let Some(n) = tail {
-            let lines: Vec<String> = reader.by_ref().lines().filter_map(|l: Result<String, _>| l.ok()).collect();
-            let start = lines.len().saturating_sub(n);
-            for line in lines.into_iter().skip(start) {
-                yield Ok(Event::default().data(line));
-            }
-
-            if !follow {
-                return;
-            }
-
-            // Re-open file for following (seek to end)
-            let file = match std::fs::File::open(&log_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    yield Ok(Event::default().data(format!("error: failed to reopen log file: {}", e)));
-                    return;
-                }
-            };
-            reader = BufReader::new(file);
-            if let Err(e) = reader.seek(SeekFrom::End(0)) {
-                yield Ok(Event::default().data(format!("error: failed to seek: {}", e)));
-                return;
-            }
+        // Emit initial tail lines first
+        for line in initial_lines {
+            yield Ok(Event::default().data(line));
         }
 
-        // Read existing content (or follow new content)
-        let mut line_buf = String::new();
+        if tail.is_some() && !follow {
+            return;
+        }
+
+        // For following or full read, poll the file for new content
+        let mut pos = if tail.is_some() { start_pos } else { 0 };
+        let mut partial_line = String::new();
+
         loop {
-            line_buf.clear();
-            match reader.read_line(&mut line_buf) {
-                Ok(0) => {
-                    // EOF reached
-                    if follow {
-                        // Wait a bit and try again
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        continue;
-                    } else {
-                        break;
+            // Read new content in spawn_blocking
+            let path = log_path.clone();
+            let current_pos = pos;
+
+            let result = tokio::task::spawn_blocking(move || {
+                read_from_position(&path, current_pos)
+            }).await;
+
+            match result {
+                Ok(Ok((new_data, new_pos))) => {
+                    pos = new_pos;
+                    if !new_data.is_empty() {
+                        partial_line.push_str(&new_data);
+                        // Yield complete lines
+                        while let Some(newline_pos) = partial_line.find('\n') {
+                            let line = partial_line[..newline_pos].trim_end_matches('\r').to_string();
+                            partial_line = partial_line[newline_pos + 1..].to_string();
+                            yield Ok(Event::default().data(line));
+                        }
                     }
                 }
-                Ok(_) => {
-                    // Remove trailing newline
-                    let line = line_buf.trim_end_matches('\n').trim_end_matches('\r');
-                    yield Ok(Event::default().data(line.to_string()));
+                Ok(Err(e)) => {
+                    yield Ok(Event::default().data(format!("error: {}", e)));
+                    break;
                 }
                 Err(e) => {
-                    yield Ok(Event::default().data(format!("error: read failed: {}", e)));
+                    yield Ok(Event::default().data(format!("error: {}", e)));
                     break;
                 }
             }
+
+            if !follow {
+                // Yield any remaining partial line
+                if !partial_line.is_empty() {
+                    yield Ok(Event::default().data(partial_line.clone()));
+                }
+                break;
+            }
+
+            // Wait before polling again
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     };
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// Read the last N lines from a file using a bounded ring buffer.
+/// Returns (lines, file_position_at_end) for follow mode.
+fn read_last_n_lines_bounded(
+    path: &std::path::Path,
+    n: usize,
+) -> std::io::Result<(Vec<String>, u64)> {
+    use std::collections::VecDeque;
+
+    let file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    let file_len = metadata.len();
+
+    let reader = BufReader::new(file);
+
+    // Use a ring buffer to keep only the last N lines in memory
+    let mut ring: VecDeque<String> = VecDeque::with_capacity(n + 1);
+
+    for line in reader.lines() {
+        let line = line?;
+        if ring.len() == n {
+            ring.pop_front();
+        }
+        ring.push_back(line);
+    }
+
+    Ok((ring.into_iter().collect(), file_len))
+}
+
+/// Read new content from a file starting at a given position.
+fn read_from_position(path: &std::path::Path, pos: u64) -> std::io::Result<(String, u64)> {
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    let file_len = metadata.len();
+
+    if pos >= file_len {
+        // No new content
+        return Ok((String::new(), pos));
+    }
+
+    file.seek(SeekFrom::Start(pos))?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf)?;
+
+    Ok((buf, file_len))
 }

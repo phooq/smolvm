@@ -62,22 +62,26 @@ pub async fn pull_image(
 
     let entry = state.get_sandbox(&sandbox_id)?;
 
-    // Ensure sandbox is running
+    // Ensure sandbox is running (blocking operation)
     {
-        let entry = entry.lock();
-        let mounts_result: Result<Vec<_>, _> = entry
-            .mounts
-            .iter()
-            .map(mount_spec_to_host_mount)
-            .collect();
-        let mounts = mounts_result.map_err(|e| ApiError::Internal(e.to_string()))?;
-        let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
-        let resources = resource_spec_to_vm_resources(&entry.resources);
+        let entry_clone = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let entry = entry_clone.lock();
+            let mounts_result: Result<Vec<_>, _> = entry
+                .mounts
+                .iter()
+                .map(mount_spec_to_host_mount)
+                .collect();
+            let mounts = mounts_result?;
+            let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
+            let resources = resource_spec_to_vm_resources(&entry.resources);
 
-        entry
-            .manager
-            .ensure_running_with_full_config(mounts, ports, resources)
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
+            entry
+                .manager
+                .ensure_running_with_full_config(mounts, ports, resources)
+        })
+        .await?
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
     }
 
     // Pull image in blocking task

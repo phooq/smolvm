@@ -55,8 +55,15 @@ stop_server() {
 }
 
 cleanup() {
-    curl -s -X DELETE "$API_URL/api/v1/sandboxes/$SANDBOX_NAME" >/dev/null 2>&1 || true
+    # Delete sandbox via API (this stops the VM properly)
+    if curl -s "$API_URL/health" >/dev/null 2>&1; then
+        curl -s -X DELETE "$API_URL/api/v1/sandboxes/$SANDBOX_NAME" >/dev/null 2>&1 || true
+    fi
     stop_server
+
+    # Fallback: if server died unexpectedly, try to stop any orphan VMs
+    # This handles cases where tests were interrupted
+    $SMOLVM microvm stop 2>/dev/null || true
 }
 
 trap cleanup EXIT

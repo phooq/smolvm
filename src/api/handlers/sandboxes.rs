@@ -13,8 +13,23 @@ use crate::api::state::{
     ApiState,
 };
 use crate::api::types::{
-    CreateSandboxRequest, ListSandboxesResponse, ResourceSpec, SandboxInfo,
+    CreateSandboxRequest, ListSandboxesResponse, MountInfo, MountSpec, ResourceSpec, SandboxInfo,
 };
+use crate::config::RecordState;
+
+/// Convert MountSpec list to MountInfo list with virtiofs tags.
+fn mounts_to_info(mounts: &[MountSpec]) -> Vec<MountInfo> {
+    mounts
+        .iter()
+        .enumerate()
+        .map(|(i, m)| MountInfo {
+            tag: format!("smolvm{}", i),
+            source: m.source.clone(),
+            target: m.target.clone(),
+            readonly: m.readonly,
+        })
+        .collect()
+}
 
 /// POST /api/v1/sandboxes - Create a new sandbox.
 pub async fn create_sandbox(
@@ -74,10 +89,10 @@ pub async fn create_sandbox(
     )?;
 
     Ok(Json(SandboxInfo {
-        name: req.name,
+        name: req.name.clone(),
         state: agent_state,
         pid,
-        mounts: req.mounts,
+        mounts: mounts_to_info(&req.mounts),
         ports: req.ports,
         resources,
     }))
@@ -106,7 +121,7 @@ pub async fn get_sandbox(
         name: id,
         state: agent_state,
         pid,
-        mounts: entry.mounts.clone(),
+        mounts: mounts_to_info(&entry.mounts),
         ports: entry.ports.clone(),
         resources: entry.resources.clone(),
     }))
@@ -151,7 +166,7 @@ pub async fn start_sandbox(
     .await?
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Get updated state
+    // Get updated state and persist
     let (agent_state, pid) = {
         let entry = entry.lock();
         let agent_state = format!("{:?}", entry.manager.state()).to_lowercase();
@@ -159,11 +174,14 @@ pub async fn start_sandbox(
         (agent_state, pid)
     };
 
+    // Persist state to config
+    state.update_sandbox_state(&id, RecordState::Running, pid);
+
     Ok(Json(SandboxInfo {
         name: id,
         state: agent_state,
         pid,
-        mounts: mounts_spec,
+        mounts: mounts_to_info(&mounts_spec),
         ports: ports_spec,
         resources: resources_spec,
     }))
@@ -195,7 +213,7 @@ pub async fn stop_sandbox(
     .await?
     .map_err(|e| ApiError::Internal(e.to_string()))?;
 
-    // Get updated state
+    // Get updated state and persist
     let (agent_state, pid) = {
         let entry = entry.lock();
         let agent_state = format!("{:?}", entry.manager.state()).to_lowercase();
@@ -203,11 +221,14 @@ pub async fn stop_sandbox(
         (agent_state, pid)
     };
 
+    // Persist state to config
+    state.update_sandbox_state(&id, RecordState::Stopped, None);
+
     Ok(Json(SandboxInfo {
         name: id,
         state: agent_state,
         pid,
-        mounts: mounts_spec,
+        mounts: mounts_to_info(&mounts_spec),
         ports: ports_spec,
         resources: resources_spec,
     }))

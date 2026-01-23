@@ -26,7 +26,7 @@ use axum::{
 };
 use std::sync::Arc;
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::CorsLayer,
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -38,8 +38,12 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
     // Health check route
     let health_route = Router::new().route("/health", get(handlers::health::health));
 
-    // Sandbox routes
-    let sandbox_routes = Router::new()
+    // SSE logs route (no timeout - streams indefinitely)
+    let logs_route = Router::new()
+        .route("/:id/logs", get(handlers::exec::stream_logs));
+
+    // Sandbox routes with timeout
+    let sandbox_routes_with_timeout = Router::new()
         .route("/", post(handlers::sandboxes::create_sandbox))
         .route("/", get(handlers::sandboxes::list_sandboxes))
         .route("/:id", get(handlers::sandboxes::get_sandbox))
@@ -49,7 +53,6 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         // Exec routes
         .route("/:id/exec", post(handlers::exec::exec_command))
         .route("/:id/run", post(handlers::exec::run_command))
-        .route("/:id/logs", get(handlers::exec::stream_logs))
         // Container routes
         .route("/:id/containers", post(handlers::containers::create_container))
         .route("/:id/containers", get(handlers::containers::list_containers))
@@ -71,22 +74,39 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         )
         // Image routes
         .route("/:id/images", get(handlers::images::list_images))
-        .route("/:id/images/pull", post(handlers::images::pull_image));
+        .route("/:id/images/pull", post(handlers::images::pull_image))
+        // Apply timeout only to these routes
+        .layer(TimeoutLayer::new(std::time::Duration::from_secs(300)));
+
+    // Combine sandbox routes (with and without timeout)
+    let sandbox_routes = Router::new()
+        .merge(logs_route)
+        .merge(sandbox_routes_with_timeout);
 
     // API v1 routes
     let api_v1 = Router::new().nest("/sandboxes", sandbox_routes);
+
+    // CORS: Allow localhost origins only by default for security.
+    // Production deployments should configure their own CORS policy.
+    let cors = CorsLayer::new()
+        .allow_origin([
+            "http://localhost:8080".parse().unwrap(),
+            "http://127.0.0.1:8080".parse().unwrap(),
+            "http://localhost:3000".parse().unwrap(),
+            "http://127.0.0.1:3000".parse().unwrap(),
+        ])
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::DELETE,
+        ])
+        .allow_headers([axum::http::header::CONTENT_TYPE]);
 
     // Combine all routes
     Router::new()
         .merge(health_route)
         .nest("/api/v1", api_v1)
-        .layer(TimeoutLayer::new(std::time::Duration::from_secs(300)))
         .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .layer(cors)
         .with_state(state)
 }

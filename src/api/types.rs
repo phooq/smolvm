@@ -11,9 +11,6 @@ use serde::{Deserialize, Serialize};
 pub struct CreateSandboxRequest {
     /// Unique name for the sandbox.
     pub name: String,
-    /// Default image for the sandbox (optional).
-    #[serde(default)]
-    pub image: Option<String>,
     /// Host mounts to attach.
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
@@ -25,7 +22,7 @@ pub struct CreateSandboxRequest {
     pub resources: Option<ResourceSpec>,
 }
 
-/// Mount specification.
+/// Mount specification (for requests).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MountSpec {
     /// Host path to mount.
@@ -34,6 +31,19 @@ pub struct MountSpec {
     pub target: String,
     /// Read-only mount.
     #[serde(default)]
+    pub readonly: bool,
+}
+
+/// Mount information (for responses, includes virtiofs tag).
+#[derive(Debug, Clone, Serialize)]
+pub struct MountInfo {
+    /// Virtiofs tag (e.g., "smolvm0"). Use this in container mounts.
+    pub tag: String,
+    /// Host path.
+    pub source: String,
+    /// Path inside the sandbox.
+    pub target: String,
+    /// Read-only mount.
     pub readonly: bool,
 }
 
@@ -67,8 +77,8 @@ pub struct SandboxInfo {
     /// Process ID (if running).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<i32>,
-    /// Configured mounts.
-    pub mounts: Vec<MountSpec>,
+    /// Configured mounts (with virtiofs tags for use in container mounts).
+    pub mounts: Vec<MountInfo>,
     /// Configured ports.
     pub ports: Vec<PortSpec>,
     /// VM resources.
@@ -164,9 +174,15 @@ pub struct CreateContainerRequest {
 }
 
 /// Container mount specification.
+///
+/// Note: The `source` field is the virtiofs tag, which corresponds to
+/// host mounts configured on the sandbox. Tags are assigned in order:
+/// `smolvm0`, `smolvm1`, etc. based on the sandbox's mount configuration.
+/// Use `GET /api/v1/sandboxes/:id` to see the tag-to-path mapping.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ContainerMountSpec {
-    /// Source path (virtiofs tag).
+    /// Virtiofs tag (e.g., "smolvm0", "smolvm1").
+    /// These correspond to sandbox mounts in order.
     pub source: String,
     /// Target path in container.
     pub target: String,

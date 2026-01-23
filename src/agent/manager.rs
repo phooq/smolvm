@@ -195,6 +195,14 @@ impl AgentManager {
     /// Returns Some(()) if agent is running and reachable, None otherwise.
     /// This also updates the internal state to Running if successful.
     pub fn try_connect_existing(&self) -> Option<()> {
+        self.try_connect_existing_with_pid(None)
+    }
+
+    /// Try to reconnect to an existing agent with a known PID.
+    ///
+    /// If the PID is provided and the process is alive, sets the child process.
+    /// Returns Some(()) if agent is running and reachable, None otherwise.
+    pub fn try_connect_existing_with_pid(&self, pid: Option<i32>) -> Option<()> {
         if !self.vsock_socket.exists() {
             return None;
         }
@@ -205,7 +213,12 @@ impl AgentManager {
                 // Update internal state to reflect running
                 let mut inner = self.inner.lock().unwrap();
                 inner.state = AgentState::Running;
-                // Note: we don't know the PID but that's ok for status checks
+                // Set the child process if PID is known and process is alive
+                if let Some(p) = pid {
+                    if process::is_alive(p) {
+                        inner.child = Some(ChildProcess::new(p));
+                    }
+                }
                 return Some(());
             }
         }
