@@ -85,6 +85,7 @@ pub use agent::{AgentClient, AgentManager};
 pub use config::{RecordState, RestartConfig, RestartPolicy, SmolvmConfig, VmRecord};
 pub use db::SmolvmDb;
 pub use error::{Error, Result};
+pub use mount::MountBinding;
 pub use process::ChildProcess;
 pub use vm::config::{HostMount, NetworkPolicy, Resources, RootfsSource, Timeouts, VmConfig, VmId};
 pub use vm::state::{ExitReason, VmState};

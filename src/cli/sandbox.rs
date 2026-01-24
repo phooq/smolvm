@@ -7,54 +7,24 @@
 //! - Runs the container
 //! - Cleans up after execution
 
+use crate::cli::parsers::{parse_duration, parse_env_spec, parse_mounts, parse_port};
 use clap::{Args, Subcommand};
-use smolvm::agent::{AgentClient, AgentManager, HostMount, PortMapping, VmResources};
-use std::path::PathBuf;
+use smolvm::agent::{AgentClient, AgentManager, PortMapping, VmResources};
 use std::time::Duration;
-
-/// Parse a duration string (e.g., "30s", "5m", "1h").
-fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
-    humantime::parse_duration(s)
-}
-
-/// Parse a port mapping specification (HOST:GUEST or PORT).
-fn parse_port(s: &str) -> Result<PortMapping, String> {
-    if let Some((host, guest)) = s.split_once(':') {
-        let host: u16 = host
-            .parse()
-            .map_err(|_| format!("invalid host port: {}", host))?;
-        let guest: u16 = guest
-            .parse()
-            .map_err(|_| format!("invalid guest port: {}", guest))?;
-        Ok(PortMapping::new(host, guest))
-    } else {
-        let port: u16 = s.parse().map_err(|_| format!("invalid port: {}", s))?;
-        Ok(PortMapping::same(port))
-    }
-}
-
-/// Parse an environment variable specification (KEY=VALUE).
-fn parse_env_spec(spec: &str) -> Option<(String, String)> {
-    let (key, value) = spec.split_once('=')?;
-    if key.is_empty() {
-        return None;
-    }
-    Some((key.to_string(), value.to_string()))
-}
 
 /// Quick sandbox commands for running containers
 #[derive(Subcommand, Debug)]
 pub enum SandboxCmd {
-    /// Run a container in a sandbox (ephemeral or persistent with -d)
+    /// Run a container image (ephemeral by default, use -d to keep running)
     Run(RunCmd),
 
-    /// Execute a command in the running sandbox
+    /// Execute a command in an existing sandbox container
     Exec(ExecCmd),
 
-    /// Stop a running sandbox
+    /// Stop the sandbox and clean up
     Stop(StopCmd),
 
-    /// Show sandbox status
+    /// Show sandbox status and running containers
     Status(StatusCmd),
 }
 
@@ -73,9 +43,10 @@ impl SandboxCmd {
 // Exec Command
 // ============================================================================
 
-/// Execute a command in the running sandbox.
+/// Execute a command in the running sandbox container.
 ///
-/// This finds the container in the sandbox and runs a command inside it.
+/// Requires a sandbox started with `sandbox run -d`. Use `sandbox status`
+/// to check if a sandbox is running.
 ///
 /// Examples:
 ///   smolvm sandbox exec -- ls -la
@@ -83,20 +54,20 @@ impl SandboxCmd {
 ///   smolvm sandbox exec -e FOO=bar -- env
 #[derive(Args, Debug)]
 pub struct ExecCmd {
-    /// Command to execute
-    #[arg(trailing_var_arg = true, required = true)]
+    /// Command and arguments to execute
+    #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 
-    /// Working directory inside container
-    #[arg(short = 'w', long)]
+    /// Set working directory inside container
+    #[arg(short = 'w', long, value_name = "DIR")]
     pub workdir: Option<String>,
 
-    /// Environment variable (KEY=VALUE)
-    #[arg(short = 'e', long = "env")]
+    /// Set environment variable (can be used multiple times)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 
-    /// Timeout for command execution (e.g., "30s", "5m")
-    #[arg(long, value_parser = parse_duration)]
+    /// Kill command after duration (e.g., "30s", "5m")
+    #[arg(long, value_parser = parse_duration, value_name = "DURATION")]
     pub timeout: Option<Duration>,
 }
 
@@ -230,73 +201,68 @@ impl StatusCmd {
 
 /// Run a container in a sandbox.
 ///
-/// By default, runs in ephemeral mode:
-/// - Starts a microVM automatically
-/// - Pulls and runs the container image
-/// - Cleans up everything after the command exits
-///
-/// With --detach, runs in persistent mode:
-/// - Starts microVM and container in background
-/// - Returns container ID for later interaction
-/// - Use `smolvm container exec` to run commands
-/// - Use `smolvm sandbox stop` to clean up
+/// By default, runs in ephemeral mode (container + VM cleaned up after exit).
+/// Use -d/--detach to keep the sandbox running for later interaction.
 ///
 /// Examples:
-///   smolvm sandbox run alpine -- echo "Hello"     # Ephemeral
-///   smolvm sandbox run -d ubuntu                   # Persistent
-///   smolvm sandbox run -d -p 8080:80 nginx        # Persistent with port
+///   smolvm sandbox run alpine -- echo "Hello"     # Ephemeral, exits after
+///   smolvm sandbox run -it alpine                  # Interactive shell
+///   smolvm sandbox run -d ubuntu                   # Detached, keeps running
+///   smolvm sandbox run -d -p 8080:80 nginx        # Web server with port
+///   smolvm sandbox run -v ./src:/app node -- npm start
 #[derive(Args, Debug)]
 pub struct RunCmd {
-    /// OCI image reference (e.g., alpine, ubuntu:22.04, ghcr.io/org/image)
+    /// Container image (e.g., alpine, ubuntu:22.04, ghcr.io/org/image)
+    #[arg(value_name = "IMAGE")]
     pub image: String,
 
-    /// Command to execute inside the container
-    #[arg(trailing_var_arg = true)]
+    /// Command and arguments to run (default: image entrypoint or /bin/sh)
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 
-    /// Run in detached/persistent mode (keeps sandbox running)
-    #[arg(short = 'd', long)]
+    /// Run in background and keep sandbox alive after command exits
+    #[arg(short = 'd', long, help_heading = "Execution")]
     pub detach: bool,
 
-    /// Number of vCPUs (default: 1)
-    #[arg(long, default_value = "1")]
-    pub cpus: u8,
-
-    /// Memory in MiB (default: 512)
-    #[arg(long, default_value = "512")]
-    pub mem: u32,
-
-    /// Working directory inside the container
-    #[arg(short = 'w', long)]
-    pub workdir: Option<String>,
-
-    /// Environment variable (KEY=VALUE)
-    #[arg(short = 'e', long = "env")]
-    pub env: Vec<String>,
-
-    /// Volume mount (host:container[:ro])
-    #[arg(short = 'v', long = "volume")]
-    pub volume: Vec<String>,
-
-    /// Enable network egress (auto-enabled when -p is used)
-    #[arg(long)]
-    pub net: bool,
-
-    /// Port mapping from host to guest (HOST:GUEST or PORT)
-    #[arg(short = 'p', long = "port", value_parser = parse_port)]
-    pub port: Vec<PortMapping>,
-
-    /// Timeout for command execution (e.g., "30s", "5m")
-    #[arg(long, value_parser = parse_duration)]
-    pub timeout: Option<Duration>,
-
-    /// Keep stdin open (interactive mode)
-    #[arg(short = 'i', long)]
+    /// Keep stdin open for interactive input
+    #[arg(short = 'i', long, help_heading = "Execution")]
     pub interactive: bool,
 
-    /// Allocate a pseudo-TTY
-    #[arg(short = 't', long)]
+    /// Allocate a pseudo-TTY (use with -i for interactive shells)
+    #[arg(short = 't', long, help_heading = "Execution")]
     pub tty: bool,
+
+    /// Kill command after duration (e.g., "30s", "5m", "1h")
+    #[arg(long, value_parser = parse_duration, value_name = "DURATION", help_heading = "Execution")]
+    pub timeout: Option<Duration>,
+
+    /// Set working directory inside container
+    #[arg(short = 'w', long, value_name = "DIR", help_heading = "Container")]
+    pub workdir: Option<String>,
+
+    /// Set environment variable (can be used multiple times)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE", help_heading = "Container")]
+    pub env: Vec<String>,
+
+    /// Mount host directory into container (can be used multiple times)
+    #[arg(short = 'v', long = "volume", value_name = "HOST:CONTAINER[:ro]", help_heading = "Container")]
+    pub volume: Vec<String>,
+
+    /// Expose port from container to host (can be used multiple times)
+    #[arg(short = 'p', long = "port", value_parser = parse_port, value_name = "HOST:GUEST", help_heading = "Network")]
+    pub port: Vec<PortMapping>,
+
+    /// Enable outbound network access
+    #[arg(long, help_heading = "Network")]
+    pub net: bool,
+
+    /// Number of virtual CPUs
+    #[arg(long, default_value = "1", value_name = "N", help_heading = "Resources")]
+    pub cpus: u8,
+
+    /// Memory allocation in MiB
+    #[arg(long, default_value = "512", value_name = "MiB", help_heading = "Resources")]
+    pub mem: u32,
 }
 
 impl RunCmd {
@@ -433,56 +399,3 @@ impl RunCmd {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Parse volume mount specifications into HostMount structs.
-fn parse_mounts(specs: &[String]) -> smolvm::Result<Vec<HostMount>> {
-    use smolvm::Error;
-
-    let mut mounts = Vec::new();
-
-    for spec in specs {
-        let parts: Vec<&str> = spec.split(':').collect();
-        if parts.len() < 2 {
-            return Err(Error::Mount(format!(
-                "invalid volume specification '{}': expected host:container[:ro]",
-                spec
-            )));
-        }
-
-        let host_path = PathBuf::from(parts[0]);
-        let guest_path = PathBuf::from(parts[1]);
-        let read_only = parts.get(2).map(|&s| s == "ro").unwrap_or(false);
-
-        // Validate host path exists
-        if !host_path.exists() {
-            return Err(Error::Mount(format!(
-                "host path does not exist: {}",
-                host_path.display()
-            )));
-        }
-
-        // Must be a directory (virtiofs limitation)
-        if !host_path.is_dir() {
-            return Err(Error::Mount(format!(
-                "host path must be a directory (virtiofs limitation): {}",
-                host_path.display()
-            )));
-        }
-
-        // Canonicalize host path
-        let host_path = host_path.canonicalize().map_err(|e| {
-            Error::Mount(format!("failed to resolve host path '{}': {}", parts[0], e))
-        })?;
-
-        mounts.push(HostMount {
-            source: host_path,
-            target: guest_path,
-            read_only,
-        });
-    }
-
-    Ok(mounts)
-}

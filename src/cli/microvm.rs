@@ -9,69 +9,41 @@
 //! - status: Show microvm status
 //! - ls: List all named VMs
 
+use crate::cli::parsers::{parse_duration, parse_env_spec, parse_mounts_as_tuples, parse_port};
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager, HostMount, PortMapping, VmResources};
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Parse a duration string (e.g., "30s", "5m", "1h").
-fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
-    humantime::parse_duration(s)
-}
-
-/// Parse a port mapping specification (HOST:GUEST or PORT).
-fn parse_port(s: &str) -> Result<PortMapping, String> {
-    if let Some((host, guest)) = s.split_once(':') {
-        let host: u16 = host
-            .parse()
-            .map_err(|_| format!("invalid host port: {}", host))?;
-        let guest: u16 = guest
-            .parse()
-            .map_err(|_| format!("invalid guest port: {}", guest))?;
-        Ok(PortMapping::new(host, guest))
-    } else {
-        let port: u16 = s.parse().map_err(|_| format!("invalid port: {}", s))?;
-        Ok(PortMapping::same(port))
-    }
-}
-
-/// Parse an environment variable specification (KEY=VALUE).
-fn parse_env_spec(spec: &str) -> Option<(String, String)> {
-    let (key, value) = spec.split_once('=')?;
-    if key.is_empty() {
-        return None;
-    }
-    Some((key.to_string(), value.to_string()))
-}
-
-/// Manage microvms
+/// Manage persistent microVMs
 #[derive(Subcommand, Debug)]
 pub enum MicrovmCmd {
-    /// Execute a command in a microvm (persistent - microvm keeps running)
+    /// Run a command directly in the VM (not in a container)
     Exec(ExecCmd),
 
-    /// Create a named VM configuration without starting it
+    /// Create a new named microVM configuration
     Create(CreateCmd),
 
-    /// Start a microvm (named or default)
+    /// Start a microVM
     Start(StartCmd),
 
-    /// Stop a microvm (named or default)
+    /// Stop a running microVM
     Stop(StopCmd),
 
-    /// Delete a named VM configuration
-    #[command(alias = "rm")]
+    /// Delete a microVM configuration
+    #[command(visible_alias = "rm")]
     Delete(DeleteCmd),
 
-    /// Show microvm status
+    /// Show microVM status
     Status(StatusCmd),
 
-    /// List all named VMs
-    #[command(alias = "list")]
+    /// List all microVMs
+    #[command(visible_alias = "list")]
     Ls(LsCmd),
 
-    /// Test network connectivity (debug TSI)
+    /// Test network connectivity from inside the VM
+    #[command(hide = true)]
     NetworkTest(NetworkTestCmd),
 }
 
@@ -94,37 +66,42 @@ impl MicrovmCmd {
 // Exec Command (Persistent) - Direct VM Execution
 // ============================================================================
 
-/// Execute a command directly in the VM (persistent - microvm keeps running).
+/// Execute a command directly in the VM's Alpine rootfs.
 ///
-/// Unlike `run`, this executes commands directly in the VM's Alpine rootfs,
-/// not inside a container. This is useful for VM-level operations and debugging.
+/// This runs commands at the VM level, not inside a container. Useful for
+/// debugging, inspecting the VM environment, or running VM-level operations.
+///
+/// Examples:
+///   smolvm microvm exec -- uname -a
+///   smolvm microvm exec --name myvm -- df -h
+///   smolvm microvm exec -it -- /bin/sh
 #[derive(Args, Debug)]
 pub struct ExecCmd {
-    /// Command to execute in the VM
-    #[arg(trailing_var_arg = true, required = true)]
+    /// Command and arguments to execute
+    #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 
-    /// Named microvm to exec into
-    #[arg(long)]
+    /// Target microVM (default: "default")
+    #[arg(long, value_name = "NAME")]
     pub name: Option<String>,
 
-    /// Working directory in the VM
-    #[arg(short = 'w', long)]
+    /// Set working directory in the VM
+    #[arg(short = 'w', long, value_name = "DIR")]
     pub workdir: Option<String>,
 
-    /// Environment variable (KEY=VALUE)
-    #[arg(short = 'e', long = "env")]
+    /// Set environment variable (can be used multiple times)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 
-    /// Timeout for command execution (e.g., "30s", "5m")
-    #[arg(long, value_parser = parse_duration)]
+    /// Kill command after duration (e.g., "30s", "5m")
+    #[arg(long, value_parser = parse_duration, value_name = "DURATION")]
     pub timeout: Option<Duration>,
 
-    /// Keep stdin open (interactive mode)
+    /// Keep stdin open for interactive input
     #[arg(short = 'i', long)]
     pub interactive: bool,
 
-    /// Allocate a pseudo-TTY
+    /// Allocate a pseudo-TTY (use with -i for shells)
     #[arg(short = 't', long)]
     pub tty: bool,
 }
@@ -189,29 +166,35 @@ impl ExecCmd {
 // Create Command
 // ============================================================================
 
-/// Create a named VM configuration without starting it.
+/// Create a named microVM configuration.
 ///
-/// This creates a microvm configuration with specified resources.
-/// Use `smolvm container` commands to run containers inside the VM.
+/// Creates a persistent VM configuration that can be started later.
+/// Use `smolvm microvm start <name>` to start, then `smolvm container`
+/// commands to run containers inside.
+///
+/// Examples:
+///   smolvm microvm create myvm
+///   smolvm microvm create webserver --cpus 2 --mem 1024 -p 80:80
 #[derive(Args, Debug)]
 pub struct CreateCmd {
-    /// VM name
+    /// Name for the microVM
+    #[arg(value_name = "NAME")]
     pub name: String,
 
-    /// Number of vCPUs
-    #[arg(long, default_value = "1")]
+    /// Number of virtual CPUs
+    #[arg(long, default_value = "1", value_name = "N")]
     pub cpus: u8,
 
-    /// Memory in MiB
-    #[arg(long, default_value = "512")]
+    /// Memory allocation in MiB
+    #[arg(long, default_value = "512", value_name = "MiB")]
     pub mem: u32,
 
-    /// Volume mount (host:guest[:ro])
-    #[arg(short = 'v', long = "volume")]
+    /// Mount host directory (can be used multiple times)
+    #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro]")]
     pub volume: Vec<String>,
 
-    /// Port mapping from host to guest (HOST:GUEST or PORT)
-    #[arg(short = 'p', long = "port", value_parser = parse_port)]
+    /// Expose port from VM to host (can be used multiple times)
+    #[arg(short = 'p', long = "port", value_parser = parse_port, value_name = "HOST:GUEST")]
     pub port: Vec<PortMapping>,
 }
 
@@ -264,10 +247,13 @@ impl CreateCmd {
 // Start Command
 // ============================================================================
 
-/// Start a microvm (named or default anonymous).
+/// Start a microVM.
+///
+/// Starts the VM process. If no name is given, starts the default VM.
 #[derive(Args, Debug)]
 pub struct StartCmd {
-    /// Named VM to start (omit for default anonymous microvm)
+    /// MicroVM to start (default: "default")
+    #[arg(value_name = "NAME")]
     pub name: Option<String>,
 }
 
@@ -389,10 +375,13 @@ impl StartCmd {
 // Stop Command
 // ============================================================================
 
-/// Stop a microvm (named or default anonymous).
+/// Stop a running microVM.
+///
+/// Gracefully stops the VM process. Running containers will be terminated.
 #[derive(Args, Debug)]
 pub struct StopCmd {
-    /// Named VM to stop (omit for default anonymous microvm)
+    /// MicroVM to stop (default: "default")
+    #[arg(value_name = "NAME")]
     pub name: Option<String>,
 }
 
@@ -476,13 +465,16 @@ impl StopCmd {
 // Delete Command
 // ============================================================================
 
-/// Delete a named VM configuration.
+/// Delete a microVM configuration.
+///
+/// Removes the VM configuration. Does not delete container data.
 #[derive(Args, Debug)]
 pub struct DeleteCmd {
-    /// VM name to delete
+    /// MicroVM to delete
+    #[arg(value_name = "NAME")]
     pub name: String,
 
-    /// Force deletion without confirmation
+    /// Skip confirmation prompt
     #[arg(short, long)]
     pub force: bool,
 }
@@ -525,10 +517,13 @@ impl DeleteCmd {
 // Status Command
 // ============================================================================
 
-/// Show microvm status.
+/// Show microVM status.
+///
+/// Displays whether the VM is running and its process ID.
 #[derive(Args, Debug)]
 pub struct StatusCmd {
-    /// Named microvm to check (omit for default anonymous)
+    /// MicroVM to check (default: "default")
+    #[arg(value_name = "NAME")]
     pub name: Option<String>,
 }
 
@@ -556,14 +551,16 @@ impl StatusCmd {
 // Ls Command
 // ============================================================================
 
-/// List all named VMs.
+/// List all microVMs.
+///
+/// Shows all configured VMs with their state, resources, and configuration.
 #[derive(Args, Debug)]
 pub struct LsCmd {
-    /// Show detailed output
+    /// Show detailed configuration (mounts, ports, PID)
     #[arg(short, long)]
     pub verbose: bool,
 
-    /// Output as JSON
+    /// Output in JSON format
     #[arg(long)]
     pub json: bool,
 }
@@ -707,54 +704,4 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         format!("{}...", &s[..max - 3])
     }
-}
-
-/// Parse volume mount specifications into tuple format for VmRecord storage.
-fn parse_mounts_as_tuples(specs: &[String]) -> smolvm::Result<Vec<(String, String, bool)>> {
-    use smolvm::Error;
-
-    let mut mounts = Vec::new();
-
-    for spec in specs {
-        let parts: Vec<&str> = spec.split(':').collect();
-        if parts.len() < 2 {
-            return Err(Error::Mount(format!(
-                "invalid volume specification '{}': expected host:container[:ro]",
-                spec
-            )));
-        }
-
-        let host_path = PathBuf::from(parts[0]);
-        let guest_path = parts[1].to_string();
-        let read_only = parts.get(2).map(|&s| s == "ro").unwrap_or(false);
-
-        // Validate host path exists
-        if !host_path.exists() {
-            return Err(Error::Mount(format!(
-                "host path does not exist: {}",
-                host_path.display()
-            )));
-        }
-
-        // Must be a directory
-        if !host_path.is_dir() {
-            return Err(Error::Mount(format!(
-                "host path must be a directory: {}",
-                host_path.display()
-            )));
-        }
-
-        // Canonicalize host path
-        let host_path = host_path.canonicalize().map_err(|e| {
-            Error::Mount(format!("failed to resolve host path '{}': {}", parts[0], e))
-        })?;
-
-        mounts.push((
-            host_path.to_string_lossy().to_string(),
-            guest_path,
-            read_only,
-        ));
-    }
-
-    Ok(mounts)
 }

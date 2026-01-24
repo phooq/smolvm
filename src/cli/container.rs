@@ -3,38 +3,33 @@
 //! These commands manage long-running containers via a microvm.
 //! Containers can be created, started, stopped, and deleted independently.
 
+use crate::cli::parsers::{parse_duration, parse_env_list, parse_mounts_to_bindings};
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager};
 use std::io::Write;
-use std::path::PathBuf;
 use std::time::Duration;
 
-/// Parse a duration string (e.g., "30s", "5m", "1h").
-fn parse_duration(s: &str) -> Result<Duration, humantime::DurationError> {
-    humantime::parse_duration(s)
-}
-
-/// Container management commands
+/// Manage containers inside a microVM
 #[derive(Subcommand, Debug)]
 pub enum ContainerCmd {
-    /// Create a new container from an image
+    /// Create a container from an image (does not start it)
     Create(ContainerCreateCmd),
 
-    /// Start a created container
+    /// Start a stopped container
     Start(ContainerStartCmd),
 
     /// Stop a running container
     Stop(ContainerStopCmd),
 
     /// Remove a container
-    #[command(alias = "rm")]
+    #[command(visible_alias = "rm")]
     Remove(ContainerRemoveCmd),
 
-    /// List all containers
-    #[command(alias = "ls")]
+    /// List containers in a microVM
+    #[command(visible_alias = "ls")]
     List(ContainerListCmd),
 
-    /// Execute a command in a running container
+    /// Run a command inside a container
     Exec(ContainerExecCmd),
 }
 
@@ -73,29 +68,38 @@ fn ensure_microvm(name: &str) -> smolvm::Result<AgentManager> {
 // Create
 // ============================================================================
 
-/// Create a new container from an image
+/// Create a container from an image.
+///
+/// Creates a container in the specified microVM. The container starts
+/// automatically if no command is specified (runs sleep infinity).
+///
+/// Examples:
+///   smolvm container create default alpine
+///   smolvm container create myvm nginx -- nginx -g "daemon off;"
 #[derive(Args, Debug)]
 pub struct ContainerCreateCmd {
-    /// Target microvm name
+    /// Target microVM name
+    #[arg(value_name = "MICROVM")]
     pub microvm: String,
 
-    /// OCI image reference
+    /// Container image (e.g., alpine, nginx:latest)
+    #[arg(value_name = "IMAGE")]
     pub image: String,
 
-    /// Command to run in the container (default: ["sleep", "infinity"])
-    #[arg(trailing_var_arg = true)]
+    /// Command to run (default: sleep infinity)
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 
-    /// Working directory inside container
-    #[arg(short = 'w', long)]
+    /// Set working directory inside container
+    #[arg(short = 'w', long, value_name = "DIR")]
     pub workdir: Option<String>,
 
-    /// Environment variable (KEY=VALUE)
-    #[arg(short = 'e', long = "env")]
+    /// Set environment variable (can be used multiple times)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 
-    /// Volume mount (host:container[:ro])
-    #[arg(short = 'v', long = "volume")]
+    /// Mount host directory (can be used multiple times)
+    #[arg(short = 'v', long = "volume", value_name = "HOST:CONTAINER[:ro]")]
     pub volume: Vec<String>,
 }
 
@@ -113,7 +117,7 @@ impl ContainerCreateCmd {
         }
 
         // Parse environment variables
-        let env = parse_env(&self.env);
+        let env = parse_env_list(&self.env);
 
         // Parse mounts
         let mounts = parse_mounts_to_bindings(&self.volume)?;
@@ -144,13 +148,17 @@ impl ContainerCreateCmd {
 // Start
 // ============================================================================
 
-/// Start a created container
+/// Start a stopped container.
+///
+/// Resumes execution of a container that was previously stopped.
 #[derive(Args, Debug)]
 pub struct ContainerStartCmd {
-    /// Target microvm name
+    /// Target microVM name
+    #[arg(value_name = "MICROVM")]
     pub microvm: String,
 
     /// Container ID (full or prefix)
+    #[arg(value_name = "CONTAINER")]
     pub container_id: String,
 }
 
@@ -173,17 +181,21 @@ impl ContainerStartCmd {
 // Stop
 // ============================================================================
 
-/// Stop a running container
+/// Stop a running container.
+///
+/// Sends SIGTERM, then SIGKILL after timeout if container doesn't stop.
 #[derive(Args, Debug)]
 pub struct ContainerStopCmd {
-    /// Target microvm name
+    /// Target microVM name
+    #[arg(value_name = "MICROVM")]
     pub microvm: String,
 
     /// Container ID (full or prefix)
+    #[arg(value_name = "CONTAINER")]
     pub container_id: String,
 
-    /// Timeout before force kill (default: 10s)
-    #[arg(short = 't', long, value_parser = parse_duration)]
+    /// Seconds to wait before force kill (default: 10)
+    #[arg(short = 't', long, value_parser = parse_duration, value_name = "DURATION")]
     pub timeout: Option<Duration>,
 }
 
@@ -207,16 +219,20 @@ impl ContainerStopCmd {
 // Remove
 // ============================================================================
 
-/// Remove a container
+/// Remove a container.
+///
+/// Deletes a stopped container. Use -f to remove a running container.
 #[derive(Args, Debug)]
 pub struct ContainerRemoveCmd {
-    /// Target microvm name
+    /// Target microVM name
+    #[arg(value_name = "MICROVM")]
     pub microvm: String,
 
     /// Container ID (full or prefix)
+    #[arg(value_name = "CONTAINER")]
     pub container_id: String,
 
-    /// Force removal even if running
+    /// Force remove even if running
     #[arg(short = 'f', long)]
     pub force: bool,
 }
@@ -240,17 +256,20 @@ impl ContainerRemoveCmd {
 // List
 // ============================================================================
 
-/// List all containers
+/// List containers in a microVM.
+///
+/// By default shows only running containers. Use -a to include stopped.
 #[derive(Args, Debug)]
 pub struct ContainerListCmd {
-    /// Target microvm name
+    /// Target microVM name
+    #[arg(value_name = "MICROVM")]
     pub microvm: String,
 
-    /// Show all containers (including stopped)
+    /// Show all containers including stopped
     #[arg(short = 'a', long)]
     pub all: bool,
 
-    /// Only display container IDs
+    /// Only show container IDs
     #[arg(short = 'q', long)]
     pub quiet: bool,
 }
@@ -333,29 +352,37 @@ impl ContainerListCmd {
 // Exec
 // ============================================================================
 
-/// Execute a command in a running container
+/// Execute a command in a running container.
+///
+/// Runs a command inside an existing container. Returns the exit code.
+///
+/// Examples:
+///   smolvm container exec default abc123 -- ls -la
+///   smolvm container exec myvm web -- /bin/sh
 #[derive(Args, Debug)]
 pub struct ContainerExecCmd {
-    /// Target microvm name
+    /// Target microVM name
+    #[arg(value_name = "MICROVM")]
     pub microvm: String,
 
     /// Container ID (full or prefix)
+    #[arg(value_name = "CONTAINER")]
     pub container_id: String,
 
-    /// Command to execute
-    #[arg(trailing_var_arg = true)]
+    /// Command to execute (default: /bin/sh)
+    #[arg(trailing_var_arg = true, value_name = "COMMAND")]
     pub command: Vec<String>,
 
-    /// Working directory inside container
-    #[arg(short = 'w', long)]
+    /// Set working directory inside container
+    #[arg(short = 'w', long, value_name = "DIR")]
     pub workdir: Option<String>,
 
-    /// Environment variable (KEY=VALUE)
-    #[arg(short = 'e', long = "env")]
+    /// Set environment variable (can be used multiple times)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 
-    /// Timeout for command execution (e.g., "30s", "5m")
-    #[arg(long, value_parser = parse_duration)]
+    /// Kill command after duration (e.g., "30s", "5m")
+    #[arg(long, value_parser = parse_duration, value_name = "DURATION")]
     pub timeout: Option<Duration>,
 }
 
@@ -365,7 +392,7 @@ impl ContainerExecCmd {
         let mut client = AgentClient::connect(manager.vsock_socket())?;
 
         // Parse environment variables
-        let env = parse_env(&self.env);
+        let env = parse_env_list(&self.env);
 
         // Default command
         let command = if self.command.is_empty() {
@@ -402,56 +429,3 @@ impl ContainerExecCmd {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Parse environment variables from CLI args
-fn parse_env(env_args: &[String]) -> Vec<(String, String)> {
-    env_args
-        .iter()
-        .filter_map(|e| {
-            let (k, v) = e.split_once('=')?;
-            if k.is_empty() {
-                None
-            } else {
-                Some((k.to_string(), v.to_string()))
-            }
-        })
-        .collect()
-}
-
-/// Parse volume mounts and convert to virtiofs bindings
-fn parse_mounts_to_bindings(volume_args: &[String]) -> smolvm::Result<Vec<(String, String, bool)>> {
-    use smolvm::Error;
-
-    let mut bindings = Vec::new();
-
-    for (i, spec) in volume_args.iter().enumerate() {
-        let parts: Vec<&str> = spec.split(':').collect();
-        if parts.len() < 2 {
-            return Err(Error::Mount(format!(
-                "invalid volume specification '{}': expected host:container[:ro]",
-                spec
-            )));
-        }
-
-        let host_path = PathBuf::from(parts[0]);
-        let guest_path = parts[1].to_string();
-        let read_only = parts.get(2).map(|&s| s == "ro").unwrap_or(false);
-
-        // Validate host path exists
-        if !host_path.exists() {
-            return Err(Error::Mount(format!(
-                "host path does not exist: {}",
-                host_path.display()
-            )));
-        }
-
-        // Use virtiofs tag format
-        let tag = format!("smolvm{}", i);
-        bindings.push((tag, guest_path, read_only));
-    }
-
-    Ok(bindings)
-}
