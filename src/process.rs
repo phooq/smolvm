@@ -190,6 +190,109 @@ pub fn stop_process(pid: libc::pid_t, timeout: Duration, force: bool) -> Result<
     }
 }
 
+/// Result of a fork operation.
+#[derive(Debug)]
+pub enum ForkResult {
+    /// This is the parent process. Contains the child's PID.
+    Parent(libc::pid_t),
+    /// This is the child process.
+    Child,
+}
+
+/// Fork a child process that becomes a session leader.
+///
+/// This function provides a safe interface to fork a child process and
+/// have it call `setsid()` to become a session leader. This is commonly
+/// used to detach VM processes from the parent's session so they survive
+/// if the parent is killed.
+///
+/// # Arguments
+///
+/// * `child_fn` - A closure to run in the child process. The closure must
+///   never return - it should either call `std::process::exit()` or exec
+///   another program.
+///
+/// # Returns
+///
+/// * `Ok(pid)` - The child's PID if this is the parent process
+/// * `Err` - If the fork failed
+///
+/// # Example
+///
+/// ```ignore
+/// let child_pid = fork_session_leader(|| {
+///     // This runs in the child process as a session leader
+///     launch_vm(...);
+///     std::process::exit(0);
+/// })?;
+/// ```
+pub fn fork_session_leader<F>(child_fn: F) -> Result<libc::pid_t>
+where
+    F: FnOnce(),
+{
+    // SAFETY: fork() creates a new process. The child inherits the parent's
+    // memory space as copy-on-write. We must be careful not to:
+    // - Hold any locks across fork (we don't)
+    // - Use async-signal-unsafe functions in the child before exec
+    //
+    // The child immediately calls setsid() and then the user-provided closure,
+    // which is expected to exec or exit.
+    let pid = unsafe { libc::fork() };
+
+    match pid {
+        -1 => {
+            // Fork failed
+            let err = std::io::Error::last_os_error();
+            Err(Error::vm_creation(format!("fork failed: {}", err)))
+        }
+        0 => {
+            // Child process
+            //
+            // SAFETY: setsid() is safe to call immediately after fork.
+            // It creates a new session and makes this process the session leader,
+            // detaching it from the parent's controlling terminal.
+            unsafe {
+                libc::setsid();
+            }
+
+            // Run the user-provided closure
+            child_fn();
+
+            // If the closure returns (it shouldn't), exit with error
+            //
+            // SAFETY: _exit() is safe in the child after fork. We use _exit()
+            // instead of exit() to avoid running atexit handlers and flushing
+            // stdio buffers that were inherited from the parent.
+            unsafe {
+                libc::_exit(1);
+            }
+        }
+        child_pid => {
+            // Parent process
+            Ok(child_pid)
+        }
+    }
+}
+
+/// Exit the current process immediately without cleanup.
+///
+/// This is a safe wrapper around `libc::_exit()` for use in forked child
+/// processes. It avoids running atexit handlers and flushing stdio buffers
+/// that were inherited from the parent.
+///
+/// # Safety
+///
+/// This function never returns. It should only be called in a forked child
+/// process after fork() to avoid double-flushing stdio buffers.
+pub fn exit_child(code: i32) -> ! {
+    // SAFETY: _exit() is safe in a forked child process. Using _exit() instead
+    // of exit() ensures we don't run atexit handlers or flush stdio buffers
+    // that were inherited from the parent process.
+    unsafe {
+        libc::_exit(code);
+    }
+}
+
 /// A handle to a running child process.
 ///
 /// Provides methods to check status, stop, and kill the process.
