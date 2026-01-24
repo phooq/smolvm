@@ -22,6 +22,22 @@ mod process;
 mod storage;
 mod vsock;
 
+// ============================================================================
+// Configuration Constants
+// ============================================================================
+
+/// Initial buffer size for reading requests from the vsock socket.
+const REQUEST_BUFFER_SIZE: usize = 64 * 1024; // 64KB
+
+/// Maximum allowed message size to prevent DoS via memory exhaustion.
+const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16MB
+
+/// Buffer size for streaming stdout/stderr in interactive mode.
+const IO_BUFFER_SIZE: usize = 4096;
+
+/// Default poll timeout in milliseconds for interactive I/O loop.
+const INTERACTIVE_POLL_TIMEOUT_MS: i32 = 100;
+
 fn main() {
     // Initialize logging
     tracing_subscriber::fmt()
@@ -77,7 +93,7 @@ fn run_server() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Handle a single connection.
 fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::error::Error>> {
-    let mut buf = vec![0u8; 64 * 1024]; // 64KB buffer
+    let mut buf = vec![0u8; REQUEST_BUFFER_SIZE];
 
     loop {
         // Read length header
@@ -92,6 +108,20 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         }
 
         let len = u32::from_be_bytes(header) as usize;
+
+        // Validate message size to prevent DoS via memory exhaustion
+        if len > MAX_MESSAGE_SIZE {
+            warn!(len = len, max = MAX_MESSAGE_SIZE, "message too large, rejecting");
+            send_response(
+                stream,
+                &AgentResponse::Error {
+                    message: format!("message size {} exceeds maximum {}", len, MAX_MESSAGE_SIZE),
+                    code: Some("MESSAGE_TOO_LARGE".to_string()),
+                },
+            )?;
+            continue;
+        }
+
         if len > buf.len() {
             buf.resize(len, 0);
         }
@@ -544,8 +574,8 @@ fn run_interactive_loop(
         set_nonblocking(stderr.as_raw_fd());
     }
 
-    let mut stdout_buf = [0u8; 4096];
-    let mut stderr_buf = [0u8; 4096];
+    let mut stdout_buf = [0u8; IO_BUFFER_SIZE];
+    let mut stderr_buf = [0u8; IO_BUFFER_SIZE];
 
     loop {
         // Check if child has exited
@@ -573,9 +603,9 @@ fn run_interactive_loop(
             Some(dl) => {
                 let remaining = dl.saturating_duration_since(Instant::now());
                 // Cap at 100ms to periodically check child exit status
-                remaining.as_millis().min(100) as i32
+                remaining.as_millis().min(INTERACTIVE_POLL_TIMEOUT_MS as u128) as i32
             }
-            None => 100, // Default 100ms poll timeout
+            None => INTERACTIVE_POLL_TIMEOUT_MS,
         };
 
         // Build poll fds array for stdout and stderr
