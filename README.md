@@ -1,13 +1,50 @@
-# smolvm, an OCI-native microVM runtime with batteries included. 
+# 🤏 smolVM
+Enable usage of microVM for sandboxing Agentic and/or containerized workloads locally with minimal setup.
 
-You can use this to... 
-- run microVM's locally on both macOS and Linux with minimal setup
-- run and sandbox coding agents locally
-- run containers within microvm for improved isolation
-
-Compared to existing tools like Firecracker, kata containers, etc.. smolvm differentiates by being easy to setup and runs on dev machines locally.
+Note: MicroVMs are lightweight virtual machines with security & isolation provided by hardware virtualization with the speed of containers.
 
 > **Alpha** - APIs can change, there may be bugs. Please submit a report or contribute!
+
+## Mission
+
+MicroVMs are used at scale to power much of the internet by hyperscalers like AWS but has been relatively unknown and inaccessible to the average developer's workflow.
+
+smolVM works to make microVM more accessible for the general developer.
+
+## What is SmolVM?
+
+An opinionated microVM manager that orchestrates multiple components:
+
+- **libkrun** - Lightweight VMM using Apple Hypervisor.framework (macOS) or KVM (Linux)
+- **libkrunfw** - Minimal Linux kernel optimized for fast boot (<500ms)
+- **crun** - OCI-compliant container runtime (runs containers inside the VM)
+- **crane** - Pulls and extracts OCI images from registries
+- **smolvm-agent** - Guest daemon handling commands via vsock 
+- **good logo** - 🤏 
+
+
+```
+┌─────────────────────────────────────────────┐
+│ Host (macOS/Linux)                          │
+│   smolvm CLI ──vsock──► smolVM            │
+│                         ├─ smolvm-agent     │
+│                         ├─ crun (container)│
+│                         └─ /storage (ext4)  │
+└─────────────────────────────────────────────┘
+```
+
+The CLI communicates with a long-running smolVM over vsock. Inside, the smolvm-agent daemon manages various responsibilities such as communication, image pulls with crane, and starting the container via crun.
+
+##  You can use this to... 
+
+- run coding agents locally and safely
+- run microVM's locally on both macOS and Linux with minimal setup
+- run containers within microvm for improved isolation
+
+## Compared to existing tools such as Firecracker, kata containers, and etc. 
+
+Smolvm differentiates by being easy to setup and runs on dev machines locally.
+
 
 ## Install
 
@@ -73,7 +110,7 @@ smolvm serve --listen 0.0.0.0:9000    # Custom address
 | macOS Apple Silicon | arm64 Linux | ✅ |
 | macOS Apple Silicon | x86_64 Linux | WIP (Rosetta 2, [experimental]) |
 | macOS Intel | x86_64 Linux | ? | No machine to test this.
-| Linux x86_64 | x86_64 Linux | ~ | WIP
+| Linux x86_64 | x86_64 Linux | WIP | My machine needs repairs.
 
 ## Known Limitations
 
@@ -85,14 +122,17 @@ smolvm serve --listen 0.0.0.0:9000    # Custom address
 ### Coding Agent File Writes
 
 ```bash
-# Works: write to mounted volume (virtiofs bypasses overlayfs)
+# Works: use top-level mount path like /workspace
 smolvm sandbox run -v ~/code:/workspace python:3.12 -- python -c "open('/workspace/out.py', 'w').write('hello')"
 
-# Fails: write to container rootfs (overlayfs triggers TSI bug)
+# Fails: nested mount paths like /mnt/code trigger the bug
+smolvm sandbox run -v ~/code:/mnt/code python:3.12 -- python -c "open('/mnt/code/out.py', 'w').write('hello')"
+
+# Fails: write to container rootfs
 smolvm sandbox run python:3.12 -- python -c "open('/tmp/out.py', 'w').write('hello')"
 ```
 
-Mount your workspace and ensure the agent writes only there.
+Use top-level mount paths (`/workspace`, `/code` ,`/documents/projectname`) - paths like `/mnt/host` which conflict with mounted paths alpine/your container will fail.
 
 ## Storage
 
@@ -111,13 +151,13 @@ AI was used to write code in this project.
 
 I write code until the first working version. 
 
-AI then review and refactor, also acts as a partner to discuss design trade-offs.
+AI then review and refactor.
 
 ## Contributions
 
-AI defaults to copying existing projects upon new obstacles and was not suitable for this project, given lack of existing projects to derive off of.
+AI defaults to copying existing projects upon new obstacles and was not suitable for this project.
 
-Please ensure to have human oversight for opening a PR.
+Please ensure to have human oversight before opening a PR.
 
 ## License
 
