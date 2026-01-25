@@ -13,6 +13,70 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+/// Configuration for running a command interactively.
+#[derive(Debug, Clone)]
+pub struct RunConfig {
+    /// OCI image to run.
+    pub image: String,
+    /// Command and arguments to execute.
+    pub command: Vec<String>,
+    /// Environment variables as (key, value) pairs.
+    pub env: Vec<(String, String)>,
+    /// Working directory inside the container.
+    pub workdir: Option<String>,
+    /// Volume mounts as (tag, guest_path, read_only) tuples.
+    pub mounts: Vec<(String, String, bool)>,
+    /// Timeout for command execution.
+    pub timeout: Option<Duration>,
+    /// Whether to allocate a TTY.
+    pub tty: bool,
+}
+
+impl RunConfig {
+    /// Create a new run configuration with the given image and command.
+    pub fn new(image: impl Into<String>, command: Vec<String>) -> Self {
+        Self {
+            image: image.into(),
+            command,
+            env: Vec::new(),
+            workdir: None,
+            mounts: Vec::new(),
+            timeout: None,
+            tty: false,
+        }
+    }
+
+    /// Set environment variables.
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
+        self
+    }
+
+    /// Set working directory.
+    pub fn with_workdir(mut self, workdir: Option<String>) -> Self {
+        self.workdir = workdir;
+        self
+    }
+
+    /// Set volume mounts.
+    pub fn with_mounts(mut self, mounts: Vec<(String, String, bool)>) -> Self {
+        self.mounts = mounts;
+        self
+    }
+
+    /// Set timeout.
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Enable TTY mode.
+    pub fn with_tty(mut self, tty: bool) -> Self {
+        self.tty = tty;
+        self
+    }
+}
+
 /// Client for communicating with the smolvm-agent.
 pub struct AgentClient {
     stream: UnixStream,
@@ -530,45 +594,30 @@ impl AgentClient {
     ///
     /// # Arguments
     ///
-    /// * `image` - Image reference (must be pulled first)
-    /// * `command` - Command and arguments
-    /// * `env` - Environment variables
-    /// * `workdir` - Working directory inside the rootfs
-    /// * `mounts` - Volume mounts as (virtiofs_tag, container_path, read_only)
-    /// * `timeout` - Optional timeout duration
-    /// * `tty` - Whether to allocate a PTY
+    /// * `config` - Run configuration including image, command, environment, etc.
     ///
     /// # Returns
     ///
     /// The exit code of the command
-    pub fn run_interactive(
-        &mut self,
-        image: &str,
-        command: Vec<String>,
-        env: Vec<(String, String)>,
-        workdir: Option<String>,
-        mounts: Vec<(String, String, bool)>,
-        timeout: Option<Duration>,
-        tty: bool,
-    ) -> Result<i32> {
+    pub fn run_interactive(&mut self, config: RunConfig) -> Result<i32> {
         use std::io::{stderr, stdout, Write};
 
         // Set long socket timeout for interactive sessions
         self.set_read_timeout(Duration::from_secs(3600))?;
 
         // Convert timeout to milliseconds for protocol
-        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+        let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
 
         // Send the run request with interactive mode
         self.send(&AgentRequest::Run {
-            image: image.to_string(),
-            command,
-            env,
-            workdir,
-            mounts,
+            image: config.image,
+            command: config.command,
+            env: config.env,
+            workdir: config.workdir,
+            mounts: config.mounts,
             timeout_ms,
             interactive: true,
-            tty,
+            tty: config.tty,
         })?;
 
         // Wait for Started response

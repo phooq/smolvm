@@ -7,9 +7,12 @@
 //! - Runs the container
 //! - Cleans up after execution
 
-use crate::cli::parsers::{parse_duration, parse_env_spec, parse_mounts, parse_port};
+use crate::cli::parsers::{
+    mounts_to_virtiofs_bindings, parse_duration, parse_env_spec, parse_mounts, parse_port,
+};
+use crate::cli::{flush_output, format_pid_suffix, truncate_id};
 use clap::{Args, Subcommand};
-use smolvm::agent::{AgentClient, AgentManager, PortMapping, VmResources};
+use smolvm::agent::{AgentClient, AgentManager, PortMapping, RunConfig, VmResources};
 use std::time::Duration;
 
 /// Quick sandbox commands for running containers
@@ -74,9 +77,8 @@ pub struct ExecCmd {
 impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
-        use std::io::Write;
 
-        let manager = AgentManager::default()?;
+        let manager = AgentManager::new_default()?;
 
         // Check if sandbox is running
         if manager.try_connect_existing().is_none() {
@@ -121,8 +123,7 @@ impl ExecCmd {
         if !stderr.is_empty() {
             eprint!("{}", stderr);
         }
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
+        flush_output();
 
         // Keep sandbox running
         std::mem::forget(manager);
@@ -140,7 +141,7 @@ pub struct StopCmd;
 
 impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = AgentManager::default()?;
+        let manager = AgentManager::new_default()?;
 
         if manager.try_connect_existing().is_some() {
             println!("Stopping sandbox...");
@@ -164,14 +165,11 @@ pub struct StatusCmd;
 
 impl StatusCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = AgentManager::default()?;
+        let manager = AgentManager::new_default()?;
 
         if manager.try_connect_existing().is_some() {
-            let pid = manager
-                .child_pid()
-                .map(|p| format!(" (PID: {})", p))
-                .unwrap_or_default();
-            println!("Sandbox: running{}", pid);
+            let pid_suffix = format_pid_suffix(manager.child_pid());
+            println!("Sandbox: running{}", pid_suffix);
 
             // Try to list containers
             if let Ok(mut client) = AgentClient::connect(manager.vsock_socket()) {
@@ -179,8 +177,7 @@ impl StatusCmd {
                     if !containers.is_empty() {
                         println!("\nContainers:");
                         for c in containers {
-                            let short_id = if c.id.len() > 12 { &c.id[..12] } else { &c.id };
-                            println!("  {} {} ({})", short_id, c.image, c.state);
+                            println!("  {} {} ({})", truncate_id(&c.id), c.image, c.state);
                         }
                     }
                 }
@@ -268,7 +265,6 @@ pub struct RunCmd {
 impl RunCmd {
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::Error;
-        use std::io::Write;
 
         // Parse volume mounts
         let mounts = parse_mounts(&self.volume)?;
@@ -280,7 +276,7 @@ impl RunCmd {
         };
 
         // Start agent VM
-        let manager = AgentManager::default()
+        let manager = AgentManager::new_default()
             .map_err(|e| Error::AgentError(format!("failed to create agent manager: {}", e)))?;
 
         // Show startup message
@@ -324,17 +320,7 @@ impl RunCmd {
             self.env.iter().filter_map(|e| parse_env_spec(e)).collect();
 
         // Convert mounts to agent format
-        let mount_bindings: Vec<(String, String, bool)> = mounts
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                (
-                    format!("smolvm{}", i),
-                    m.target.to_string_lossy().to_string(),
-                    m.read_only,
-                )
-            })
-            .collect();
+        let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
         if self.detach {
             // Detached/persistent mode: create container and keep running
@@ -359,15 +345,13 @@ impl RunCmd {
         } else {
             // Ephemeral mode: run command and clean up
             let exit_code = if self.interactive || self.tty {
-                client.run_interactive(
-                    &self.image,
-                    command,
-                    env,
-                    self.workdir.clone(),
-                    mount_bindings,
-                    self.timeout,
-                    self.tty,
-                )?
+                let config = RunConfig::new(&self.image, command)
+                    .with_env(env)
+                    .with_workdir(self.workdir.clone())
+                    .with_mounts(mount_bindings)
+                    .with_timeout(self.timeout)
+                    .with_tty(self.tty);
+                client.run_interactive(config)?
             } else {
                 let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
                     &self.image,
@@ -384,8 +368,7 @@ impl RunCmd {
                 if !stderr.is_empty() {
                     eprint!("{}", stderr);
                 }
-                let _ = std::io::stdout().flush();
-                let _ = std::io::stderr().flush();
+                flush_output();
                 exit_code
             };
 

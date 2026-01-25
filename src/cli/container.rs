@@ -4,9 +4,9 @@
 //! Containers can be created, started, stopped, and deleted independently.
 
 use crate::cli::parsers::{parse_duration, parse_env_list, parse_mounts_to_bindings};
+use crate::cli::{flush_output, truncate, truncate_id, COMMAND_WIDTH, IMAGE_NAME_WIDTH};
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager};
-use std::io::Write;
 use std::time::Duration;
 
 /// Manage containers inside a microVM
@@ -50,7 +50,7 @@ impl ContainerCmd {
 fn ensure_microvm(name: &str) -> smolvm::Result<AgentManager> {
     // "default" refers to the anonymous default microvm
     let manager = if name == "default" {
-        AgentManager::default()?
+        AgentManager::new_default()?
     } else {
         AgentManager::for_vm(name)?
     };
@@ -278,7 +278,7 @@ impl ContainerListCmd {
     pub fn run(self) -> smolvm::Result<()> {
         // "default" refers to the anonymous default microvm
         let manager = if self.microvm == "default" {
-            AgentManager::default()?
+            AgentManager::new_default()?
         } else {
             AgentManager::for_vm(&self.microvm)?
         };
@@ -316,23 +316,9 @@ impl ContainerListCmd {
                     continue;
                 }
 
-                // Truncate container ID for display
-                let short_id = if c.id.len() > 12 { &c.id[..12] } else { &c.id };
-
-                // Truncate image name for display
-                let short_image = if c.image.len() > 18 {
-                    format!("{}...", &c.image[..15])
-                } else {
-                    c.image.clone()
-                };
-
-                // Format command
-                let cmd_str = c.command.join(" ");
-                let short_cmd = if cmd_str.len() > 28 {
-                    format!("{}...", &cmd_str[..25])
-                } else {
-                    cmd_str
-                };
+                let short_id = truncate_id(&c.id);
+                let short_image = truncate(&c.image, IMAGE_NAME_WIDTH);
+                let short_cmd = truncate(&c.command.join(" "), COMMAND_WIDTH);
 
                 println!(
                     "{:<16} {:<20} {:<12} {:<30}",
@@ -418,9 +404,7 @@ impl ContainerExecCmd {
             eprint!("{}", stderr);
         }
 
-        // Flush output
-        let _ = std::io::stdout().flush();
-        let _ = std::io::stderr().flush();
+        flush_output();
 
         // Keep microvm running
         std::mem::forget(manager);
