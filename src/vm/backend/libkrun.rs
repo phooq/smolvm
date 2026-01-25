@@ -369,7 +369,7 @@ impl LibkrunVm {
 
             let pid = libc::fork();
             if pid < 0 {
-                return Err(Error::vm_creation("fork failed"));
+                Err(Error::vm_creation("fork failed"))
             } else if pid == 0 {
                 // Child process: run the VM
                 // This will call exit() when the VM exits

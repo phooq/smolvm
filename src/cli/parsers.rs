@@ -119,17 +119,23 @@ pub fn parse_mounts_as_tuples(specs: &[String]) -> smolvm::Result<Vec<(String, S
 ///
 /// Returns tuples of (virtiofs_tag, container_path, read_only).
 pub fn parse_mounts_to_bindings(specs: &[String]) -> smolvm::Result<Vec<(String, String, bool)>> {
-    parse_mounts(specs).map(|mounts| {
-        mounts
-            .into_iter()
-            .enumerate()
-            .map(|(i, m)| {
-                (
-                    format!("smolvm{}", i),
-                    m.target.to_string_lossy().to_string(),
-                    m.read_only,
-                )
-            })
-            .collect()
-    })
+    parse_mounts(specs).map(|mounts| mounts_to_virtiofs_bindings(&mounts))
+}
+
+/// Convert parsed HostMount list to virtiofs binding format for agent.
+///
+/// Returns tuples of (virtiofs_tag, container_path, read_only).
+/// The tag format is "smolvm{index}" to match libkrun virtiofs device naming.
+pub fn mounts_to_virtiofs_bindings(mounts: &[HostMount]) -> Vec<(String, String, bool)> {
+    mounts
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            (
+                format!("smolvm{}", i),
+                m.target.to_string_lossy().to_string(),
+                m.read_only,
+            )
+        })
+        .collect()
 }

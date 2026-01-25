@@ -197,7 +197,7 @@ pub fn launch_agent_vm(
 
         // Set exec command (/sbin/init)
         let exec_path = CString::new("/sbin/init").unwrap();
-        let argv_strings = vec![CString::new("/sbin/init").unwrap()];
+        let argv_strings = [CString::new("/sbin/init").unwrap()];
         let mut argv: Vec<*const libc::c_char> = argv_strings.iter().map(|s| s.as_ptr()).collect();
         argv.push(std::ptr::null());
 

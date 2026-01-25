@@ -234,7 +234,7 @@ pub fn pull_image(image: &str, platform: Option<&str>) -> Result<ImageInfo> {
     let root = Path::new(STORAGE_ROOT);
 
     // Determine platform - default to current architecture
-    let platform = platform.or_else(|| {
+    let platform = platform.or({
         #[cfg(target_arch = "aarch64")]
         {
             Some("linux/arm64")
@@ -941,7 +941,7 @@ fn crane_config(image: &str, platform: Option<&str>) -> Result<String> {
 
 /// Sanitize image name for use as filename.
 fn sanitize_image_name(image: &str) -> String {
-    image.replace('/', "_").replace(':', "_").replace('@', "_")
+    image.replace(['/', ':', '@'], "_")
 }
 
 /// Reverse sanitization.
