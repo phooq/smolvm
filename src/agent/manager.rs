@@ -628,8 +628,10 @@ impl AgentManager {
                                     let total = start.elapsed();
                                     tracing::info!(
                                         total_ms = total.as_millis(),
-                                        socket_wait_ms = socket_appeared_at.map(|d| d.as_millis()).unwrap_or(0),
-                                        connect_wait_ms = first_connect_at.map(|d| d.as_millis()).unwrap_or(0),
+                                        socket_wait_ms =
+                                            socket_appeared_at.map(|d| d.as_millis()).unwrap_or(0),
+                                        connect_wait_ms =
+                                            first_connect_at.map(|d| d.as_millis()).unwrap_or(0),
                                         "agent ready - timing breakdown"
                                     );
                                     return Ok(());

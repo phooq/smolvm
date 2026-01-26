@@ -35,8 +35,8 @@ impl VmExecutor for LinuxExecutor {
             return Err(Error::vm_creation("command cannot be empty"));
         }
 
-        let exec_path =
-            CString::new(cmd[0].as_str()).map_err(|_| Error::vm_creation("invalid command path"))?;
+        let exec_path = CString::new(cmd[0].as_str())
+            .map_err(|_| Error::vm_creation("invalid command path"))?;
 
         // Skip argv[0] - libkrun/init.krun handles it via KRUN_INIT
         let cstrings: Vec<CString> = cmd
@@ -53,11 +53,7 @@ impl VmExecutor for LinuxExecutor {
     }
 
     fn tool_search_paths(&self) -> &'static [&'static str] {
-        &[
-            "/sbin",
-            "/usr/sbin",
-            "/usr/local/sbin",
-        ]
+        &["/sbin", "/usr/sbin", "/usr/local/sbin"]
     }
 
     fn dylib_extension(&self) -> &'static str {
@@ -148,6 +144,9 @@ mod tests {
 
         // No mount script should be created
         let script_path = tmp.path().join("tmp/smolvm-mount.sh");
-        assert!(!script_path.exists(), "Linux should not create mount script");
+        assert!(
+            !script_path.exists(),
+            "Linux should not create mount script"
+        );
     }
 }

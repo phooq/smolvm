@@ -85,12 +85,9 @@ fn parse_mount_spec(spec: &str) -> smolvm::Result<HostMount> {
     }
 
     // Canonicalize host path
-    let host_path = host_path.canonicalize().map_err(|e| {
-        Error::Mount(format!(
-            "failed to resolve host path '{}': {}",
-            parts[0], e
-        ))
-    })?;
+    let host_path = host_path
+        .canonicalize()
+        .map_err(|e| Error::Mount(format!("failed to resolve host path '{}': {}", parts[0], e)))?;
 
     Ok(if read_only {
         HostMount::new(host_path, guest_path)

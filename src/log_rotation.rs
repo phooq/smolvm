@@ -164,9 +164,18 @@ mod tests {
 
         // Check rotation happened correctly
         assert!(!log_path.exists());
-        assert_eq!(fs::read_to_string(dir.path().join("test.log.1")).unwrap(), "current");
-        assert_eq!(fs::read_to_string(dir.path().join("test.log.2")).unwrap(), "old1");
-        assert_eq!(fs::read_to_string(dir.path().join("test.log.3")).unwrap(), "old2");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("test.log.1")).unwrap(),
+            "current"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("test.log.2")).unwrap(),
+            "old1"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("test.log.3")).unwrap(),
+            "old2"
+        );
     }
 
     #[test]
@@ -183,7 +192,10 @@ mod tests {
         rotate(&log_path).unwrap();
 
         // .3 should have been deleted, then recreated from .2
-        assert_eq!(fs::read_to_string(dir.path().join("test.log.3")).unwrap(), "old2");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("test.log.3")).unwrap(),
+            "old2"
+        );
     }
 
     #[test]

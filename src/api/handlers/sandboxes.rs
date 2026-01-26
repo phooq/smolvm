@@ -46,9 +46,10 @@ fn mounts_to_info(mounts: &[MountSpec]) -> Vec<MountInfo> {
 /// - No path separators (/, \)
 fn validate_sandbox_name(name: &str) -> Result<(), ApiError> {
     // Check length and get first/last chars safely
-    let first_char = name.chars().next().ok_or_else(|| {
-        ApiError::BadRequest("sandbox name cannot be empty".into())
-    })?;
+    let first_char = name
+        .chars()
+        .next()
+        .ok_or_else(|| ApiError::BadRequest("sandbox name cannot be empty".into()))?;
 
     if name.len() > MAX_NAME_LENGTH {
         return Err(ApiError::BadRequest(format!(
@@ -114,11 +115,8 @@ pub async fn create_sandbox(
     validate_sandbox_name(&req.name)?;
 
     // Validate mounts
-    let _mounts_result: Result<Vec<_>, _> = req
-        .mounts
-        .iter()
-        .map(mount_spec_to_host_mount)
-        .collect();
+    let _mounts_result: Result<Vec<_>, _> =
+        req.mounts.iter().map(mount_spec_to_host_mount).collect();
     _mounts_result.map_err(|e| ApiError::BadRequest(e.to_string()))?;
 
     let resources = req.resources.clone().unwrap_or(ResourceSpec {
@@ -168,9 +166,7 @@ pub async fn create_sandbox(
 }
 
 /// GET /api/v1/sandboxes - List all sandboxes.
-pub async fn list_sandboxes(
-    State(state): State<Arc<ApiState>>,
-) -> Json<ListSandboxesResponse> {
+pub async fn list_sandboxes(State(state): State<Arc<ApiState>>) -> Json<ListSandboxesResponse> {
     let sandboxes = state.list_sandboxes();
     Json(ListSandboxesResponse { sandboxes })
 }
@@ -212,11 +208,8 @@ pub async fn start_sandbox(
     // Get configuration from entry
     let (mounts, ports, resources, mounts_spec, ports_spec, resources_spec) = {
         let entry = entry.lock();
-        let mounts_result: Result<Vec<_>, _> = entry
-            .mounts
-            .iter()
-            .map(mount_spec_to_host_mount)
-            .collect();
+        let mounts_result: Result<Vec<_>, _> =
+            entry.mounts.iter().map(mount_spec_to_host_mount).collect();
         let mounts = mounts_result.map_err(|e| ApiError::Internal(e.to_string()))?;
         let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
         let resources = resource_spec_to_vm_resources(&entry.resources);

@@ -93,7 +93,8 @@ impl Supervisor {
         if !Self::should_restart(&restart_config) {
             tracing::debug!(sandbox = %name, policy = %restart_config.policy, "sandbox dead, not restarting per policy");
             // Update state to stopped
-            self.state.update_sandbox_state(name, RecordState::Stopped, None);
+            self.state
+                .update_sandbox_state(name, RecordState::Stopped, None);
             return Ok(());
         }
 
@@ -169,12 +170,14 @@ impl Supervisor {
                     let entry = entry.lock();
                     entry.manager.child_pid()
                 };
-                self.state.update_sandbox_state(name, RecordState::Running, pid);
+                self.state
+                    .update_sandbox_state(name, RecordState::Running, pid);
                 tracing::info!(sandbox = %name, pid = ?pid, "sandbox restarted successfully");
                 Ok(())
             }
             Err(e) => {
-                self.state.update_sandbox_state(name, RecordState::Failed, None);
+                self.state
+                    .update_sandbox_state(name, RecordState::Failed, None);
                 tracing::error!(sandbox = %name, error = %e, "failed to restart sandbox");
                 Err(e)
             }

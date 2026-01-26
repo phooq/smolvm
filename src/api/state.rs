@@ -154,9 +154,8 @@ impl ApiState {
     ///
     /// Returns an error if the database cannot be opened.
     pub fn new() -> Result<Self, ApiError> {
-        let db = SmolvmDb::open().map_err(|e| {
-            ApiError::Internal(format!("failed to open database: {}", e))
-        })?;
+        let db = SmolvmDb::open()
+            .map_err(|e| ApiError::Internal(format!("failed to open database: {}", e)))?;
         Ok(Self {
             sandboxes: RwLock::new(HashMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
@@ -265,7 +264,9 @@ impl ApiState {
         let record = VmRecord::new_with_restart(
             name.clone(),
             resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
-            resources.memory_mb.unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
+            resources
+                .memory_mb
+                .unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
             mounts
                 .iter()
                 .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
@@ -476,7 +477,9 @@ impl ApiState {
         let record = VmRecord::new_with_restart(
             name.clone(),
             resources.cpus.unwrap_or(crate::agent::DEFAULT_CPUS),
-            resources.memory_mb.unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
+            resources
+                .memory_mb
+                .unwrap_or(crate::agent::DEFAULT_MEMORY_MIB),
             mounts
                 .iter()
                 .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
@@ -583,7 +586,10 @@ impl ApiState {
             entry.restart.user_stopped = stopped;
         }
         // Update in database
-        if let Err(e) = self.db.update_vm(name, |r| r.restart.user_stopped = stopped) {
+        if let Err(e) = self
+            .db
+            .update_vm(name, |r| r.restart.user_stopped = stopped)
+        {
             tracing::warn!(error = %e, sandbox = %name, "failed to persist user_stopped");
         }
     }
@@ -610,7 +616,11 @@ impl ApiState {
 
     /// Get last exit code for a sandbox.
     pub fn get_last_exit_code(&self, name: &str) -> Option<i32> {
-        self.db.get_vm(name).ok().flatten().and_then(|r| r.last_exit_code)
+        self.db
+            .get_vm(name)
+            .ok()
+            .flatten()
+            .and_then(|r| r.last_exit_code)
     }
 
     /// Check if a sandbox process is alive.

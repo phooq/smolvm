@@ -347,4 +347,3 @@ pub struct HealthResponse {
     /// Server version.
     pub version: &'static str,
 }
-

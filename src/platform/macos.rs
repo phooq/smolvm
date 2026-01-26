@@ -158,7 +158,10 @@ fn write_mount_script(rootfs: &Path, mounts: &[(String, String)], rosetta: bool)
     // Mount each virtiofs volume
     for (tag, guest_mount) in mounts {
         write_line(&mut file, &format!("mkdir -p \"{}\"", guest_mount))?;
-        write_line(&mut file, &format!("mount -t virtiofs {} \"{}\"", tag, guest_mount))?;
+        write_line(
+            &mut file,
+            &format!("mount -t virtiofs {} \"{}\"", tag, guest_mount),
+        )?;
     }
 
     // If Rosetta is enabled, mount the runtime and register binfmt_misc

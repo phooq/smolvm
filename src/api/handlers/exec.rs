@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api::error::ApiError;
-use crate::api::state::{mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState};
+use crate::api::state::{
+    mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState,
+};
 use crate::api::types::{ExecRequest, ExecResponse, LogsQuery, RunRequest};
 
 /// POST /api/v1/sandboxes/:id/exec - Execute a command in a sandbox.
@@ -34,11 +36,8 @@ pub async fn exec_command(
         let entry_clone = entry.clone();
         tokio::task::spawn_blocking(move || {
             let entry = entry_clone.lock();
-            let mounts_result: Result<Vec<_>, _> = entry
-                .mounts
-                .iter()
-                .map(mount_spec_to_host_mount)
-                .collect();
+            let mounts_result: Result<Vec<_>, _> =
+                entry.mounts.iter().map(mount_spec_to_host_mount).collect();
             let mounts = mounts_result?;
             let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
             let resources = resource_spec_to_vm_resources(&entry.resources);
@@ -97,11 +96,8 @@ pub async fn run_command(
         let entry_clone = entry.clone();
         tokio::task::spawn_blocking(move || {
             let entry = entry_clone.lock();
-            let mounts_result: Result<Vec<_>, _> = entry
-                .mounts
-                .iter()
-                .map(mount_spec_to_host_mount)
-                .collect();
+            let mounts_result: Result<Vec<_>, _> =
+                entry.mounts.iter().map(mount_spec_to_host_mount).collect();
             let mounts = mounts_result?;
             let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
             let resources = resource_spec_to_vm_resources(&entry.resources);

@@ -26,11 +26,7 @@ use axum::{
     Router,
 };
 use std::sync::Arc;
-use tower_http::{
-    cors::CorsLayer,
-    timeout::TimeoutLayer,
-    trace::TraceLayer,
-};
+use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
 use state::ApiState;
 
@@ -40,8 +36,7 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
     let health_route = Router::new().route("/health", get(handlers::health::health));
 
     // SSE logs route (no timeout - streams indefinitely)
-    let logs_route = Router::new()
-        .route("/:id/logs", get(handlers::exec::stream_logs));
+    let logs_route = Router::new().route("/:id/logs", get(handlers::exec::stream_logs));
 
     // Sandbox routes with timeout
     let sandbox_routes_with_timeout = Router::new()
@@ -55,8 +50,14 @@ pub fn create_router(state: Arc<ApiState>) -> Router {
         .route("/:id/exec", post(handlers::exec::exec_command))
         .route("/:id/run", post(handlers::exec::run_command))
         // Container routes
-        .route("/:id/containers", post(handlers::containers::create_container))
-        .route("/:id/containers", get(handlers::containers::list_containers))
+        .route(
+            "/:id/containers",
+            post(handlers::containers::create_container),
+        )
+        .route(
+            "/:id/containers",
+            get(handlers::containers::list_containers),
+        )
         .route(
             "/:id/containers/:cid/start",
             post(handlers::containers::start_container),

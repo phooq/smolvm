@@ -79,8 +79,8 @@ fn current_timestamp() -> u64 {
 
 /// Generate a unique instance ID for this agent run.
 fn generate_instance_id() -> u64 {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
     current_timestamp().hash(&mut hasher);
@@ -128,7 +128,10 @@ impl RegistryLock {
 
             let err = std::io::Error::last_os_error();
             if err.kind() != std::io::ErrorKind::WouldBlock {
-                return Err(StorageError::new(format!("failed to acquire lock: {}", err)));
+                return Err(StorageError::new(format!(
+                    "failed to acquire lock: {}",
+                    err
+                )));
             }
 
             // Check timeout
@@ -344,7 +347,10 @@ impl ContainerRegistry {
     pub fn load(&self) -> Result<(), StorageError> {
         let path = Path::new(paths::REGISTRY_PATH);
         if !path.exists() {
-            debug!(path = paths::REGISTRY_PATH, "registry file not found, starting fresh");
+            debug!(
+                path = paths::REGISTRY_PATH,
+                "registry file not found, starting fresh"
+            );
             return Ok(());
         }
 
@@ -537,15 +543,13 @@ fn validate_container_params(
     // Validate command is not empty
     if command.is_empty() {
         return Err(StorageError::new(
-            "command cannot be empty: specify at least one command to run"
+            "command cannot be empty: specify at least one command to run",
         ));
     }
 
     // Validate first command element is not empty
     if command[0].is_empty() {
-        return Err(StorageError::new(
-            "command cannot start with empty string"
-        ));
+        return Err(StorageError::new("command cannot start with empty string"));
     }
 
     // Validate workdir if provided
@@ -573,12 +577,12 @@ fn validate_env_vars(env: &[(String, String)]) -> Result<(), StorageError> {
 fn validate_exec_params(command: &[String]) -> Result<(), StorageError> {
     if command.is_empty() {
         return Err(StorageError::new(
-            "exec command cannot be empty: specify at least one command to run"
+            "exec command cannot be empty: specify at least one command to run",
         ));
     }
     if command[0].is_empty() {
         return Err(StorageError::new(
-            "exec command cannot start with empty string"
+            "exec command cannot start with empty string",
         ));
     }
     Ok(())
@@ -681,8 +685,8 @@ pub fn create_container(
     let mut child = Command::new(paths::CRUN_PATH)
         .args(crun_args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())  // Don't capture - can cause blocking
-        .stderr(Stdio::null())  // Don't capture - can cause blocking
+        .stdout(Stdio::null()) // Don't capture - can cause blocking
+        .stderr(Stdio::null()) // Don't capture - can cause blocking
         .spawn()
         .map_err(|e| StorageError::new(format!("failed to spawn crun create: {}", e)))?;
 
@@ -709,18 +713,31 @@ pub fn create_container(
                 std::thread::sleep(poll_interval);
             }
             Err(e) => {
-                return Err(StorageError::new(format!("failed to wait for crun create: {}", e)));
+                return Err(StorageError::new(format!(
+                    "failed to wait for crun create: {}",
+                    e
+                )));
             }
         }
     };
 
-    debug!(exit_code = status.code(), elapsed_ms = start.elapsed().as_millis(), "crun create completed");
+    debug!(
+        exit_code = status.code(),
+        elapsed_ms = start.elapsed().as_millis(),
+        "crun create completed"
+    );
 
     if !status.success() {
         // If crun failed, try to get error from crun state
         let state_output = CrunCommand::state(&container_id).output();
-        let state_info = state_output.map(|o| String::from_utf8_lossy(&o.stderr).to_string()).unwrap_or_default();
-        return Err(StorageError::new(format!("crun create failed with exit code {:?}: {}", status.code(), state_info)));
+        let state_info = state_output
+            .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
+            .unwrap_or_default();
+        return Err(StorageError::new(format!(
+            "crun create failed with exit code {:?}: {}",
+            status.code(),
+            state_info
+        )));
     }
 
     // Get current timestamp
@@ -801,8 +818,7 @@ pub fn start_container(container_id: &str) -> Result<(), StorageError> {
                         let _ = CrunCommand::delete(&info.id, true).output();
                         return Err(StorageError::new(format!(
                             "crun start failed (exit {}): {}",
-                            exit_code,
-                            output.stderr
+                            exit_code, output.stderr
                         )));
                     }
                 }
@@ -816,8 +832,7 @@ pub fn start_container(container_id: &str) -> Result<(), StorageError> {
                     let _ = CrunCommand::delete(&info.id, true).output();
                     return Err(StorageError::new(format!(
                         "crun start timed out after {}ms: {}",
-                        timeout_ms,
-                        output.stderr
+                        timeout_ms, output.stderr
                     )));
                 }
             }
@@ -886,8 +901,8 @@ pub fn start_container(container_id: &str) -> Result<(), StorageError> {
                     &info.id,
                 ])
                 .stdin(Stdio::null())
-                .stdout(Stdio::null())  // Don't capture - can cause blocking
-                .stderr(Stdio::null())  // Don't capture - can cause blocking
+                .stdout(Stdio::null()) // Don't capture - can cause blocking
+                .stderr(Stdio::null()) // Don't capture - can cause blocking
                 .spawn()
                 .map_err(|e| StorageError::new(format!("failed to spawn crun create: {}", e)))?;
 
@@ -910,7 +925,10 @@ pub fn start_container(container_id: &str) -> Result<(), StorageError> {
                         std::thread::sleep(poll_interval);
                     }
                     Err(e) => {
-                        return Err(StorageError::new(format!("failed to wait for crun create: {}", e)));
+                        return Err(StorageError::new(format!(
+                            "failed to wait for crun create: {}",
+                            e
+                        )));
                     }
                 }
             };
@@ -948,14 +966,15 @@ pub fn start_container(container_id: &str) -> Result<(), StorageError> {
                             let _ = child.wait();
                             // Cleanup stale container
                             let _ = CrunCommand::delete(&info.id, true).output();
-                            return Err(StorageError::new(
-                                "crun start timed out on restart"
-                            ));
+                            return Err(StorageError::new("crun start timed out on restart"));
                         }
                         std::thread::sleep(poll_interval);
                     }
                     Err(e) => {
-                        return Err(StorageError::new(format!("failed to wait for crun start: {}", e)));
+                        return Err(StorageError::new(format!(
+                            "failed to wait for crun start: {}",
+                            e
+                        )));
                     }
                 }
             };
@@ -1049,7 +1068,10 @@ pub fn exec_in_container(
 }
 
 /// Convert WaitResult to ExecResult.
-fn convert_wait_result_to_exec(container_id: &str, result: WaitResult) -> Result<ExecResult, StorageError> {
+fn convert_wait_result_to_exec(
+    container_id: &str,
+    result: WaitResult,
+) -> Result<ExecResult, StorageError> {
     match result {
         WaitResult::Completed { exit_code, output } => {
             debug!(
@@ -1340,7 +1362,7 @@ mod tests {
             state: ContainerState::Created,
             created_at: 12345,
             command: vec!["sleep".to_string(), "infinity".to_string()],
-                        pid_file: None,
+            pid_file: None,
             exit_file: None,
             log_file: None,
             attach_socket: None,
@@ -1372,7 +1394,7 @@ mod tests {
             state: ContainerState::Running,
             created_at: 12345,
             command: vec!["sh".to_string()],
-                        pid_file: None,
+            pid_file: None,
             exit_file: None,
             log_file: None,
             attach_socket: None,

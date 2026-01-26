@@ -216,8 +216,15 @@ fn mount_storage_disk() {
         Ok(status) if status.success() => {
             debug!("storage disk mounted successfully");
             // Create directory structure
-            let dirs = ["layers", "configs", "manifests", "overlays",
-                       "containers/run", "containers/logs", "containers/exit"];
+            let dirs = [
+                "layers",
+                "configs",
+                "manifests",
+                "overlays",
+                "containers/run",
+                "containers/logs",
+                "containers/exit",
+            ];
             for dir in dirs {
                 let _ = std::fs::create_dir_all(std::path::Path::new(STORAGE_MOUNT).join(dir));
             }
@@ -232,8 +239,15 @@ fn mount_storage_disk() {
                 .args([STORAGE_DEVICE, STORAGE_MOUNT])
                 .status();
             // Create directory structure
-            let dirs = ["layers", "configs", "manifests", "overlays",
-                       "containers/run", "containers/logs", "containers/exit"];
+            let dirs = [
+                "layers",
+                "configs",
+                "manifests",
+                "overlays",
+                "containers/run",
+                "containers/logs",
+                "containers/exit",
+            ];
             for dir in dirs {
                 let _ = std::fs::create_dir_all(std::path::Path::new(STORAGE_MOUNT).join(dir));
             }
@@ -244,14 +258,13 @@ fn mount_storage_disk() {
 /// Run the vsock server with a pre-created listener.
 /// The listener is created early (before initialization) to ensure the kernel
 /// has a listener ready when the host connects.
-fn run_server_with_listener(listener: vsock::VsockListener) -> Result<(), Box<dyn std::error::Error>> {
+fn run_server_with_listener(
+    listener: vsock::VsockListener,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut first_connection = true;
     let listen_start = uptime_ms();
 
-    info!(
-        uptime_ms = uptime_ms(),
-        "entering vsock accept loop"
-    );
+    info!(uptime_ms = uptime_ms(), "entering vsock accept loop");
 
     loop {
         match listener.accept() {
@@ -297,7 +310,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 
         // Validate message size to prevent DoS via memory exhaustion
         if len > MAX_MESSAGE_SIZE {
-            warn!(len = len, max = MAX_MESSAGE_SIZE, "message too large, rejecting");
+            warn!(
+                len = len,
+                max = MAX_MESSAGE_SIZE,
+                "message too large, rejecting"
+            );
             send_response(
                 stream,
                 &AgentResponse::Error {
@@ -771,7 +788,13 @@ fn run_interactive_loop(
         // Check if child has exited
         if let Some(status) = child.try_wait()? {
             // Drain any remaining output
-            drain_remaining_output(stream, &mut child_stdout, &mut child_stderr, &mut stdout_buf, &mut stderr_buf)?;
+            drain_remaining_output(
+                stream,
+                &mut child_stdout,
+                &mut child_stderr,
+                &mut stdout_buf,
+                &mut stderr_buf,
+            )?;
             return Ok(status.code().unwrap_or(-1));
         }
 
@@ -795,7 +818,9 @@ fn run_interactive_loop(
             Some(dl) => {
                 let remaining = dl.saturating_duration_since(Instant::now());
                 // Cap at 100ms to periodically check child exit status
-                remaining.as_millis().min(INTERACTIVE_POLL_TIMEOUT_MS as u128) as i32
+                remaining
+                    .as_millis()
+                    .min(INTERACTIVE_POLL_TIMEOUT_MS as u128) as i32
             }
             None => INTERACTIVE_POLL_TIMEOUT_MS,
         };
@@ -822,15 +847,18 @@ fn run_interactive_loop(
             2
         } else if stdout_fd >= 0 || stderr_fd >= 0 {
             // Only one fd is valid, adjust nfds
-            if stdout_fd >= 0 { 1 } else { 2 }
+            if stdout_fd >= 0 {
+                1
+            } else {
+                2
+            }
         } else {
             0
         };
 
         if nfds > 0 {
-            let poll_result = unsafe {
-                libc::poll(poll_fds.as_mut_ptr(), nfds as libc::nfds_t, poll_timeout_ms)
-            };
+            let poll_result =
+                unsafe { libc::poll(poll_fds.as_mut_ptr(), nfds as libc::nfds_t, poll_timeout_ms) };
 
             if poll_result < 0 {
                 let err = std::io::Error::last_os_error();

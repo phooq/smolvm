@@ -168,7 +168,9 @@ mod tests {
         let env = vec![("HOME".to_string(), "/root".to_string())];
         let result = ensure_path_in_env(&env);
         assert_eq!(result.len(), 2);
-        assert!(result.iter().any(|(k, v)| k == "PATH" && v == DEFAULT_CONTAINER_PATH));
+        assert!(result
+            .iter()
+            .any(|(k, v)| k == "PATH" && v == DEFAULT_CONTAINER_PATH));
     }
 
     #[test]

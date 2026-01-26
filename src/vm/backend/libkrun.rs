@@ -250,8 +250,12 @@ impl LibkrunVm {
             // On macOS, this wraps the command with a mount script for virtiofs
             // On Linux, the kernel handles virtiofs mounting automatically
             let executor = platform::vm_executor();
-            let (exec_path, argv, _argv_cstrings) =
-                executor.build_exec_command(&config.command, &mount_specs, rootfs_path, rosetta_enabled)?;
+            let (exec_path, argv, _argv_cstrings) = executor.build_exec_command(
+                &config.command,
+                &mount_specs,
+                rootfs_path,
+                rosetta_enabled,
+            )?;
 
             tracing::debug!("[libkrun] exec_path: {:?}", exec_path);
             tracing::debug!("[libkrun] command: {:?}", config.command);

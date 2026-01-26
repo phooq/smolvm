@@ -94,7 +94,10 @@ mod tests {
             (ApiError::Conflict("x".into()), StatusCode::CONFLICT),
             (ApiError::BadRequest("x".into()), StatusCode::BAD_REQUEST),
             (ApiError::Timeout, StatusCode::REQUEST_TIMEOUT),
-            (ApiError::Internal("x".into()), StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                ApiError::Internal("x".into()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
         ];
         for (error, expected) in cases {
             assert_eq!(error.into_response().status(), expected);

@@ -215,13 +215,7 @@ impl CreateCmd {
         let ports: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
 
         // Create record
-        let record = VmRecord::new(
-            self.name.clone(),
-            self.cpus,
-            self.mem,
-            mounts,
-            ports,
-        );
+        let record = VmRecord::new(self.name.clone(), self.cpus, self.mem, mounts, ports);
 
         // Store in config (persisted immediately to database)
         config.insert_vm(self.name.clone(), record)?;
@@ -234,8 +228,14 @@ impl CreateCmd {
         if !self.port.is_empty() {
             println!("  Ports: {}", self.port.len());
         }
-        println!("\nUse 'smolvm microvm start {}' to start the microvm", self.name);
-        println!("Then use 'smolvm container create {}' to run containers", self.name);
+        println!(
+            "\nUse 'smolvm microvm start {}' to start the microvm",
+            self.name
+        );
+        println!(
+            "Then use 'smolvm container create {}' to run containers",
+            self.name
+        );
 
         Ok(())
     }
@@ -334,7 +334,10 @@ impl StartCmd {
         config.save()?;
 
         println!("MicroVM '{}' running (PID: {})", name, pid.unwrap_or(0));
-        println!("\nUse 'smolvm container create {} <image>' to run containers", name);
+        println!(
+            "\nUse 'smolvm container create {} <image>' to run containers",
+            name
+        );
 
         // Keep microvm running (persistent)
         manager.detach();

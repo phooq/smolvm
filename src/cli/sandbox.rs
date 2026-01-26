@@ -82,7 +82,9 @@ impl ExecCmd {
 
         // Check if sandbox is running
         if manager.try_connect_existing().is_none() {
-            return Err(Error::AgentError("No sandbox running. Start one with: smolvm sandbox run -d <image>".to_string()));
+            return Err(Error::AgentError(
+                "No sandbox running. Start one with: smolvm sandbox run -d <image>".to_string(),
+            ));
         }
 
         let mut client = AgentClient::connect(manager.vsock_socket())?;
@@ -94,7 +96,9 @@ impl ExecCmd {
         let container_id = match container {
             Some(c) => c.id.clone(),
             None => {
-                return Err(Error::AgentError("No running container in sandbox".to_string()));
+                return Err(Error::AgentError(
+                    "No running container in sandbox".to_string(),
+                ));
             }
         };
 
@@ -104,7 +108,11 @@ impl ExecCmd {
             .iter()
             .filter_map(|e| {
                 let (k, v) = e.split_once('=')?;
-                if k.is_empty() { None } else { Some((k.to_string(), v.to_string())) }
+                if k.is_empty() {
+                    None
+                } else {
+                    Some((k.to_string(), v.to_string()))
+                }
             })
             .collect();
 
@@ -238,11 +246,21 @@ pub struct RunCmd {
     pub workdir: Option<String>,
 
     /// Set environment variable (can be used multiple times)
-    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE", help_heading = "Container")]
+    #[arg(
+        short = 'e',
+        long = "env",
+        value_name = "KEY=VALUE",
+        help_heading = "Container"
+    )]
     pub env: Vec<String>,
 
     /// Mount host directory into container (can be used multiple times)
-    #[arg(short = 'v', long = "volume", value_name = "HOST:CONTAINER[:ro]", help_heading = "Container")]
+    #[arg(
+        short = 'v',
+        long = "volume",
+        value_name = "HOST:CONTAINER[:ro]",
+        help_heading = "Container"
+    )]
     pub volume: Vec<String>,
 
     /// Expose port from container to host (can be used multiple times)
@@ -254,11 +272,21 @@ pub struct RunCmd {
     pub net: bool,
 
     /// Number of virtual CPUs
-    #[arg(long, default_value = "1", value_name = "N", help_heading = "Resources")]
+    #[arg(
+        long,
+        default_value = "1",
+        value_name = "N",
+        help_heading = "Resources"
+    )]
     pub cpus: u8,
 
     /// Memory allocation in MiB
-    #[arg(long, default_value = "512", value_name = "MiB", help_heading = "Resources")]
+    #[arg(
+        long,
+        default_value = "512",
+        value_name = "MiB",
+        help_heading = "Resources"
+    )]
     pub mem: u32,
 }
 
@@ -280,7 +308,11 @@ impl RunCmd {
             .map_err(|e| Error::AgentError(format!("failed to create agent manager: {}", e)))?;
 
         // Show startup message
-        let mode = if self.detach { "persistent" } else { "ephemeral" };
+        let mode = if self.detach {
+            "persistent"
+        } else {
+            "ephemeral"
+        };
         let mount_info = if !mounts.is_empty() {
             format!(" with {} mount(s)", mounts.len())
         } else {
@@ -334,8 +366,14 @@ impl RunCmd {
 
             println!("Sandbox running (container: {})", &info.id[..12]);
             println!("\nTo interact with the sandbox:");
-            println!("  smolvm container exec default {} -- <command>", &info.id[..12]);
-            println!("  smolvm container exec default {} -it -- /bin/sh", &info.id[..12]);
+            println!(
+                "  smolvm container exec default {} -- <command>",
+                &info.id[..12]
+            );
+            println!(
+                "  smolvm container exec default {} -it -- /bin/sh",
+                &info.id[..12]
+            );
             println!("\nTo stop the sandbox:");
             println!("  smolvm sandbox stop");
 
@@ -381,4 +419,3 @@ impl RunCmd {
         }
     }
 }
-

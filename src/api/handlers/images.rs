@@ -7,7 +7,9 @@ use axum::{
 use std::sync::Arc;
 
 use crate::api::error::ApiError;
-use crate::api::state::{mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState};
+use crate::api::state::{
+    mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState,
+};
 use crate::api::types::{ImageInfo, ListImagesResponse, PullImageRequest, PullImageResponse};
 
 /// GET /api/v1/sandboxes/:id/images - List images in a sandbox.
@@ -57,7 +59,9 @@ pub async fn pull_image(
     Json(req): Json<PullImageRequest>,
 ) -> Result<Json<PullImageResponse>, ApiError> {
     if req.image.is_empty() {
-        return Err(ApiError::BadRequest("image reference cannot be empty".into()));
+        return Err(ApiError::BadRequest(
+            "image reference cannot be empty".into(),
+        ));
     }
 
     let entry = state.get_sandbox(&sandbox_id)?;
@@ -67,11 +71,8 @@ pub async fn pull_image(
         let entry_clone = entry.clone();
         tokio::task::spawn_blocking(move || {
             let entry = entry_clone.lock();
-            let mounts_result: Result<Vec<_>, _> = entry
-                .mounts
-                .iter()
-                .map(mount_spec_to_host_mount)
-                .collect();
+            let mounts_result: Result<Vec<_>, _> =
+                entry.mounts.iter().map(mount_spec_to_host_mount).collect();
             let mounts = mounts_result?;
             let ports: Vec<_> = entry.ports.iter().map(port_spec_to_mapping).collect();
             let resources = resource_spec_to_vm_resources(&entry.resources);

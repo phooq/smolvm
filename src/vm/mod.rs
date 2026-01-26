@@ -43,7 +43,6 @@ pub trait VmHandle: Send {
     ///
     /// This immediately terminates the VM without waiting for graceful shutdown.
     fn kill(&mut self) -> Result<()>;
-
 }
 
 /// Factory for creating VMs.

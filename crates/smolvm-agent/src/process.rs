@@ -21,10 +21,7 @@ pub struct ChildOutput {
 #[derive(Debug)]
 pub enum WaitResult {
     /// Process completed with the given exit code.
-    Completed {
-        exit_code: i32,
-        output: ChildOutput,
-    },
+    Completed { exit_code: i32, output: ChildOutput },
     /// Process was killed due to timeout.
     TimedOut {
         output: ChildOutput,
@@ -308,7 +305,10 @@ mod tests {
         .unwrap();
 
         assert!(matches!(result, WaitResult::TimedOut { .. }));
-        assert!(callback_called.load(Ordering::SeqCst), "cleanup callback should be called");
+        assert!(
+            callback_called.load(Ordering::SeqCst),
+            "cleanup callback should be called"
+        );
     }
 
     #[test]
@@ -329,6 +329,9 @@ mod tests {
         .unwrap();
 
         assert!(matches!(result, WaitResult::Completed { .. }));
-        assert!(!callback_called.load(Ordering::SeqCst), "cleanup callback should not be called on success");
+        assert!(
+            !callback_called.load(Ordering::SeqCst),
+            "cleanup callback should not be called on success"
+        );
     }
 }

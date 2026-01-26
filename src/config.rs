@@ -409,14 +409,8 @@ mod tests {
             restart_count: 0,
             user_stopped: false,
         };
-        let record = VmRecord::new_with_restart(
-            "test".to_string(),
-            2,
-            512,
-            vec![],
-            vec![],
-            restart,
-        );
+        let record =
+            VmRecord::new_with_restart("test".to_string(), 2, 512, vec![], vec![], restart);
 
         let json = serde_json::to_string(&record).unwrap();
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
@@ -439,10 +433,22 @@ mod tests {
         assert_eq!(RestartPolicy::OnFailure.to_string(), "on-failure");
         assert_eq!(RestartPolicy::UnlessStopped.to_string(), "unless-stopped");
 
-        assert_eq!("never".parse::<RestartPolicy>().unwrap(), RestartPolicy::Never);
-        assert_eq!("always".parse::<RestartPolicy>().unwrap(), RestartPolicy::Always);
-        assert_eq!("on-failure".parse::<RestartPolicy>().unwrap(), RestartPolicy::OnFailure);
-        assert_eq!("unless-stopped".parse::<RestartPolicy>().unwrap(), RestartPolicy::UnlessStopped);
+        assert_eq!(
+            "never".parse::<RestartPolicy>().unwrap(),
+            RestartPolicy::Never
+        );
+        assert_eq!(
+            "always".parse::<RestartPolicy>().unwrap(),
+            RestartPolicy::Always
+        );
+        assert_eq!(
+            "on-failure".parse::<RestartPolicy>().unwrap(),
+            RestartPolicy::OnFailure
+        );
+        assert_eq!(
+            "unless-stopped".parse::<RestartPolicy>().unwrap(),
+            RestartPolicy::UnlessStopped
+        );
     }
 
     #[test]

@@ -52,8 +52,7 @@ pub fn truncate_id(id: &str) -> &str {
 ///
 /// Returns " (PID: N)" if pid is Some, or empty string if None.
 pub fn format_pid_suffix(pid: Option<i32>) -> String {
-    pid.map(|p| format!(" (PID: {})", p))
-        .unwrap_or_default()
+    pid.map(|p| format!(" (PID: {})", p)).unwrap_or_default()
 }
 
 /// Flush stdout and stderr, ignoring errors.

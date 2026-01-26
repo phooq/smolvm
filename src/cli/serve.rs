@@ -29,7 +29,12 @@ EXAMPLES:
   smolvm serve -v                      Enable verbose logging")]
 pub struct ServeCmd {
     /// Address and port to listen on
-    #[arg(short, long, default_value = "127.0.0.1:8080", value_name = "ADDR:PORT")]
+    #[arg(
+        short,
+        long,
+        default_value = "127.0.0.1:8080",
+        value_name = "ADDR:PORT"
+    )]
     listen: String,
 
     /// Enable debug logging (or set RUST_LOG=debug)
@@ -54,18 +59,18 @@ impl ServeCmd {
         }
 
         // Create the runtime and run the server
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(smolvm::error::Error::Io)?;
+        let runtime = tokio::runtime::Runtime::new().map_err(smolvm::error::Error::Io)?;
 
-        runtime.block_on(async move {
-            self.run_server(addr).await
-        })
+        runtime.block_on(async move { self.run_server(addr).await })
     }
 
     async fn run_server(self, addr: SocketAddr) -> Result<()> {
         // Security warning if binding to all interfaces
         if addr.ip().is_unspecified() {
-            eprintln!("WARNING: Server is listening on all interfaces ({}).", addr.ip());
+            eprintln!(
+                "WARNING: Server is listening on all interfaces ({}).",
+                addr.ip()
+            );
             eprintln!("         The API has no authentication - any network client can control this host.");
             eprintln!("         Consider using --listen 127.0.0.1:8080 for local-only access.");
         }
@@ -76,7 +81,11 @@ impl ServeCmd {
         })?);
         let loaded = state.load_persisted_sandboxes();
         if !loaded.is_empty() {
-            println!("Reconnected to {} existing sandbox(es): {}", loaded.len(), loaded.join(", "));
+            println!(
+                "Reconnected to {} existing sandbox(es): {}",
+                loaded.len(),
+                loaded.join(", ")
+            );
         }
 
         // Create shutdown channel for supervisor
@@ -85,10 +94,8 @@ impl ServeCmd {
         // Spawn supervisor task
         let supervisor_state = state.clone();
         let supervisor_handle = tokio::spawn(async move {
-            let supervisor = smolvm::api::supervisor::Supervisor::new(
-                supervisor_state,
-                shutdown_rx,
-            );
+            let supervisor =
+                smolvm::api::supervisor::Supervisor::new(supervisor_state, shutdown_rx);
             supervisor.run().await;
         });
 
@@ -113,10 +120,7 @@ impl ServeCmd {
         let _ = shutdown_tx.send(true);
 
         // Wait for supervisor to finish (with timeout)
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            supervisor_handle,
-        ).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), supervisor_handle).await;
 
         Ok(())
     }

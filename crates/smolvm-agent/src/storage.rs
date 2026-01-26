@@ -563,7 +563,10 @@ pub fn prepare_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
     for layer_path in &lowerdirs {
         let path = Path::new(layer_path);
         if !path.exists() {
-            return Err(StorageError(format!("layer path does not exist: {}", layer_path)));
+            return Err(StorageError(format!(
+                "layer path does not exist: {}",
+                layer_path
+            )));
         }
         // Check if layer has contents
         if let Ok(mut entries) = std::fs::read_dir(path) {
@@ -858,7 +861,8 @@ fn run_with_crun(
         .map_err(|e| {
             StorageError(format!(
                 "failed to spawn crun: {}. Is crun installed at {}?",
-                e, paths::CRUN_PATH
+                e,
+                paths::CRUN_PATH
             ))
         })?;
 
@@ -923,7 +927,10 @@ fn run_crane(operation: &str, image: &str, platform: Option<&str>) -> Result<Str
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(StorageError(format!("crane {} failed: {}", operation, stderr)));
+        return Err(StorageError(format!(
+            "crane {} failed: {}",
+            operation, stderr
+        )));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())

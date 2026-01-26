@@ -9,14 +9,16 @@ mod cli;
 #[derive(Parser, Debug)]
 #[command(name = "smolvm")]
 #[command(about = "Run containers in lightweight VMs with VM-level isolation")]
-#[command(long_about = "smolvm is an OCI-native microVM runtime for macOS and Linux.\n\n\
+#[command(
+    long_about = "smolvm is an OCI-native microVM runtime for macOS and Linux.\n\n\
 It runs container images inside lightweight VMs using libkrun, providing \
 VM-level isolation with container-like UX.\n\n\
 Quick start:\n  \
 smolvm sandbox run alpine -- echo hello\n  \
 smolvm sandbox run -d nginx -p 8080:80\n\n\
 For programmatic access:\n  \
-smolvm serve")]
+smolvm serve"
+)]
 #[command(version)]
 struct Cli {
     #[command(subcommand)]
