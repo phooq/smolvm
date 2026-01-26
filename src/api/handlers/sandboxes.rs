@@ -10,7 +10,7 @@ use crate::agent::AgentManager;
 use crate::api::error::ApiError;
 use crate::api::state::{
     mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources,
-    restart_spec_to_config, ApiState, ReservationGuard,
+    restart_spec_to_config, ApiState, DbCloseGuard, ReservationGuard,
 };
 use crate::api::types::{
     CreateSandboxRequest, ListSandboxesResponse, MountInfo, MountSpec, ResourceSpec, SandboxInfo,
@@ -234,25 +234,23 @@ pub async fn start_sandbox(
     // Clear user_stopped flag since user is explicitly starting
     state.mark_user_stopped(&id, false);
 
-    // Close database before forking to prevent child from inheriting the fd lock.
-    // Use a closure to ensure reopen happens even if the task fails/panics.
-    state.close_db_temporarily();
+    // Start the sandbox in a blocking task (this forks).
+    // Use DbCloseGuard to ensure DB is reopened even if cancelled/panicked.
+    let start_result = {
+        let _db_guard = DbCloseGuard::new(&state);
 
-    // Start the sandbox in a blocking task (this forks)
-    let entry_clone = entry.clone();
-    let start_result = tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        entry
-            .manager
-            .ensure_running_with_full_config(mounts, ports, resources)
-    })
-    .await;
+        let entry_clone = entry.clone();
+        tokio::task::spawn_blocking(move || {
+            let entry = entry_clone.lock();
+            entry
+                .manager
+                .ensure_running_with_full_config(mounts, ports, resources)
+        })
+        .await
+        // Guard dropped here, DB reopened (even on cancellation)
+    };
 
-    // CRITICAL: Always reopen database, regardless of task result.
-    // If we don't reopen, the DB stays closed for the rest of the process.
-    state.reopen_db().map_err(|e| ApiError::Internal(e.to_string()))?;
-
-    // Now check the task join result, then the start result
+    // Check the task join result, then the start result
     let start_result = start_result?;
     start_result.map_err(|e| ApiError::Internal(e.to_string()))?;
 

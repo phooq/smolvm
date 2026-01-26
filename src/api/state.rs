@@ -107,6 +107,48 @@ impl Drop for ReservationGuard<'_> {
     }
 }
 
+/// RAII guard for temporarily closing the database during fork operations.
+///
+/// Automatically reopens the database on drop, ensuring the DB is never left
+/// closed even if the operation is cancelled or panics.
+///
+/// # Example
+///
+/// ```ignore
+/// // Guard closes DB on creation, reopens on drop
+/// let _guard = DbCloseGuard::new(&state);
+///
+/// // Fork operation - even if this panics or is cancelled,
+/// // the guard's Drop will reopen the database
+/// let result = tokio::task::spawn_blocking(|| {
+///     // fork happens here
+/// }).await;
+///
+/// // Guard dropped here (or earlier if cancelled), DB reopened
+/// ```
+pub struct DbCloseGuard<'a> {
+    state: &'a ApiState,
+}
+
+impl<'a> DbCloseGuard<'a> {
+    /// Create a new guard, closing the database.
+    ///
+    /// The database will be automatically reopened when the guard is dropped.
+    pub fn new(state: &'a ApiState) -> Self {
+        state.db.close_temporarily();
+        Self { state }
+    }
+}
+
+impl Drop for DbCloseGuard<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = self.state.db.reopen() {
+            // Log error but don't panic - we're in a Drop impl
+            tracing::error!(error = %e, "failed to reopen database in DbCloseGuard drop");
+        }
+    }
+}
+
 impl ApiState {
     /// Create a new API state, opening the database.
     ///

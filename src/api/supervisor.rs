@@ -9,6 +9,7 @@ use tokio::sync::watch;
 
 use crate::api::state::{
     mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState,
+    DbCloseGuard,
 };
 use crate::config::{RecordState, RestartConfig, RestartPolicy};
 
@@ -143,22 +144,22 @@ impl Supervisor {
             (mounts, ports, resources)
         };
 
-        // Close database before forking
-        self.state.close_db_temporarily();
+        // Start the sandbox in a blocking task (this forks).
+        // Use DbCloseGuard to ensure DB is reopened even if cancelled/panicked.
+        let start_result = {
+            let _db_guard = DbCloseGuard::new(&self.state);
 
-        // Start the sandbox in a blocking task
-        let entry_clone = entry.clone();
-        let start_result = tokio::task::spawn_blocking(move || {
-            let entry = entry_clone.lock();
-            entry
-                .manager
-                .ensure_running_with_full_config(mounts, ports, resources)
-        })
-        .await
+            let entry_clone = entry.clone();
+            tokio::task::spawn_blocking(move || {
+                let entry = entry_clone.lock();
+                entry
+                    .manager
+                    .ensure_running_with_full_config(mounts, ports, resources)
+            })
+            .await
+            // Guard dropped here, DB reopened (even on cancellation)
+        }
         .map_err(|e| crate::Error::AgentError(format!("spawn error: {}", e)))?;
-
-        // Reopen database
-        self.state.reopen_db()?;
 
         // Handle start result
         match start_result {
