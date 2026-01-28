@@ -58,8 +58,11 @@ impl ServeCmd {
             tracing::info!("verbose logging enabled");
         }
 
-        // Create the runtime and run the server
-        let runtime = tokio::runtime::Runtime::new().map_err(smolvm::error::Error::Io)?;
+        // Create the runtime with signal handling enabled
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(smolvm::error::Error::Io)?;
 
         runtime.block_on(async move { self.run_server(addr).await })
     }

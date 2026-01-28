@@ -7,7 +7,69 @@
 use crate::error::{Error, Result};
 use crate::platform::traits::{RosettaSupport, VmExecutor};
 use std::ffi::CString;
+use std::fs;
 use std::path::Path;
+
+/// Check if KVM is available and accessible on this system.
+///
+/// This checks:
+/// 1. `/dev/kvm` exists (KVM module is loaded)
+/// 2. Current user has read/write access to `/dev/kvm`
+///
+/// # Errors
+///
+/// Returns `Error::KvmUnavailable` if KVM module is not loaded.
+/// Returns `Error::KvmPermission` if the user lacks access to `/dev/kvm`.
+pub fn check_kvm_available() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let kvm_path = Path::new("/dev/kvm");
+
+    // Check if /dev/kvm exists
+    if !kvm_path.exists() {
+        return Err(Error::KvmUnavailable(
+            "KVM not available. Ensure KVM kernel module is loaded.\n\
+             Try: sudo modprobe kvm && sudo modprobe kvm_intel  # (or kvm_amd)"
+                .to_string(),
+        ));
+    }
+
+    // Check read/write access by trying to open the file
+    match fs::OpenOptions::new().read(true).write(true).open(kvm_path) {
+        Ok(_) => {
+            tracing::debug!("KVM access verified");
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // Get the group that owns /dev/kvm for the error message
+            let group_hint = match fs::metadata(kvm_path) {
+                Ok(meta) => {
+                    let _gid = meta.gid();
+                    // Common default on most Linux distros
+                    "kvm".to_string()
+                }
+                Err(_) => "kvm".to_string(),
+            };
+
+            return Err(Error::KvmPermission(format!(
+                "Cannot access /dev/kvm (permission denied).\n\
+                 Add your user to the '{}' group:\n\
+                 \n\
+                 sudo usermod -aG {} $USER\n\
+                 \n\
+                 Then log out and log back in for the change to take effect.",
+                group_hint, group_hint
+            )));
+        }
+        Err(e) => {
+            return Err(Error::KvmUnavailable(format!(
+                "Failed to access /dev/kvm: {}",
+                e
+            )));
+        }
+    }
+
+    Ok(())
+}
 
 /// Linux VM executor implementation.
 ///
@@ -123,6 +185,13 @@ mod tests {
         // The needs_rosetta logic is in the trait default impl
         assert!(rosetta.needs_rosetta("linux/amd64"));
         assert!(!rosetta.needs_rosetta("linux/arm64"));
+    }
+
+    #[test]
+    fn test_check_kvm_available_does_not_panic() {
+        // This test just ensures the function doesn't panic
+        // The actual result depends on the system configuration
+        let _ = super::check_kvm_available();
     }
 
     #[test]

@@ -137,7 +137,32 @@ fn link_libkrun() {
         return;
     }
 
-    // Option 4: System installation via pkg-config
+    // Option 4: Bundled libraries in lib/linux-{arch}/ (for distribution builds)
+    #[cfg(target_os = "linux")]
+    {
+        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        let lib_dir = format!("{}/lib/linux-{}", manifest_dir, arch);
+        let lib_path = std::path::Path::new(&lib_dir);
+
+        if lib_path.join("libkrun.so").exists() {
+            println!(
+                "cargo:warning=Using bundled Linux libraries from {}",
+                lib_dir
+            );
+            println!("cargo:rustc-link-search=native={}", lib_dir);
+            println!("cargo:rustc-link-lib=krun");
+
+            // Set rpath to find libraries relative to executable
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/lib");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
+            // Also add the source directory for development builds
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir);
+            return;
+        }
+    }
+
+    // Option 5: System installation via pkg-config
     if pkg_config::Config::new()
         .atleast_version("1.0")
         .probe("libkrun")
@@ -146,7 +171,7 @@ fn link_libkrun() {
         return;
     }
 
-    // Option 5: Common installation paths
+    // Option 6: Common installation paths
     #[cfg(target_os = "macos")]
     {
         let paths = [

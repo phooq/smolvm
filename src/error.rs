@@ -107,6 +107,15 @@ pub enum Error {
     #[error("agent error: {0}")]
     AgentError(String),
 
+    // KVM errors (Linux)
+    /// KVM is not available (module not loaded).
+    #[error("kvm unavailable: {0}")]
+    KvmUnavailable(String),
+
+    /// KVM permission denied (user not in kvm group).
+    #[error("kvm permission denied: {0}")]
+    KvmPermission(String),
+
     // IO errors
     /// IO error wrapper.
     #[error("io error: {0}")]
@@ -135,6 +144,16 @@ impl Error {
             command: command.into(),
             message: message.into(),
         }
+    }
+
+    /// Create a KVM unavailable error.
+    pub fn kvm_unavailable(msg: impl Into<String>) -> Self {
+        Self::KvmUnavailable(msg.into())
+    }
+
+    /// Create a KVM permission error.
+    pub fn kvm_permission(msg: impl Into<String>) -> Self {
+        Self::KvmPermission(msg.into())
     }
 }
 

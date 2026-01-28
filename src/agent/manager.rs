@@ -407,6 +407,16 @@ impl AgentManager {
             "starting agent VM"
         );
 
+        // Check KVM availability on Linux before attempting to start VM
+        #[cfg(target_os = "linux")]
+        {
+            if let Err(e) = crate::platform::linux::check_kvm_available() {
+                let mut inner = self.inner.lock();
+                inner.state = AgentState::Stopped;
+                return Err(e);
+            }
+        }
+
         // Validate rootfs exists
         if !self.rootfs_path.exists() {
             let mut inner = self.inner.lock();
