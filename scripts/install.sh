@@ -3,7 +3,7 @@
 #
 # Usage:
 #   curl -sSL https://smolmachines.com/install.sh | bash
-#   curl -sSL https://smolmachines.com/install.sh | bash -s -- --version 0.1.0
+#   curl -sSL https://smolmachines.com/install.sh | bash -s -- --version 0.1.1
 #   curl -sSL https://smolmachines.com/install.sh | bash -s -- --prefix /opt/smolvm
 #
 # Options:
@@ -166,7 +166,7 @@ get_latest_version() {
 
     if [[ -z "$version" ]]; then
         # Fallback to a default version if GitHub API fails
-        echo "0.1.0"
+        echo "0.1.1"
     else
         echo "$version"
     fi
@@ -445,7 +445,7 @@ Examples:
     curl -sSL https://smolmachines.com/install.sh | bash
 
     # Install specific version
-    curl -sSL https://smolmachines.com/install.sh | bash -s -- --version 0.1.0
+    curl -sSL https://smolmachines.com/install.sh | bash -s -- --version 0.1.1
 
     # Install to custom directory
     curl -sSL https://smolmachines.com/install.sh | bash -s -- --prefix /opt/smolvm
