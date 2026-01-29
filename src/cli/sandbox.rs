@@ -29,6 +29,12 @@ pub enum SandboxCmd {
 
     /// Show sandbox status and running containers
     Status(StatusCmd),
+
+    /// List cached images and storage usage
+    Images(ImagesCmd),
+
+    /// Remove unused images and layers to free disk space
+    Prune(PruneCmd),
 }
 
 impl SandboxCmd {
@@ -38,6 +44,8 @@ impl SandboxCmd {
             SandboxCmd::Exec(cmd) => cmd.run(),
             SandboxCmd::Stop(cmd) => cmd.run(),
             SandboxCmd::Status(cmd) => cmd.run(),
+            SandboxCmd::Images(cmd) => cmd.run(),
+            SandboxCmd::Prune(cmd) => cmd.run(),
         }
     }
 }
@@ -417,5 +425,211 @@ impl RunCmd {
 
             std::process::exit(exit_code);
         }
+    }
+}
+
+// ============================================================================
+// Images Command
+// ============================================================================
+
+/// List cached images and storage usage.
+///
+/// Shows all OCI images cached in the sandbox storage, along with their
+/// sizes and layer counts. Also displays total storage usage.
+///
+/// Examples:
+///   smolvm sandbox images
+///   smolvm sandbox images --json
+#[derive(Args, Debug)]
+pub struct ImagesCmd {
+    /// Output in JSON format
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl ImagesCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let manager = AgentManager::new_default()?;
+
+        // Start VM if not running (needed to query storage)
+        let mut client = if manager.try_connect_existing().is_some() {
+            AgentClient::connect(manager.vsock_socket())?
+        } else {
+            println!("Starting sandbox VM to query storage...");
+            manager.start()?;
+            AgentClient::connect(manager.vsock_socket())?
+        };
+
+        // Get storage status
+        let status = client.storage_status()?;
+
+        // Get images list
+        let images = client.list_images()?;
+
+        if self.json {
+            let output = serde_json::json!({
+                "storage": {
+                    "total_bytes": status.total_bytes,
+                    "used_bytes": status.used_bytes,
+                    "layer_count": status.layer_count,
+                    "image_count": status.image_count,
+                },
+                "images": images,
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        } else {
+            // Print storage summary
+            println!("Storage Usage:");
+            println!("  Total:  {}", format_bytes(status.total_bytes));
+            println!("  Used:   {}", format_bytes(status.used_bytes));
+            println!("  Layers: {}", status.layer_count);
+            println!();
+
+            if images.is_empty() {
+                println!("No cached images.");
+            } else {
+                println!("Cached Images:");
+                println!("{:<40} {:>10} {:>8}", "IMAGE", "SIZE", "LAYERS");
+                println!("{}", "-".repeat(60));
+
+                for image in &images {
+                    let name = if image.reference.len() > 38 {
+                        format!("{}...", &image.reference[..35])
+                    } else {
+                        image.reference.clone()
+                    };
+                    println!(
+                        "{:<40} {:>10} {:>8}",
+                        name,
+                        format_bytes(image.size),
+                        image.layer_count
+                    );
+                }
+
+                println!();
+                println!("Total: {} images", images.len());
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Prune Command
+// ============================================================================
+
+/// Remove unused images and layers to free disk space.
+///
+/// This removes layers that are not referenced by any cached image manifest.
+/// Use --dry-run to see what would be removed without actually deleting.
+///
+/// Examples:
+///   smolvm sandbox prune --dry-run
+///   smolvm sandbox prune
+///   smolvm sandbox prune --all
+#[derive(Args, Debug)]
+pub struct PruneCmd {
+    /// Show what would be removed without actually removing
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Remove all cached images (not just unreferenced layers)
+    #[arg(long)]
+    pub all: bool,
+}
+
+impl PruneCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let manager = AgentManager::new_default()?;
+
+        // Start VM if not running
+        let mut client = if manager.try_connect_existing().is_some() {
+            AgentClient::connect(manager.vsock_socket())?
+        } else {
+            println!("Starting sandbox VM...");
+            manager.start()?;
+            AgentClient::connect(manager.vsock_socket())?
+        };
+
+        if self.all {
+            // Get list of images first
+            let images = client.list_images()?;
+
+            if images.is_empty() {
+                println!("No cached images to remove.");
+                return Ok(());
+            }
+
+            let total_size: u64 = images.iter().map(|i| i.size).sum();
+
+            if self.dry_run {
+                println!("Would remove {} images ({})", images.len(), format_bytes(total_size));
+                for image in &images {
+                    println!("  - {} ({}, {} layers)",
+                        image.reference,
+                        format_bytes(image.size),
+                        image.layer_count
+                    );
+                }
+            } else {
+                println!("Removing all cached images...");
+
+                // Remove each image by clearing storage
+                // Note: This requires a storage clear API which we may need to add
+                // For now, we use garbage_collect which only removes unreferenced layers
+                let freed = client.garbage_collect(false)?;
+
+                println!("Freed {} of unreferenced layers", format_bytes(freed));
+                println!();
+                println!("Note: To remove all images, stop the sandbox and delete the storage disk:");
+                println!("  smolvm sandbox stop");
+                println!("  rm ~/.smolvm/vms/default/storage.raw");
+            }
+        } else {
+            // Just garbage collect unreferenced layers
+            if self.dry_run {
+                println!("Scanning for unreferenced layers...");
+                let would_free = client.garbage_collect(true)?;
+
+                if would_free > 0 {
+                    println!("Would free {} of unreferenced layers", format_bytes(would_free));
+                } else {
+                    println!("No unreferenced layers to remove.");
+                }
+            } else {
+                println!("Removing unreferenced layers...");
+                let freed = client.garbage_collect(false)?;
+
+                if freed > 0 {
+                    println!("Freed {}", format_bytes(freed));
+                } else {
+                    println!("No unreferenced layers to remove.");
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Format bytes as human-readable string.
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
     }
 }

@@ -34,6 +34,28 @@ test_sandbox_run_cat() {
 }
 
 # =============================================================================
+# Python Image Tests
+# =============================================================================
+
+test_sandbox_python_hello() {
+    local output
+    output=$($SMOLVM sandbox run python:3.12 -- python -c "print('python-test-marker')" 2>&1)
+    [[ "$output" == *"python-test-marker"* ]]
+}
+
+test_sandbox_python_version() {
+    local output
+    output=$($SMOLVM sandbox run python:3.12 -- python --version 2>&1)
+    [[ "$output" == *"Python 3.12"* ]]
+}
+
+test_sandbox_python_math() {
+    local output
+    output=$($SMOLVM sandbox run python:3.12 -- python -c "print(2 + 2)" 2>&1)
+    [[ "$output" == *"4"* ]]
+}
+
+# =============================================================================
 # Exit Codes
 # =============================================================================
 
@@ -303,6 +325,9 @@ test_sandbox_command_not_found() {
 
 run_test "Sandbox run echo" test_sandbox_run_echo || true
 run_test "Sandbox run cat /etc/os-release" test_sandbox_run_cat || true
+run_test "Python hello world" test_sandbox_python_hello || true
+run_test "Python version" test_sandbox_python_version || true
+run_test "Python math" test_sandbox_python_math || true
 run_test "Exit code 0" test_sandbox_exit_code_zero || true
 run_test "Exit code 42" test_sandbox_exit_code_nonzero || true
 run_test "Exit code 1" test_sandbox_exit_code_one || true
