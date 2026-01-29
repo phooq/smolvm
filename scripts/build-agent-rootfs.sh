@@ -83,7 +83,8 @@ if command -v docker &> /dev/null; then
             e2fsprogs \
             crun \
             conmon \
-            util-linux
+            util-linux \
+            libcap
     '
     echo "Packages installed successfully"
 else

@@ -12,6 +12,8 @@ VERSION="${VERSION:-$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)}"
 PLATFORM="$(uname -s | tr '[:upper:]' '[:lower:]')-$(uname -m)"
 DIST_NAME="smolvm-${VERSION}-${PLATFORM}"
 DIST_DIR="dist/${DIST_NAME}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 echo "Building smolvm distribution: ${DIST_NAME}"
 
@@ -23,9 +25,20 @@ if [[ ! -f "$LIB_DIR/libkrun.dylib" ]] && [[ ! -f "$LIB_DIR/libkrun.so" ]]; then
     exit 1
 fi
 
+# Check for Docker (required for cross-compiling agent)
+if ! command -v docker &> /dev/null; then
+    echo "Error: Docker is required to cross-compile the agent for Linux"
+    exit 1
+fi
+
 # Build release binary
 echo "Building release binary..."
 LIBKRUN_BUNDLE="$LIB_DIR" cargo build --release --bin smolvm
+
+# Build smolvm-agent for Linux
+echo "Building smolvm-agent for Linux..."
+docker run --rm -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
+    "apk add musl-dev && cargo build --release -p smolvm-agent"
 
 # Sign binary (macOS only)
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -55,6 +68,28 @@ else
     cp "$LIB_DIR/libkrun.so"* "$DIST_DIR/lib/"
     cp "$LIB_DIR/libkrunfw.so"* "$DIST_DIR/lib/"
 fi
+
+# Build agent-rootfs
+echo "Building agent-rootfs..."
+ROOTFS_SRC="$PROJECT_ROOT/helper-rootfs/rootfs"
+if [[ ! -d "$ROOTFS_SRC" ]]; then
+    echo "Error: helper-rootfs/rootfs not found"
+    echo "Run ./scripts/build-agent-rootfs.sh first to create the base rootfs."
+    exit 1
+fi
+
+# Copy rootfs and update agent binary
+# Use cp -a to preserve symlinks (busybox creates many symlinks in /bin)
+mkdir -p "$DIST_DIR/agent-rootfs"
+cp -a "$ROOTFS_SRC"/* "$DIST_DIR/agent-rootfs/"
+
+# Copy freshly built agent binary
+cp ./target/release/smolvm-agent "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
+cp ./target/release/smolvm-agent "$DIST_DIR/agent-rootfs/sbin/init"
+chmod +x "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
+chmod +x "$DIST_DIR/agent-rootfs/sbin/init"
+
+echo "Agent rootfs size: $(du -sh "$DIST_DIR/agent-rootfs" | cut -f1)"
 
 # Copy README
 cat > "$DIST_DIR/README.txt" << 'EOF'

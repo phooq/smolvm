@@ -106,6 +106,25 @@ install_from_dir() {
     cp "$src_dir/smolvm-bin" "$INSTALL_PREFIX/"
     chmod +x "$INSTALL_PREFIX/smolvm" "$INSTALL_PREFIX/smolvm-bin"
 
+    # Install agent-rootfs to data directory
+    local data_dir
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        data_dir="$HOME/Library/Application Support/smolvm"
+    else
+        data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/smolvm"
+    fi
+
+    if [[ -d "$src_dir/agent-rootfs" ]]; then
+        info "Installing agent-rootfs to $data_dir..."
+        mkdir -p "$data_dir"
+        rm -rf "$data_dir/agent-rootfs"
+        # Use cp -a to preserve symlinks (busybox creates many symlinks)
+        cp -a "$src_dir/agent-rootfs" "$data_dir/"
+        success "Agent rootfs installed"
+    else
+        warn "agent-rootfs not found in distribution"
+    fi
+
     # Store version
     echo "$version" > "$INSTALL_PREFIX/.version"
 
