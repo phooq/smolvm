@@ -541,10 +541,7 @@ mod tests {
     /// ext4 superblock is at offset 1024, magic number 0xEF53 is at offset 56.
     fn write_ext4_magic(path: &std::path::Path) {
         use std::io::{Seek, SeekFrom, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
 
         // Seek to superblock magic offset (1024 + 56 = 1080)
         file.seek(SeekFrom::Start(1080)).unwrap();
@@ -556,10 +553,7 @@ mod tests {
     /// Corrupt the ext4 magic bytes by zeroing them.
     fn corrupt_ext4_magic(path: &std::path::Path) {
         use std::io::{Seek, SeekFrom, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .unwrap();
+        let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
 
         // Seek to superblock magic offset and zero it
         file.seek(SeekFrom::Start(1080)).unwrap();

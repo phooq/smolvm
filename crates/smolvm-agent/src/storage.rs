@@ -1383,8 +1383,9 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
         if !is_mountpoint(&virtiofs_mount) {
             info!(tag = %tag, mount_point = %virtiofs_mount.display(), "mounting virtiofs");
 
+            // Use cache=none to ensure writes are synchronously persisted to host
             let status = Command::new("mount")
-                .args(["-t", "virtiofs", tag])
+                .args(["-t", "virtiofs", "-o", "cache=none", tag])
                 .arg(&virtiofs_mount)
                 .status()?;
 
