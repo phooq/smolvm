@@ -382,29 +382,37 @@ mod tests {
 
     #[test]
     fn test_is_safe_mount_source() {
-        // Blocked system paths
-        assert!(!is_safe_mount_source(Path::new("/")));
-        assert!(!is_safe_mount_source(Path::new("/etc")));
-        assert!(!is_safe_mount_source(Path::new("/etc/passwd")));
-        assert!(!is_safe_mount_source(Path::new("/System")));
-        assert!(!is_safe_mount_source(Path::new("/var")));
-        assert!(!is_safe_mount_source(Path::new("/usr")));
-        assert!(!is_safe_mount_source(Path::new("/bin")));
-        assert!(!is_safe_mount_source(Path::new("/sbin")));
-        assert!(!is_safe_mount_source(Path::new("/lib")));
+        // (path, expected_safe, description)
+        let cases = [
+            // Blocked system paths
+            ("/", false, "root"),
+            ("/etc", false, "etc"),
+            ("/etc/passwd", false, "etc file"),
+            ("/etc/nginx", false, "etc subdir"),
+            ("/System", false, "System"),
+            ("/var", false, "var"),
+            ("/var/log", false, "var subdir"),
+            ("/usr", false, "usr"),
+            ("/usr/local", false, "usr subdir"),
+            ("/bin", false, "bin"),
+            ("/sbin", false, "sbin"),
+            ("/lib", false, "lib"),
+            // Safe user paths
+            ("/home/user/project", true, "home dir"),
+            ("/Users/someone/code", true, "Users dir"),
+            ("/tmp/test", true, "tmp"),
+            ("/opt/myapp", true, "opt"),
+        ];
 
-        // Safe user paths
-        assert!(is_safe_mount_source(Path::new("/home/user/project")));
-        assert!(is_safe_mount_source(Path::new("/Users/someone/code")));
-        assert!(is_safe_mount_source(Path::new("/tmp/test")));
-        assert!(is_safe_mount_source(Path::new("/opt/myapp")));
-    }
-
-    #[test]
-    fn test_is_safe_mount_source_subdirectories() {
-        // Subdirectories of blocked paths should also be blocked
-        assert!(!is_safe_mount_source(Path::new("/etc/nginx")));
-        assert!(!is_safe_mount_source(Path::new("/var/log")));
-        assert!(!is_safe_mount_source(Path::new("/usr/local")));
+        for (path, expected, desc) in cases {
+            assert_eq!(
+                is_safe_mount_source(Path::new(path)),
+                expected,
+                "{} ({}) should be {}",
+                path,
+                desc,
+                if expected { "safe" } else { "blocked" }
+            );
+        }
     }
 }

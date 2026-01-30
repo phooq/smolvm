@@ -176,30 +176,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_vm_state_is_terminal() {
-        assert!(!VmState::Created.is_terminal());
-        assert!(!VmState::Booting.is_terminal());
-        assert!(!VmState::Running.is_terminal());
-        assert!(VmState::Stopped.is_terminal());
-        assert!(VmState::Failed {
-            reason: "test".to_string()
+    fn test_vm_state_transitions() {
+        // (state, is_terminal, can_start, can_stop)
+        let cases = [
+            (VmState::Created, false, true, false),
+            (VmState::Booting, false, false, true),
+            (VmState::Running, false, false, true),
+            (VmState::Stopped, true, false, false),
+            (
+                VmState::Failed {
+                    reason: "test".to_string(),
+                },
+                true,
+                false,
+                false,
+            ),
+        ];
+
+        for (state, terminal, start, stop) in cases {
+            assert_eq!(state.is_terminal(), terminal, "{:?}.is_terminal()", state);
+            assert_eq!(state.can_start(), start, "{:?}.can_start()", state);
+            assert_eq!(state.can_stop(), stop, "{:?}.can_stop()", state);
         }
-        .is_terminal());
-    }
-
-    #[test]
-    fn test_vm_state_can_start() {
-        assert!(VmState::Created.can_start());
-        assert!(!VmState::Running.can_start());
-        assert!(!VmState::Stopped.can_start());
-    }
-
-    #[test]
-    fn test_vm_state_can_stop() {
-        assert!(!VmState::Created.can_stop());
-        assert!(VmState::Booting.can_stop());
-        assert!(VmState::Running.can_stop());
-        assert!(!VmState::Stopped.can_stop());
     }
 
     #[test]
