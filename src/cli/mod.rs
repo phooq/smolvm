@@ -1,5 +1,6 @@
 //! CLI command implementations.
 
+pub mod config;
 pub mod container;
 pub mod microvm;
 pub mod pack;

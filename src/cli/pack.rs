@@ -50,6 +50,13 @@ pub struct PackCmd {
     #[arg(long, default_value = "256", value_name = "MiB")]
     pub mem: u32,
 
+    /// Target platform for multi-arch images (e.g., linux/arm64, linux/amd64)
+    ///
+    /// By default, uses the host architecture. Use this to override, for example
+    /// to pack x86_64 images for Rosetta on Apple Silicon.
+    #[arg(long, value_name = "OS/ARCH")]
+    pub platform: Option<String>,
+
     /// Override the image entrypoint
     #[arg(long, value_name = "CMD")]
     pub entrypoint: Option<String>,
@@ -94,7 +101,11 @@ impl PackCmd {
 
         // Pull image
         println!("Pulling {}...", self.image);
-        let image_info = client.pull(&self.image, PullOptions::new().use_registry_config(true))?;
+        let mut pull_opts = PullOptions::new().use_registry_config(true);
+        if let Some(ref platform) = self.platform {
+            pull_opts = pull_opts.platform(platform);
+        }
+        let image_info = client.pull(&self.image, pull_opts)?;
         debug!(image_info = ?image_info, "image pulled");
 
         println!(

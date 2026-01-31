@@ -72,6 +72,34 @@ test_pack_with_custom_resources() {
     [[ "$info" == *"Default CPUs: 2"* ]] && [[ "$info" == *"Default Memory: 512"* ]]
 }
 
+test_pack_platform_flag_help() {
+    # Verify --platform flag exists in help
+    $SMOLVM pack --help 2>&1 | grep -q "\-\-platform"
+}
+
+test_pack_with_platform() {
+    # Pack with explicit platform
+    local output="$TEST_DIR/test-platform"
+
+    # Determine host platform for the test
+    local host_arch
+    if [[ "$(uname -m)" == "arm64" ]] || [[ "$(uname -m)" == "aarch64" ]]; then
+        host_arch="linux/arm64"
+    else
+        host_arch="linux/amd64"
+    fi
+
+    $SMOLVM pack alpine:latest -o "$output" --platform "$host_arch" 2>&1
+
+    # Binary should exist
+    [[ -f "$output" ]]
+
+    # Verify manifest shows correct platform
+    local info
+    info=$("$output" --info 2>&1)
+    [[ "$info" == *"Platform:"* ]]
+}
+
 # =============================================================================
 # Packed Binary - Info and Version
 # =============================================================================
@@ -595,6 +623,8 @@ run_test "Pack help" test_pack_help || true
 run_test "Pack requires output" test_pack_requires_output || true
 run_test "Pack alpine" test_pack_alpine || true
 run_test "Pack with custom resources" test_pack_with_custom_resources || true
+run_test "Pack --platform flag in help" test_pack_platform_flag_help || true
+run_test "Pack with --platform" test_pack_with_platform || true
 
 echo ""
 echo "Running Packed Binary Info Tests..."
