@@ -172,6 +172,103 @@ pub fn extract_to_cache(
     Ok(())
 }
 
+/// Extract assets from a memory pointer (for Mach-O section mode on macOS).
+///
+/// This is similar to `extract_to_cache` but reads compressed data from
+/// memory instead of a file. Used when assets are embedded in the `__DATA,__smolvm`
+/// Mach-O section.
+#[cfg(target_os = "macos")]
+pub fn extract_from_section(
+    cache_dir: &Path,
+    assets_ptr: *const u8,
+    assets_size: usize,
+    debug: bool,
+) -> std::io::Result<()> {
+    // Create cache directory
+    fs::create_dir_all(cache_dir)?;
+
+    if debug {
+        eprintln!(
+            "debug: extracting {} bytes of compressed assets from section",
+            assets_size
+        );
+    }
+
+    // Create a reader from the memory pointer
+    let assets_slice = unsafe { std::slice::from_raw_parts(assets_ptr, assets_size) };
+    let cursor = std::io::Cursor::new(assets_slice);
+
+    // Decompress with zstd
+    let decoder = zstd::stream::Decoder::new(cursor)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    // Extract tar archive
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(cache_dir)?;
+
+    if debug {
+        eprintln!("debug: extracted assets to {}", cache_dir.display());
+    }
+
+    // Post-process: extract agent-rootfs.tar
+    let rootfs_tar = cache_dir.join("agent-rootfs.tar");
+    let rootfs_dir = cache_dir.join("agent-rootfs");
+    if rootfs_tar.exists() && !rootfs_dir.exists() {
+        if debug {
+            eprintln!("debug: extracting agent-rootfs.tar...");
+        }
+        fs::create_dir_all(&rootfs_dir)?;
+        let tar_file = File::open(&rootfs_tar)?;
+        let mut archive = tar::Archive::new(tar_file);
+        archive.unpack(&rootfs_dir)?;
+    }
+
+    // Post-process: extract OCI layers
+    let layers_dir = cache_dir.join("layers");
+    if layers_dir.exists() {
+        if debug {
+            eprintln!("debug: extracting OCI layers...");
+        }
+        for entry in fs::read_dir(&layers_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(false, |ext| ext == "tar") {
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                let layer_dir = layers_dir.join(&*stem);
+                if !layer_dir.exists() {
+                    if debug {
+                        eprintln!("debug: extracting layer {}...", stem);
+                    }
+                    fs::create_dir_all(&layer_dir)?;
+                    let tar_file = File::open(&path)?;
+                    let mut archive = tar::Archive::new(tar_file);
+                    archive.unpack(&layer_dir)?;
+                }
+            }
+        }
+    }
+
+    // Write marker file
+    fs::write(cache_dir.join(EXTRACTION_MARKER), "")?;
+
+    // Make libraries executable
+    let lib_dir = cache_dir.join("lib");
+    if lib_dir.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        for entry in fs::read_dir(&lib_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_file() {
+                let mut perms = fs::metadata(&path)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&path, perms)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Clean up old cached extractions (keep only the most recent N).
 #[allow(dead_code)] // Reserved for future cache management CLI
 pub fn cleanup_old_caches(keep: usize) -> std::io::Result<()> {

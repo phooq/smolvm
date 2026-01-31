@@ -402,6 +402,89 @@ test_sidecar_required() {
 }
 
 # =============================================================================
+# Single-File Mode Tests (--single-file)
+# =============================================================================
+
+test_single_file_pack() {
+    # Pack with --single-file flag
+    local output="$TEST_DIR/test-single-file"
+    $SMOLVM pack alpine:latest -o "$output" --single-file 2>&1
+
+    # Binary should exist
+    [[ -f "$output" ]]
+
+    # Sidecar should NOT exist
+    [[ ! -f "$output.smolmachine" ]]
+
+    # Binary should be executable
+    [[ -x "$output" ]]
+}
+
+test_single_file_info() {
+    local output="$TEST_DIR/test-single-file"
+
+    if [[ ! -f "$output" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" --single-file 2>&1
+    fi
+
+    local info_output
+    info_output=$("$output" --info 2>&1)
+
+    # Should show image info
+    [[ "$info_output" == *"Image:"* ]] && [[ "$info_output" == *"alpine"* ]]
+}
+
+test_single_file_run_echo() {
+    local output="$TEST_DIR/test-single-file"
+
+    if [[ ! -f "$output" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" --single-file 2>&1
+    fi
+
+    local result
+    result=$("$output" echo "single-file-test-marker" 2>&1)
+
+    # Retry once if it fails (handles first-run extraction)
+    if [[ "$result" != *"single-file-test-marker"* ]]; then
+        sleep 1
+        result=$("$output" echo "single-file-test-marker" 2>&1)
+    fi
+
+    [[ "$result" == *"single-file-test-marker"* ]]
+}
+
+test_single_file_size() {
+    local output="$TEST_DIR/test-single-file"
+
+    if [[ ! -f "$output" ]]; then
+        $SMOLVM pack alpine:latest -o "$output" --single-file 2>&1
+    fi
+
+    local size
+    size=$(stat -f%z "$output" 2>/dev/null || stat -c%s "$output" 2>/dev/null)
+
+    # Single file should be substantial (contains stub + compressed assets)
+    # Should be at least 1MB
+    [[ $size -gt 1000000 ]]
+}
+
+test_single_file_no_sidecar_needed() {
+    local output="$TEST_DIR/test-single-file-standalone"
+    $SMOLVM pack alpine:latest -o "$output" --single-file 2>&1
+
+    # Move to a different directory (simulating distribution)
+    local new_dir="$TEST_DIR/standalone-test"
+    mkdir -p "$new_dir"
+    cp "$output" "$new_dir/myapp"
+
+    # Should work without any sidecar
+    local info_output
+    info_output=$("$new_dir/myapp" --info 2>&1)
+
+    [[ "$info_output" == *"Image:"* ]]
+}
+
+# =============================================================================
 # Cache Directory Tests
 # =============================================================================
 
@@ -527,6 +610,16 @@ echo ""
 run_test "Sidecar exists" test_sidecar_exists || true
 run_test "Sidecar size" test_sidecar_size || true
 run_test "Sidecar required" test_sidecar_required || true
+
+echo ""
+echo "Running Single-File Mode Tests..."
+echo ""
+
+run_test "Single-file pack" test_single_file_pack || true
+run_test "Single-file info" test_single_file_info || true
+run_test "Single-file size" test_single_file_size || true
+run_test "Single-file no sidecar needed" test_single_file_no_sidecar_needed || true
+run_test "Single-file run echo (requires VM)" test_single_file_run_echo || true
 
 echo ""
 echo "Running Packed Binary Execution Tests (requires VM)..."

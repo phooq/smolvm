@@ -4,6 +4,7 @@
 //! and receiving responses.
 
 use crate::error::{Error, Result};
+use crate::registry::{extract_registry, rewrite_image_registry, RegistryAuth, RegistryConfig};
 use smolvm_protocol::{
     encode_message, AgentRequest, AgentResponse, ContainerInfo, ImageInfo, OverlayInfo,
     StorageStatus, MAX_FRAME_SIZE,
@@ -74,6 +75,84 @@ impl RunConfig {
     pub fn with_tty(mut self, tty: bool) -> Self {
         self.tty = tty;
         self
+    }
+}
+
+/// Options for pulling an OCI image.
+///
+/// Use `PullOptions::new()` to create with defaults, then chain methods
+/// to customize behavior.
+///
+/// # Example
+///
+/// ```ignore
+/// let options = PullOptions::new()
+///     .platform("linux/arm64")
+///     .use_registry_config(true)
+///     .progress(|cur, total, layer| println!("{}/{}: {}", cur, total, layer));
+///
+/// client.pull("alpine:latest", options)?;
+/// ```
+#[derive(Default)]
+pub struct PullOptions<F = fn(usize, usize, &str)>
+where
+    F: FnMut(usize, usize, &str),
+{
+    /// Platform to pull (e.g., "linux/arm64").
+    pub platform: Option<String>,
+    /// Explicit authentication credentials.
+    pub auth: Option<RegistryAuth>,
+    /// Whether to load credentials from registry config file.
+    pub use_registry_config: bool,
+    /// Progress callback: (current, total, layer_id).
+    pub progress: Option<F>,
+}
+
+impl PullOptions<fn(usize, usize, &str)> {
+    /// Create new pull options with defaults.
+    pub fn new() -> Self {
+        Self {
+            platform: None,
+            auth: None,
+            use_registry_config: false,
+            progress: None,
+        }
+    }
+}
+
+impl<F: FnMut(usize, usize, &str)> PullOptions<F> {
+    /// Set the target platform (e.g., "linux/arm64").
+    pub fn platform(mut self, platform: impl Into<String>) -> Self {
+        self.platform = Some(platform.into());
+        self
+    }
+
+    /// Set explicit authentication credentials.
+    pub fn auth(mut self, auth: RegistryAuth) -> Self {
+        self.auth = Some(auth);
+        self
+    }
+
+    /// Enable loading credentials from registry config file.
+    ///
+    /// When enabled, loads `~/.config/smolvm/registries.toml` and
+    /// automatically provides credentials for matching registries.
+    /// Also applies registry mirrors if configured.
+    pub fn use_registry_config(mut self, enabled: bool) -> Self {
+        self.use_registry_config = enabled;
+        self
+    }
+
+    /// Set a progress callback.
+    ///
+    /// The callback receives (current_percent, total=100, layer_id) for each layer.
+    pub fn progress<G: FnMut(usize, usize, &str)>(self, callback: G) -> PullOptions<G> {
+        PullOptions {
+            platform: self.platform,
+            auth: self.auth,
+            use_registry_config: self.use_registry_config,
+            progress: Some(callback),
+        }
     }
 }
 
@@ -193,33 +272,86 @@ impl AgentClient {
         }
     }
 
-    /// Pull an OCI image.
+    /// Pull an OCI image with the given options.
     ///
-    /// # Arguments
+    /// This is the primary pull method. Use `PullOptions` to configure
+    /// authentication, platform, and progress tracking.
     ///
-    /// * `image` - Image reference (e.g., "alpine:latest")
-    /// * `platform` - Optional platform (e.g., "linux/arm64")
+    /// # Example
+    ///
+    /// ```ignore
+    /// // Simple pull
+    /// client.pull("alpine:latest", PullOptions::new())?;
+    ///
+    /// // Pull with registry config (loads credentials from config file)
+    /// client.pull("ghcr.io/owner/repo", PullOptions::new().use_registry_config(true))?;
+    ///
+    /// // Pull with explicit auth and progress
+    /// client.pull("private.registry/image", PullOptions::new()
+    ///     .auth(RegistryAuth { username: "user".into(), password: "pass".into() })
+    ///     .progress(|cur, total, layer| eprintln!("{}%", cur)))?;
+    /// ```
     ///
     /// # Note
     ///
-    /// This operation uses a 10-minute timeout to accommodate large images
-    /// that may take significant time to download and extract.
-    pub fn pull(&mut self, image: &str, platform: Option<&str>) -> Result<ImageInfo> {
-        self.pull_with_progress(image, platform, |_, _, _| {})
+    /// This operation uses a 10-minute timeout to accommodate large images.
+    pub fn pull<F: FnMut(usize, usize, &str)>(
+        &mut self,
+        image: &str,
+        options: PullOptions<F>,
+    ) -> Result<ImageInfo> {
+        // Resolve effective image and auth based on options
+        let (effective_image, effective_auth) = if options.use_registry_config {
+            let registry_config = RegistryConfig::load().unwrap_or_default();
+            let registry = extract_registry(image);
+
+            // Get credentials from config if not explicitly provided
+            let auth = options.auth.or_else(|| {
+                registry_config.get_credentials(&registry).map(|creds| {
+                    tracing::debug!(
+                        registry = %registry,
+                        username = %creds.username,
+                        "using configured registry credentials"
+                    );
+                    creds
+                })
+            });
+
+            // Apply mirror if configured
+            let img = if let Some(mirror) = registry_config.get_mirror(&registry) {
+                let mirrored = rewrite_image_registry(image, mirror);
+                tracing::debug!(
+                    original = %image,
+                    mirrored = %mirrored,
+                    mirror = %mirror,
+                    "using registry mirror"
+                );
+                mirrored
+            } else {
+                image.to_string()
+            };
+
+            (img, auth)
+        } else {
+            (image.to_string(), options.auth)
+        };
+
+        self.pull_image_internal(
+            &effective_image,
+            options.platform.as_deref(),
+            effective_auth.as_ref(),
+            options.progress,
+        )
     }
 
-    /// Pull an OCI image with progress callback.
-    ///
-    /// The callback receives (current_layer, total_layers, layer_id) for each layer.
-    pub fn pull_with_progress<F>(
+    /// Internal implementation of image pull.
+    fn pull_image_internal<F: FnMut(usize, usize, &str)>(
         &mut self,
         image: &str,
         platform: Option<&str>,
-        mut progress: F,
-    ) -> Result<ImageInfo>
-    where
-        F: FnMut(usize, usize, &str),
-    {
+        auth: Option<&RegistryAuth>,
+        mut progress: Option<F>,
+    ) -> Result<ImageInfo> {
         // Use a long timeout for pull - large images can take minutes to download/extract
         self.set_read_timeout(Duration::from_secs(600))?; // 10 minutes
 
@@ -227,6 +359,7 @@ impl AgentClient {
         let data = encode_message(&AgentRequest::Pull {
             image: image.to_string(),
             platform: platform.map(String::from),
+            auth: auth.cloned(),
         })
         .map_err(|e| Error::AgentError(e.to_string()))?;
 
@@ -249,11 +382,11 @@ impl AgentClient {
                     layer,
                     message: _,
                 } => {
-                    // Extract current/total from percent or message
-                    let current = percent.unwrap_or(0) as usize;
-                    let total = 100;
-                    let layer_id = layer.as_deref().unwrap_or("");
-                    progress(current, total, layer_id);
+                    if let Some(ref mut cb) = progress {
+                        let current = percent.unwrap_or(0) as usize;
+                        let layer_id = layer.as_deref().unwrap_or("");
+                        cb(current, 100, layer_id);
+                    }
                 }
                 AgentResponse::Ok { data: Some(data) } => {
                     return serde_json::from_value(data)
@@ -267,6 +400,41 @@ impl AgentClient {
                 }
             }
         }
+    }
+
+    // =========================================================================
+    // Convenience methods for common pull patterns
+    // =========================================================================
+
+    /// Pull an OCI image with default options.
+    ///
+    /// Shorthand for `pull(image, PullOptions::new())`.
+    pub fn pull_simple(&mut self, image: &str) -> Result<ImageInfo> {
+        self.pull(image, PullOptions::new())
+    }
+
+    /// Pull an OCI image with automatic registry credential lookup.
+    ///
+    /// Loads credentials from `~/.config/smolvm/registries.toml` and applies
+    /// registry mirrors if configured.
+    ///
+    /// Shorthand for `pull(image, PullOptions::new().use_registry_config(true))`.
+    pub fn pull_with_registry_config(&mut self, image: &str) -> Result<ImageInfo> {
+        self.pull(image, PullOptions::new().use_registry_config(true))
+    }
+
+    /// Pull an OCI image with registry config and progress callback.
+    pub fn pull_with_registry_config_and_progress<F: FnMut(usize, usize, &str)>(
+        &mut self,
+        image: &str,
+        platform: Option<&str>,
+        progress: F,
+    ) -> Result<ImageInfo> {
+        let mut opts = PullOptions::new().use_registry_config(true).progress(progress);
+        if let Some(p) = platform {
+            opts = opts.platform(p);
+        }
+        self.pull(image, opts)
     }
 
     /// Query if an image exists locally.

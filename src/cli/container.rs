@@ -6,7 +6,7 @@
 use crate::cli::parsers::{parse_duration, parse_env_list, parse_mounts_to_bindings};
 use crate::cli::{flush_output, truncate, truncate_id, COMMAND_WIDTH, IMAGE_NAME_WIDTH};
 use clap::{Args, Subcommand};
-use smolvm::agent::{AgentClient, AgentManager};
+use smolvm::agent::{AgentClient, AgentManager, PullOptions};
 use std::time::Duration;
 
 /// Manage containers inside a microVM
@@ -117,25 +117,30 @@ impl ContainerCreateCmd {
 
             let image_name = self.image.clone();
             let mut last_percent = 0u8;
-            client.pull_with_progress(&self.image, None, |percent, _total, _layer| {
-                let percent = percent as u8;
-                if percent != last_percent && percent <= 100 {
-                    print!("\rPulling image {}... [", image_name);
-                    let filled = (percent as usize) / 5;
-                    for i in 0..20 {
-                        if i < filled {
-                            print!("=");
-                        } else if i == filled {
-                            print!(">");
-                        } else {
-                            print!(" ");
+            client.pull(
+                &self.image,
+                PullOptions::new()
+                    .use_registry_config(true)
+                    .progress(|percent, _total, _layer| {
+                        let percent = percent as u8;
+                        if percent != last_percent && percent <= 100 {
+                            print!("\rPulling image {}... [", image_name);
+                            let filled = (percent as usize) / 5;
+                            for i in 0..20 {
+                                if i < filled {
+                                    print!("=");
+                                } else if i == filled {
+                                    print!(">");
+                                } else {
+                                    print!(" ");
+                                }
+                            }
+                            print!("] {}%", percent);
+                            let _ = std::io::Write::flush(&mut std::io::stdout());
+                            last_percent = percent;
                         }
-                    }
-                    print!("] {}%", percent);
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                    last_percent = percent;
-                }
-            })?;
+                    }),
+            )?;
             println!(
                 "\rPulling image {}... done.                              ",
                 self.image

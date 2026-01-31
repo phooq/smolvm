@@ -8,7 +8,7 @@
 //! - Configuration manifest
 
 use clap::Args;
-use smolvm::agent::{AgentClient, AgentManager, VmResources};
+use smolvm::agent::{AgentClient, AgentManager, PullOptions, VmResources};
 use smolvm::platform::{Os, VmExecutor};
 use smolvm::Error;
 use smolvm_pack::assets::AssetCollector;
@@ -58,6 +58,13 @@ pub struct PackCmd {
     #[arg(long)]
     pub no_sign: bool,
 
+    /// Pack as a single file (no sidecar)
+    ///
+    /// Creates one executable instead of binary + .smolmachine sidecar.
+    /// Simpler to distribute but may have issues with macOS notarization.
+    #[arg(long)]
+    pub single_file: bool,
+
     /// Path to stub executable (defaults to built-in)
     #[arg(long, value_name = "PATH", hide = true)]
     pub stub: Option<PathBuf>,
@@ -87,7 +94,7 @@ impl PackCmd {
 
         // Pull image
         println!("Pulling {}...", self.image);
-        let image_info = client.pull(&self.image, None)?;
+        let image_info = client.pull(&self.image, PullOptions::new().use_registry_config(true))?;
         debug!(image_info = ?image_info, "image pulled");
 
         println!(
@@ -166,14 +173,21 @@ impl PackCmd {
             AssetCollector::new(staging_dir).map_err(|e| Error::AgentError(e.to_string()))?;
 
         // Pack the binary
-        println!("Assembling packed binary...");
         let packer = Packer::new(manifest)
             .with_stub(&stub_path)
             .with_asset_collector(collector);
 
-        let info = packer
-            .pack(&self.output)
-            .map_err(|e| Error::AgentError(e.to_string()))?;
+        let info = if self.single_file {
+            println!("Assembling single-file packed binary...");
+            packer
+                .pack_embedded(&self.output)
+                .map_err(|e| Error::AgentError(e.to_string()))?
+        } else {
+            println!("Assembling packed binary...");
+            packer
+                .pack(&self.output)
+                .map_err(|e| Error::AgentError(e.to_string()))?
+        };
 
         println!(
             "Packed: {} (stub: {}KB, total: {}KB)",
@@ -187,6 +201,8 @@ impl PackCmd {
                 sidecar.display(),
                 info.assets_size / 1024
             );
+        } else {
+            println!("Mode: single-file (no sidecar)");
         }
 
         // Sign on macOS

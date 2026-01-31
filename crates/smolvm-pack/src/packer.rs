@@ -21,6 +21,15 @@ pub struct Packer {
     asset_collector: Option<AssetCollector>,
 }
 
+/// Error type for try_pack_embedded_macho (internal).
+#[cfg(target_os = "macos")]
+enum PackedEmbeddedError {
+    /// Not a valid Mach-O with required section, return Packer to try append mode.
+    NotMachO(Packer),
+    /// Other pack error.
+    PackError(crate::PackError),
+}
+
 impl Packer {
     /// Create a new packer with the given manifest.
     pub fn new(manifest: PackManifest) -> Self {
@@ -146,6 +155,244 @@ impl Packer {
             total_size,
             checksum,
             sidecar_path: Some(sidecar_path),
+        })
+    }
+
+    /// Pack everything into a single executable file (embedded format).
+    ///
+    /// On macOS, this uses Mach-O section manipulation to embed assets inside
+    /// the `__DATA,__smolvm` section, allowing proper code signing.
+    ///
+    /// On other platforms, this appends assets to the binary (simpler but
+    /// not signable on macOS).
+    pub fn pack_embedded(self, output: impl AsRef<Path>) -> Result<PackedInfo> {
+        #[cfg(target_os = "macos")]
+        {
+            // Try Mach-O section mode first
+            match self.try_pack_embedded_macho(output.as_ref()) {
+                Ok(info) => return Ok(info),
+                Err(PackedEmbeddedError::NotMachO(packer)) => {
+                    // Not a valid Mach-O, fall back to append mode
+                    return packer.pack_embedded_append(output);
+                }
+                Err(PackedEmbeddedError::PackError(e)) => return Err(e),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.pack_embedded_append(output)
+        }
+    }
+
+    /// Try to pack using Mach-O section manipulation.
+    ///
+    /// Returns NotMachO with self if the stub isn't a valid Mach-O with
+    /// the required __smolvm section, allowing fallback to append mode.
+    #[cfg(target_os = "macos")]
+    fn try_pack_embedded_macho(self, output: &Path) -> std::result::Result<PackedInfo, PackedEmbeddedError> {
+        use crate::macho::MachoFile;
+
+        // Get stub path
+        let stub_path = match self.stub_path.as_ref() {
+            Some(p) => p,
+            None => {
+                return Err(PackedEmbeddedError::PackError(crate::PackError::AssetNotFound(
+                    "stub executable".to_string(),
+                )))
+            }
+        };
+
+        // Read stub data
+        let stub_data = match fs::read(stub_path) {
+            Ok(data) => data,
+            Err(e) => return Err(PackedEmbeddedError::PackError(e.into())),
+        };
+
+        // Try to parse as Mach-O
+        let macho = match MachoFile::parse(&stub_data) {
+            Ok(m) => m,
+            Err(_) => return Err(PackedEmbeddedError::NotMachO(self)), // Not a Mach-O, fall back
+        };
+
+        // Check for __smolvm section
+        if macho.find_section("__DATA", "__smolvm").is_none() {
+            return Err(PackedEmbeddedError::NotMachO(self)); // No section, fall back
+        }
+
+        // Valid Mach-O with section, proceed with Mach-O packing
+        match self.pack_embedded_macho_inner(output, stub_data, macho) {
+            Ok(info) => Ok(info),
+            Err(e) => Err(PackedEmbeddedError::PackError(e)),
+        }
+    }
+
+    /// Pack using Mach-O section manipulation (macOS), inner implementation.
+    ///
+    /// This writes assets to the `__DATA,__smolvm` section, keeping the
+    /// binary as a valid Mach-O that can be properly code-signed.
+    #[cfg(target_os = "macos")]
+    fn pack_embedded_macho_inner(
+        self,
+        output: &Path,
+        stub_data: Vec<u8>,
+        mut macho: crate::macho::MachoFile,
+    ) -> Result<PackedInfo> {
+        use crate::format::{SectionHeader, SECTION_HEADER_SIZE};
+
+        let stub_size = stub_data.len() as u64;
+        let temp_dir = tempfile::tempdir()?;
+
+        // Compress assets
+        let assets_temp = temp_dir.path().join("assets.tar.zst");
+        let assets_size = if let Some(collector) = &self.asset_collector {
+            collector.compress(&assets_temp)?
+        } else {
+            let empty_file = File::create(&assets_temp)?;
+            let encoder = zstd::stream::Encoder::new(empty_file, 1)?;
+            let tar_builder = tar::Builder::new(encoder);
+            let encoder = tar_builder.into_inner()?;
+            encoder.finish()?;
+            fs::metadata(&assets_temp)?.len()
+        };
+
+        // Serialize manifest
+        let manifest_json = self.manifest.to_json()?;
+        let manifest_size = manifest_json.len() as u32;
+
+        // Calculate checksum of manifest + assets
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&manifest_json);
+        let assets_data = fs::read(&assets_temp)?;
+        hasher.update(&assets_data);
+        let checksum = hasher.finalize();
+
+        // Build section data: header + manifest + assets
+        let header = SectionHeader {
+            manifest_size,
+            assets_size,
+            checksum,
+        };
+
+        let mut section_data =
+            Vec::with_capacity(SECTION_HEADER_SIZE + manifest_json.len() + assets_data.len());
+        section_data.extend_from_slice(&header.to_bytes());
+        section_data.extend_from_slice(&manifest_json);
+        section_data.extend_from_slice(&assets_data);
+
+        // Write section data to Mach-O
+        macho
+            .write_section("__DATA", "__smolvm", &section_data)
+            .map_err(|e| crate::PackError::Signing(format!("failed to write section: {}", e)))?;
+
+        // Sign the binary with adhoc signature
+        macho
+            .sign_adhoc()
+            .map_err(|e| crate::PackError::Signing(format!("failed to sign: {}", e)))?;
+
+        // Write output
+        let output_data = macho.write();
+        let total_size = output_data.len() as u64;
+        fs::write(output, &output_data)?;
+
+        // Make executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(output)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(output, perms)?;
+        }
+
+        Ok(PackedInfo {
+            stub_size,
+            assets_size,
+            manifest_size: manifest_size as u64,
+            total_size,
+            checksum,
+            sidecar_path: None,
+        })
+    }
+
+    /// Pack by appending assets to binary.
+    ///
+    /// This is the fallback method on macOS (when stub isn't a valid Mach-O)
+    /// and the default method on other platforms.
+    fn pack_embedded_append(self, output: impl AsRef<Path>) -> Result<PackedInfo> {
+        let output = output.as_ref();
+        let temp_dir = tempfile::tempdir()?;
+
+        // Get stub executable
+        let stub_path = self
+            .stub_path
+            .as_ref()
+            .ok_or_else(|| crate::PackError::AssetNotFound("stub executable".to_string()))?;
+
+        // 1. Copy stub executable to output
+        let stub_data = fs::read(stub_path)?;
+        let stub_size = stub_data.len() as u64;
+        let mut output_file = File::create(output)?;
+        output_file.write_all(&stub_data)?;
+
+        // 2. Compress and append assets
+        let assets_temp = temp_dir.path().join("assets.tar.zst");
+        let assets_size = if let Some(collector) = &self.asset_collector {
+            collector.compress(&assets_temp)?
+        } else {
+            let empty_file = File::create(&assets_temp)?;
+            let encoder = zstd::stream::Encoder::new(empty_file, 1)?;
+            let tar_builder = tar::Builder::new(encoder);
+            let encoder = tar_builder.into_inner()?;
+            encoder.finish()?;
+            fs::metadata(&assets_temp)?.len()
+        };
+
+        let assets_offset = stub_size; // Assets start right after stub
+        let mut assets_file = File::open(&assets_temp)?;
+        std::io::copy(&mut assets_file, &mut output_file)?;
+
+        // 3. Append manifest JSON
+        let manifest_offset = stub_size + assets_size;
+        let manifest_json = self.manifest.to_json()?;
+        let manifest_size = manifest_json.len() as u64;
+        output_file.write_all(&manifest_json)?;
+
+        // 4. Calculate checksum of assets + manifest
+        output_file.flush()?;
+        drop(output_file);
+        let checksum_size = assets_size + manifest_size;
+        let checksum = crc32_file_range(output, assets_offset, checksum_size)?;
+
+        // 5. Append footer
+        let footer = PackFooter {
+            stub_size,
+            assets_offset, // Non-zero indicates embedded mode
+            assets_size,
+            manifest_offset,
+            manifest_size,
+            checksum,
+        };
+
+        let mut output_file = fs::OpenOptions::new().append(true).open(output)?;
+        output_file.write_all(&footer.to_bytes())?;
+
+        // Make executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(output)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(output, perms)?;
+        }
+
+        let total_size = stub_size + assets_size + manifest_size + FOOTER_SIZE as u64;
+
+        Ok(PackedInfo {
+            stub_size,
+            assets_size,
+            manifest_size,
+            total_size,
+            checksum,
+            sidecar_path: None, // No sidecar in embedded mode
         })
     }
 }
@@ -394,5 +641,139 @@ mod tests {
         let layer_file = extract_dir.join("layers/abc123def456.tar");
         assert!(layer_file.exists());
         assert_eq!(fs::read_to_string(&layer_file).unwrap(), "layer content");
+    }
+
+    #[test]
+    fn test_pack_embedded() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create a dummy stub
+        let stub_path = temp_dir.path().join("stub");
+        fs::write(&stub_path, b"#!/bin/sh\necho stub").unwrap();
+
+        // Create manifest
+        let manifest = PackManifest::new(
+            "alpine:latest".to_string(),
+            "sha256:abc123".to_string(),
+            "linux/arm64".to_string(),
+        );
+
+        // Pack embedded (single file)
+        let output_path = temp_dir.path().join("packed-single");
+        let packer = Packer::new(manifest).with_stub(&stub_path);
+        let info = packer.pack_embedded(&output_path).unwrap();
+
+        // Should have no sidecar
+        assert!(info.sidecar_path.is_none());
+        assert!(info.stub_size > 0);
+        assert!(info.total_size > info.stub_size);
+
+        // Sidecar file should NOT exist
+        let sidecar = sidecar_path_for(&output_path);
+        assert!(!sidecar.exists());
+
+        // Output file should contain everything
+        let output_size = fs::metadata(&output_path).unwrap().len();
+        assert_eq!(output_size, info.total_size);
+
+        // Read back - embedded mode has non-zero assets_offset
+        let footer = read_footer(&output_path).unwrap();
+        assert!(footer.assets_offset > 0); // Embedded mode indicator
+        assert_eq!(footer.stub_size, info.stub_size);
+
+        let manifest = read_manifest(&output_path).unwrap();
+        assert_eq!(manifest.image, "alpine:latest");
+
+        // Verify checksum
+        assert!(verify_checksum(&output_path).unwrap());
+    }
+
+    #[test]
+    fn test_pack_embedded_with_assets() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create a dummy stub
+        let stub_path = temp_dir.path().join("stub");
+        fs::write(&stub_path, b"#!/bin/sh\necho stub").unwrap();
+
+        // Create staging directory with a test file
+        let staging = temp_dir.path().join("staging");
+        let mut collector = AssetCollector::new(staging).unwrap();
+
+        // Add a fake layer (digest must be at least 12 chars after sha256:)
+        collector
+            .add_layer("sha256:embedded123456", b"embedded layer content")
+            .unwrap();
+
+        // Create manifest
+        let manifest = PackManifest::new(
+            "test:embedded".to_string(),
+            "sha256:test".to_string(),
+            "linux/arm64".to_string(),
+        );
+
+        // Pack embedded with assets
+        let output_path = temp_dir.path().join("packed-embedded");
+        let packer = Packer::new(manifest)
+            .with_stub(&stub_path)
+            .with_assets(collector);
+        packer.pack_embedded(&output_path).unwrap();
+
+        // Verify we can read the manifest with layer info
+        let manifest = read_manifest(&output_path).unwrap();
+        assert_eq!(manifest.assets.layers.len(), 1);
+        assert_eq!(manifest.assets.layers[0].digest, "sha256:embedded123456");
+
+        // Verify footer indicates embedded mode
+        let footer = read_footer(&output_path).unwrap();
+        assert!(footer.assets_offset > 0);
+        assert!(!is_sidecar_mode(&footer));
+
+        // Extract and verify assets
+        let extract_dir = temp_dir.path().join("extracted");
+        extract_assets(&output_path, &extract_dir).unwrap();
+
+        let layer_file = extract_dir.join("layers/embedded1234.tar"); // First 12 chars
+        assert!(layer_file.exists());
+        assert_eq!(
+            fs::read_to_string(&layer_file).unwrap(),
+            "embedded layer content"
+        );
+    }
+
+    #[test]
+    fn test_sidecar_vs_embedded_mode_detection() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create a dummy stub
+        let stub_path = temp_dir.path().join("stub");
+        fs::write(&stub_path, b"#!/bin/sh\necho stub").unwrap();
+
+        let manifest = PackManifest::new(
+            "test:latest".to_string(),
+            "sha256:test".to_string(),
+            "linux/arm64".to_string(),
+        );
+
+        // Pack sidecar mode
+        let sidecar_output = temp_dir.path().join("sidecar-mode");
+        let packer = Packer::new(manifest.clone()).with_stub(&stub_path);
+        packer.pack(&sidecar_output).unwrap();
+
+        // Pack embedded mode
+        let embedded_output = temp_dir.path().join("embedded-mode");
+        let packer = Packer::new(manifest).with_stub(&stub_path);
+        packer.pack_embedded(&embedded_output).unwrap();
+
+        // Verify mode detection
+        let sidecar_footer = read_footer(&sidecar_output).unwrap();
+        let embedded_footer = read_footer(&embedded_output).unwrap();
+
+        assert!(is_sidecar_mode(&sidecar_footer));
+        assert!(!is_sidecar_mode(&embedded_footer));
+
+        // Both should have valid checksums
+        assert!(verify_checksum(&sidecar_output).unwrap());
+        assert!(verify_checksum(&embedded_output).unwrap());
     }
 }

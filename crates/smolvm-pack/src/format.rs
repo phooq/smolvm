@@ -10,6 +10,9 @@ use crate::{PackError, Result};
 /// Magic bytes identifying a packed smolvm binary.
 pub const MAGIC: &[u8; 8] = b"SMOLPACK";
 
+/// Magic bytes for embedded section header.
+pub const SECTION_MAGIC: &[u8; 8] = b"SMOLSECT";
+
 /// Current format version.
 /// Version 1: Assets appended to binary
 /// Version 2: Assets in sidecar file (.smolmachine)
@@ -20,6 +23,88 @@ pub const SIDECAR_EXTENSION: &str = ".smolmachine";
 
 /// Footer size in bytes (fixed).
 pub const FOOTER_SIZE: usize = 64;
+
+/// Embedded section header size (fixed).
+pub const SECTION_HEADER_SIZE: usize = 32;
+
+/// Header for data embedded in the __DATA,__smolvm Mach-O section.
+///
+/// This format is used for macOS single-file binaries where assets are
+/// stored inside the executable's Mach-O structure, allowing proper code signing.
+///
+/// Layout (32 bytes total):
+/// ```text
+/// Offset  Size  Field
+/// 0       8     magic ("SMOLSECT")
+/// 8       4     version (u32 LE)
+/// 12      4     manifest_size (u32 LE)
+/// 16      8     assets_size (u64 LE)
+/// 24      4     checksum (u32 LE)
+/// 28      4     reserved (zeroes)
+/// ```
+///
+/// Following the header:
+/// - Manifest JSON (manifest_size bytes)
+/// - Compressed assets (assets_size bytes)
+#[derive(Debug, Clone, Copy)]
+pub struct SectionHeader {
+    /// Size of manifest JSON in bytes.
+    pub manifest_size: u32,
+    /// Size of compressed assets in bytes.
+    pub assets_size: u64,
+    /// CRC32 checksum of manifest + assets.
+    pub checksum: u32,
+}
+
+impl SectionHeader {
+    /// Serialize header to bytes.
+    pub fn to_bytes(&self) -> [u8; SECTION_HEADER_SIZE] {
+        let mut buf = [0u8; SECTION_HEADER_SIZE];
+
+        // Magic
+        buf[0..8].copy_from_slice(SECTION_MAGIC);
+
+        // Version
+        buf[8..12].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+
+        // Manifest size
+        buf[12..16].copy_from_slice(&self.manifest_size.to_le_bytes());
+
+        // Assets size
+        buf[16..24].copy_from_slice(&self.assets_size.to_le_bytes());
+
+        // Checksum
+        buf[24..28].copy_from_slice(&self.checksum.to_le_bytes());
+
+        // Reserved (already zeroed)
+
+        buf
+    }
+
+    /// Deserialize header from bytes.
+    pub fn from_bytes(buf: &[u8]) -> Result<Self> {
+        if buf.len() < SECTION_HEADER_SIZE {
+            return Err(PackError::InvalidMagic);
+        }
+
+        // Validate magic
+        if &buf[0..8] != SECTION_MAGIC {
+            return Err(PackError::InvalidMagic);
+        }
+
+        // Check version
+        let version = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        if version != FORMAT_VERSION {
+            return Err(PackError::UnsupportedVersion(version));
+        }
+
+        Ok(Self {
+            manifest_size: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            assets_size: u64::from_le_bytes(buf[16..24].try_into().unwrap()),
+            checksum: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+        })
+    }
+}
 
 /// Fixed-size footer at the end of a packed binary.
 ///

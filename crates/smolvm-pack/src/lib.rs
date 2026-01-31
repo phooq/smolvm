@@ -38,10 +38,15 @@
 
 pub mod assets;
 pub mod format;
+#[cfg(target_os = "macos")]
+pub mod macho;
 pub mod packer;
 pub mod signing;
 
-pub use format::{PackFooter, PackManifest, FOOTER_SIZE, MAGIC, SIDECAR_EXTENSION};
+pub use format::{
+    PackFooter, PackManifest, SectionHeader, FOOTER_SIZE, MAGIC, SECTION_HEADER_SIZE,
+    SECTION_MAGIC, SIDECAR_EXTENSION,
+};
 pub use packer::{
     read_footer, read_footer_from_sidecar, read_manifest, read_manifest_from_sidecar,
     sidecar_path_for, Packer,

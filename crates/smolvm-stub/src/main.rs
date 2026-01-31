@@ -5,14 +5,22 @@
 //! 2. Extracts assets to a cache directory if needed
 //! 3. Launches the VM with the packaged image
 //!
-//! Supports two modes:
+//! Supports three modes:
+//! - Sidecar: Assets in .smolmachine file (default, best for macOS signing)
+//! - Embedded (section): Assets in __DATA,__smolvm Mach-O section (macOS signed single-file)
+//! - Embedded (append): Assets appended to binary (Linux single-file)
+//!
+//! And two runtime modes:
 //! - Ephemeral (default): Boot VM, run command, exit
 //! - Daemon: Keep VM running for fast repeated exec
 
 mod extract;
 mod launch;
+#[cfg(target_os = "macos")]
+mod section;
 
 use clap::{Parser, Subcommand};
+use smolvm_pack::format::PackManifest;
 use smolvm_pack::packer::{read_footer, read_manifest};
 use std::env;
 use std::process::ExitCode;
@@ -85,6 +93,23 @@ enum Command {
     Status,
 }
 
+/// Data source for packed assets.
+enum PackedData {
+    /// Assets embedded in Mach-O section (macOS single-file).
+    #[cfg(target_os = "macos")]
+    Section {
+        manifest: PackManifest,
+        checksum: u32,
+        assets_ptr: *const u8,
+        assets_size: usize,
+    },
+    /// Assets in sidecar file or appended to binary.
+    FooterBased {
+        manifest: PackManifest,
+        footer: smolvm_pack::PackFooter,
+    },
+}
+
 fn main() -> ExitCode {
     let args = Args::parse();
 
@@ -97,32 +122,44 @@ fn main() -> ExitCode {
         }
     };
 
-    // Read footer and manifest
-    let footer = match read_footer(&exe_path) {
-        Ok(f) => f,
+    // Try to read packed data - section first on macOS, then footer-based
+    let packed_data = load_packed_data(&exe_path, args.debug);
+    let packed_data = match packed_data {
+        Ok(d) => d,
         Err(e) => {
-            eprintln!("error: failed to read footer: {}", e);
+            eprintln!("error: {}", e);
             eprintln!("This binary may not be a valid packed smolvm executable.");
             return ExitCode::from(1);
         }
     };
 
-    let manifest = match read_manifest(&exe_path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("error: failed to read manifest: {}", e);
-            return ExitCode::from(1);
-        }
+    // Get manifest and checksum from packed data
+    let (manifest, checksum) = match &packed_data {
+        #[cfg(target_os = "macos")]
+        PackedData::Section {
+            manifest, checksum, ..
+        } => (manifest.clone(), *checksum),
+        PackedData::FooterBased { manifest, footer } => (manifest.clone(), footer.checksum),
     };
 
     if args.debug {
-        eprintln!("debug: footer offsets:");
-        eprintln!("  stub_size: {}", footer.stub_size);
-        eprintln!("  assets_offset: {}", footer.assets_offset);
-        eprintln!("  assets_size: {}", footer.assets_size);
-        eprintln!("  manifest_offset: {}", footer.manifest_offset);
-        eprintln!("  manifest_size: {}", footer.manifest_size);
-        eprintln!("  checksum: {:08x}", footer.checksum);
+        match &packed_data {
+            #[cfg(target_os = "macos")]
+            PackedData::Section { assets_size, .. } => {
+                eprintln!("debug: using Mach-O section mode");
+                eprintln!("  assets_size: {}", assets_size);
+                eprintln!("  checksum: {:08x}", checksum);
+            }
+            PackedData::FooterBased { footer, .. } => {
+                eprintln!("debug: using footer-based mode");
+                eprintln!("  stub_size: {}", footer.stub_size);
+                eprintln!("  assets_offset: {}", footer.assets_offset);
+                eprintln!("  assets_size: {}", footer.assets_size);
+                eprintln!("  manifest_offset: {}", footer.manifest_offset);
+                eprintln!("  manifest_size: {}", footer.manifest_size);
+                eprintln!("  checksum: {:08x}", footer.checksum);
+            }
+        }
     }
 
     if args.version {
@@ -154,7 +191,7 @@ fn main() -> ExitCode {
     }
 
     // Extract assets to cache directory
-    let cache_dir = match extract::get_cache_dir(footer.checksum) {
+    let cache_dir = match extract::get_cache_dir(checksum) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("error: failed to determine cache directory: {}", e);
@@ -173,7 +210,19 @@ fn main() -> ExitCode {
             eprintln!("debug: extracting assets...");
         }
 
-        if let Err(e) = extract::extract_to_cache(&exe_path, &cache_dir, &footer, args.debug) {
+        let extract_result = match &packed_data {
+            #[cfg(target_os = "macos")]
+            PackedData::Section {
+                assets_ptr,
+                assets_size,
+                ..
+            } => extract::extract_from_section(&cache_dir, *assets_ptr, *assets_size, args.debug),
+            PackedData::FooterBased { footer, .. } => {
+                extract::extract_to_cache(&exe_path, &cache_dir, footer, args.debug)
+            }
+        };
+
+        if let Err(e) = extract_result {
             eprintln!("error: failed to extract assets: {}", e);
             return ExitCode::from(1);
         }
@@ -311,4 +360,38 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// Load packed data from the binary.
+///
+/// On macOS, tries to read from the Mach-O section first (for signed single-file binaries).
+/// Falls back to footer-based reading (sidecar or appended assets).
+fn load_packed_data(
+    exe_path: &std::path::Path,
+    debug: bool,
+) -> Result<PackedData, Box<dyn std::error::Error>> {
+    // On macOS, try section-based reading first
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(embedded) = section::read_embedded_section() {
+            if debug {
+                eprintln!("debug: found embedded data in Mach-O section");
+            }
+            return Ok(PackedData::Section {
+                manifest: embedded.manifest,
+                checksum: embedded.header.checksum,
+                assets_ptr: embedded.assets_ptr,
+                assets_size: embedded.assets_size,
+            });
+        }
+        if debug {
+            eprintln!("debug: no section data, trying footer-based mode");
+        }
+    }
+
+    // Fall back to footer-based reading
+    let footer = read_footer(exe_path)?;
+    let manifest = read_manifest(exe_path)?;
+
+    Ok(PackedData::FooterBased { manifest, footer })
 }

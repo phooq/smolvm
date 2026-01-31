@@ -10,6 +10,7 @@ use crate::api::error::ApiError;
 use crate::api::state::{
     mount_spec_to_host_mount, port_spec_to_mapping, resource_spec_to_vm_resources, ApiState,
 };
+use crate::agent::PullOptions;
 use crate::api::types::{ImageInfo, ListImagesResponse, PullImageRequest, PullImageResponse};
 
 /// GET /api/v1/sandboxes/:id/images - List images in a sandbox.
@@ -92,7 +93,11 @@ pub async fn pull_image(
     let image_info = tokio::task::spawn_blocking(move || {
         let entry = entry_clone.lock();
         let mut client = entry.manager.connect()?;
-        client.pull(&image, platform.as_deref())
+        let mut opts = PullOptions::new().use_registry_config(true);
+        if let Some(p) = platform {
+            opts = opts.platform(p);
+        }
+        client.pull(&image, opts)
     })
     .await?
     .map_err(|e| ApiError::Internal(e.to_string()))?;
