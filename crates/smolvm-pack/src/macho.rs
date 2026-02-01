@@ -360,6 +360,44 @@ impl DysymtabCommand {
     }
 }
 
+/// DyldInfo command (LC_DYLD_INFO or LC_DYLD_INFO_ONLY)
+#[derive(Debug, Clone, Copy)]
+pub struct DyldInfoCommand {
+    pub cmd: u32,
+    pub cmdsize: u32,
+    pub rebase_off: u32,
+    pub rebase_size: u32,
+    pub bind_off: u32,
+    pub bind_size: u32,
+    pub weak_bind_off: u32,
+    pub weak_bind_size: u32,
+    pub lazy_bind_off: u32,
+    pub lazy_bind_size: u32,
+    pub export_off: u32,
+    pub export_size: u32,
+}
+
+impl DyldInfoCommand {
+    pub fn read<R: Read>(reader: &mut R, cmd: u32, cmdsize: u32) -> io::Result<Self> {
+        let mut buf = [0u8; 40];
+        reader.read_exact(&mut buf)?;
+        Ok(Self {
+            cmd,
+            cmdsize,
+            rebase_off: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+            rebase_size: u32::from_le_bytes(buf[4..8].try_into().unwrap()),
+            bind_off: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+            bind_size: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
+            weak_bind_off: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
+            weak_bind_size: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
+            lazy_bind_off: u32::from_le_bytes(buf[24..28].try_into().unwrap()),
+            lazy_bind_size: u32::from_le_bytes(buf[28..32].try_into().unwrap()),
+            export_off: u32::from_le_bytes(buf[32..36].try_into().unwrap()),
+            export_size: u32::from_le_bytes(buf[36..40].try_into().unwrap()),
+        })
+    }
+}
+
 /// Parsed load command with data
 #[derive(Debug)]
 pub enum ParsedLoadCommand {
@@ -374,6 +412,7 @@ pub enum ParsedLoadCommand {
     DyldExportsTrie(LinkeditDataCommand),
     Symtab(SymtabCommand),
     Dysymtab(DysymtabCommand),
+    DyldInfo(DyldInfoCommand),
     Other {
         cmd: u32,
         data: Vec<u8>,
@@ -447,6 +486,10 @@ impl MachoFile {
                     let cmd = DysymtabCommand::read(&mut cursor, lc.cmd, lc.cmdsize)?;
                     ParsedLoadCommand::Dysymtab(cmd)
                 }
+                LC_DYLD_INFO_ONLY => {
+                    let cmd = DyldInfoCommand::read(&mut cursor, lc.cmd, lc.cmdsize)?;
+                    ParsedLoadCommand::DyldInfo(cmd)
+                }
                 _ => {
                     // Read remaining bytes for this command
                     let remaining = lc.cmdsize as usize - LoadCommand::SIZE;
@@ -513,8 +556,16 @@ impl MachoFile {
         None
     }
 
+    /// Align a value up to the page size boundary (16KB for arm64).
+    fn page_align(size: usize) -> usize {
+        (size + CS_PAGE_SIZE - 1) & !(CS_PAGE_SIZE - 1)
+    }
+
     /// Write data into a section, expanding the binary as needed.
-    /// This updates the section size and all relevant offsets.
+    ///
+    /// This is designed for sections in their own dedicated segment (like __SMOLVM).
+    /// It updates the section size, segment sizes, and all file offsets for content
+    /// that follows in the binary.
     pub fn write_section(
         &mut self,
         seg_name: &str,
@@ -522,99 +573,156 @@ impl MachoFile {
         data: &[u8],
     ) -> io::Result<()> {
         // Find the section
-        let (section_offset, section_size, cmd_idx, sect_idx) = {
-            let mut found = None;
-            for (cmd_idx, cmd) in self.load_commands.iter().enumerate() {
-                if let ParsedLoadCommand::Segment64 { sections, .. } = cmd {
-                    for (sect_idx, section) in sections.iter().enumerate() {
-                        if section.segment_name() == seg_name && section.name() == sect_name {
-                            found = Some((
-                                section.offset as usize,
-                                section.size as usize,
-                                cmd_idx,
-                                sect_idx,
-                            ));
-                            break;
-                        }
-                    }
-                }
-                if found.is_some() {
-                    break;
-                }
-            }
-            found.ok_or_else(|| {
+        let (section_offset, old_size, cmd_idx, sect_idx) = self
+            .find_section_details(seg_name, sect_name)
+            .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("Section ({},{}) not found", seg_name, sect_name),
                 )
-            })?
+            })?;
+
+        let new_size = data.len();
+        let aligned_new_size = Self::page_align(new_size);
+
+        // Calculate the page-aligned delta for shifting subsequent content.
+        // The delta must be page-aligned so LINKEDIT remains at a page boundary.
+        let delta = if aligned_new_size > old_size {
+            Self::page_align(aligned_new_size - old_size) as i64
+        } else {
+            -(Self::page_align(old_size - aligned_new_size) as i64)
         };
 
-        // Calculate size difference
-        let old_size = section_size;
-        let new_size = data.len();
+        // Modify file_data: expand or contract at the section location
+        let relative_offset = section_offset - self.data_offset;
+        self.resize_file_data(relative_offset, old_size, aligned_new_size, delta);
 
-        // Align new size to 16KB boundary for arm64
-        let aligned_new_size = (new_size + CS_PAGE_SIZE - 1) & !(CS_PAGE_SIZE - 1);
-        let size_diff = aligned_new_size as i64 - old_size as i64;
-
-        // Calculate where data starts in file_data (relative to data_offset)
-        let file_offset = section_offset;
-        let relative_offset = file_offset - self.data_offset;
-
-        // Expand or contract file_data
-        if size_diff > 0 {
-            // Need to expand
-            let insert_pos = relative_offset + old_size;
-            let extra = size_diff as usize;
-            self.file_data
-                .splice(insert_pos..insert_pos, vec![0u8; extra]);
-        } else if size_diff < 0 {
-            // Need to shrink
-            let remove_start = relative_offset + aligned_new_size;
-            let remove_end = relative_offset + old_size;
-            self.file_data.drain(remove_start..remove_end);
-        }
-
-        // Write the data
+        // Write the actual data and zero-pad to alignment
         self.file_data[relative_offset..relative_offset + new_size].copy_from_slice(data);
-        // Zero-pad to alignment
-        for i in new_size..aligned_new_size {
-            self.file_data[relative_offset + i] = 0;
-        }
-
-        // Update the section size
-        if let ParsedLoadCommand::Segment64 { segment, sections } = &mut self.load_commands[cmd_idx]
+        for byte in
+            &mut self.file_data[relative_offset + new_size..relative_offset + aligned_new_size]
         {
-            sections[sect_idx].size = aligned_new_size as u64;
-
-            // Update segment filesize and vmsize
-            segment.filesize = (segment.filesize as i64 + size_diff) as u64;
-            segment.vmsize = (segment.vmsize as i64 + size_diff) as u64;
+            *byte = 0;
         }
 
-        // Update offsets in other load commands
-        if size_diff != 0 {
-            self.update_offsets_after(file_offset + old_size, size_diff);
+        // Update section and segment metadata
+        let segment_vmaddr =
+            self.update_segment_for_section(cmd_idx, sect_idx, aligned_new_size as u64, delta);
+
+        // Shift all content after this section
+        if delta != 0 {
+            self.shift_offsets_after(section_offset + old_size, segment_vmaddr, delta);
         }
 
         Ok(())
     }
 
-    /// Update file offsets in load commands for data after a certain point
-    fn update_offsets_after(&mut self, after_offset: usize, delta: i64) {
+    /// Find section details: (file_offset, size, cmd_index, section_index).
+    fn find_section_details(
+        &self,
+        seg_name: &str,
+        sect_name: &str,
+    ) -> Option<(usize, usize, usize, usize)> {
+        for (cmd_idx, cmd) in self.load_commands.iter().enumerate() {
+            if let ParsedLoadCommand::Segment64 { sections, .. } = cmd {
+                for (sect_idx, section) in sections.iter().enumerate() {
+                    if section.segment_name() == seg_name && section.name() == sect_name {
+                        return Some((
+                            section.offset as usize,
+                            section.size as usize,
+                            cmd_idx,
+                            sect_idx,
+                        ));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Resize file_data by inserting or removing bytes at the given position.
+    fn resize_file_data(
+        &mut self,
+        relative_offset: usize,
+        old_size: usize,
+        new_size: usize,
+        delta: i64,
+    ) {
+        if delta > 0 {
+            // Expand: insert bytes after old content
+            let insert_pos = relative_offset + old_size;
+            self.file_data
+                .splice(insert_pos..insert_pos, vec![0u8; delta as usize]);
+        } else if delta < 0 {
+            // Shrink: remove bytes
+            let remove_start = relative_offset + new_size;
+            let remove_end = relative_offset + old_size;
+            if remove_end > remove_start {
+                self.file_data.drain(remove_start..remove_end);
+            }
+        }
+    }
+
+    /// Update segment and section metadata after resizing a section.
+    /// Returns the segment's vmaddr for use in shifting subsequent segments.
+    fn update_segment_for_section(
+        &mut self,
+        cmd_idx: usize,
+        sect_idx: usize,
+        new_section_size: u64,
+        delta: i64,
+    ) -> u64 {
+        if let ParsedLoadCommand::Segment64 { segment, sections } = &mut self.load_commands[cmd_idx]
+        {
+            let section_addr = sections[sect_idx].addr;
+            let old_vmsize = segment.vmsize;
+
+            // Update section size
+            sections[sect_idx].size = new_section_size;
+
+            // Update segment file size
+            segment.filesize = (segment.filesize as i64 + delta) as u64;
+
+            // Calculate required vmsize to contain the section
+            let section_offset_in_segment = section_addr - segment.vmaddr;
+            let required_vmsize = section_offset_in_segment + new_section_size;
+            let aligned_vmsize = Self::page_align(required_vmsize as usize) as u64;
+
+            segment.vmsize = std::cmp::max((old_vmsize as i64 + delta) as u64, aligned_vmsize);
+
+            segment.vmaddr
+        } else {
+            0
+        }
+    }
+
+    /// Shift file offsets and vmaddrs for all content after the modification point.
+    fn shift_offsets_after(&mut self, after_offset: usize, modified_vmaddr: u64, delta: i64) {
         for cmd in &mut self.load_commands {
             match cmd {
                 ParsedLoadCommand::Segment64 { segment, sections } => {
-                    // Update segment fileoff if it's after our modification point
+                    let is_modified = segment.vmaddr == modified_vmaddr;
+                    let should_move = segment.vmaddr > modified_vmaddr && segment.vmaddr != 0;
+
+                    // Shift segment file offset
                     if segment.fileoff as usize > after_offset {
                         segment.fileoff = (segment.fileoff as i64 + delta) as u64;
                     }
 
-                    // Update section offsets
-                    for section in sections {
-                        if section.offset as usize > after_offset {
-                            section.offset = (section.offset as i64 + delta) as u32;
+                    // Shift segment vmaddr for segments after the modified one
+                    if should_move {
+                        segment.vmaddr = (segment.vmaddr as i64 + delta) as u64;
+                    }
+
+                    // Shift sections (skip the modified segment - already handled)
+                    if !is_modified {
+                        for section in sections {
+                            if section.offset as usize > after_offset {
+                                section.offset = (section.offset as i64 + delta) as u32;
+                            }
+                            if should_move {
+                                section.addr = (section.addr as i64 + delta) as u64;
+                            }
                         }
                     }
                 }
@@ -628,35 +736,33 @@ impl MachoFile {
                     }
                 }
                 ParsedLoadCommand::Symtab(st) => {
-                    if st.symoff as usize > after_offset {
-                        st.symoff = (st.symoff as i64 + delta) as u32;
-                    }
-                    if st.stroff as usize > after_offset {
-                        st.stroff = (st.stroff as i64 + delta) as u32;
-                    }
+                    Self::shift_offset_if_after(&mut st.symoff, after_offset, delta);
+                    Self::shift_offset_if_after(&mut st.stroff, after_offset, delta);
                 }
                 ParsedLoadCommand::Dysymtab(dst) => {
-                    if dst.tocoff as usize > after_offset && dst.tocoff != 0 {
-                        dst.tocoff = (dst.tocoff as i64 + delta) as u32;
-                    }
-                    if dst.modtaboff as usize > after_offset && dst.modtaboff != 0 {
-                        dst.modtaboff = (dst.modtaboff as i64 + delta) as u32;
-                    }
-                    if dst.extrefsymoff as usize > after_offset && dst.extrefsymoff != 0 {
-                        dst.extrefsymoff = (dst.extrefsymoff as i64 + delta) as u32;
-                    }
-                    if dst.indirectsymoff as usize > after_offset && dst.indirectsymoff != 0 {
-                        dst.indirectsymoff = (dst.indirectsymoff as i64 + delta) as u32;
-                    }
-                    if dst.extreloff as usize > after_offset && dst.extreloff != 0 {
-                        dst.extreloff = (dst.extreloff as i64 + delta) as u32;
-                    }
-                    if dst.locreloff as usize > after_offset && dst.locreloff != 0 {
-                        dst.locreloff = (dst.locreloff as i64 + delta) as u32;
-                    }
+                    Self::shift_offset_if_after(&mut dst.tocoff, after_offset, delta);
+                    Self::shift_offset_if_after(&mut dst.modtaboff, after_offset, delta);
+                    Self::shift_offset_if_after(&mut dst.extrefsymoff, after_offset, delta);
+                    Self::shift_offset_if_after(&mut dst.indirectsymoff, after_offset, delta);
+                    Self::shift_offset_if_after(&mut dst.extreloff, after_offset, delta);
+                    Self::shift_offset_if_after(&mut dst.locreloff, after_offset, delta);
+                }
+                ParsedLoadCommand::DyldInfo(di) => {
+                    Self::shift_offset_if_after(&mut di.rebase_off, after_offset, delta);
+                    Self::shift_offset_if_after(&mut di.bind_off, after_offset, delta);
+                    Self::shift_offset_if_after(&mut di.weak_bind_off, after_offset, delta);
+                    Self::shift_offset_if_after(&mut di.lazy_bind_off, after_offset, delta);
+                    Self::shift_offset_if_after(&mut di.export_off, after_offset, delta);
                 }
                 ParsedLoadCommand::Other { .. } => {}
             }
+        }
+    }
+
+    /// Helper to shift an offset if it's after the given position and non-zero.
+    fn shift_offset_if_after(offset: &mut u32, after: usize, delta: i64) {
+        if *offset != 0 && (*offset as usize) > after {
+            *offset = (*offset as i64 + delta) as u32;
         }
     }
 
@@ -884,6 +990,20 @@ impl MachoFile {
                 out.extend(&dst.locreloff.to_le_bytes());
                 out.extend(&dst.nlocrel.to_le_bytes());
             }
+            ParsedLoadCommand::DyldInfo(di) => {
+                out.extend(&di.cmd.to_le_bytes());
+                out.extend(&di.cmdsize.to_le_bytes());
+                out.extend(&di.rebase_off.to_le_bytes());
+                out.extend(&di.rebase_size.to_le_bytes());
+                out.extend(&di.bind_off.to_le_bytes());
+                out.extend(&di.bind_size.to_le_bytes());
+                out.extend(&di.weak_bind_off.to_le_bytes());
+                out.extend(&di.weak_bind_size.to_le_bytes());
+                out.extend(&di.lazy_bind_off.to_le_bytes());
+                out.extend(&di.lazy_bind_size.to_le_bytes());
+                out.extend(&di.export_off.to_le_bytes());
+                out.extend(&di.export_size.to_le_bytes());
+            }
             ParsedLoadCommand::Other { cmd, data } => {
                 out.extend(&cmd.to_le_bytes());
                 out.extend(&((data.len() + 8) as u32).to_le_bytes());
@@ -967,14 +1087,14 @@ mod tests {
         };
 
         // Check if section exists
-        if macho.find_section("__DATA", "__smolvm").is_none() {
+        if macho.find_section("__SMOLVM", "__smolvm").is_none() {
             return; // Skip if section not present
         }
 
         // Write test data to section
         let test_data = b"SMOLSECT\x00\x00\x00\x00\x00\x00\x00\x00test data for section";
         macho
-            .write_section("__DATA", "__smolvm", test_data)
+            .write_section("__SMOLVM", "__smolvm", test_data)
             .expect("Failed to write section");
 
         // Sign adhoc

@@ -27,7 +27,7 @@ pub const FOOTER_SIZE: usize = 64;
 /// Embedded section header size (fixed).
 pub const SECTION_HEADER_SIZE: usize = 32;
 
-/// Header for data embedded in the __DATA,__smolvm Mach-O section.
+/// Header for data embedded in the __SMOLVM,__smolvm Mach-O section.
 ///
 /// This format is used for macOS single-file binaries where assets are
 /// stored inside the executable's Mach-O structure, allowing proper code signing.

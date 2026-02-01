@@ -26,9 +26,11 @@ fn main() {
         // Pad to reasonable size (the section will be expanded at pack time)
         f.write_all(&[0u8; 4]).unwrap();
 
-        // Tell the linker to create a section with this content
+        // Tell the linker to create a section in its own segment.
+        // Using a separate segment (__SMOLVM) instead of __DATA avoids
+        // affecting other sections when we expand it at pack time.
         println!(
-            "cargo:rustc-link-arg=-Wl,-sectcreate,__DATA,__smolvm,{}",
+            "cargo:rustc-link-arg=-Wl,-sectcreate,__SMOLVM,__smolvm,{}",
             placeholder_path
         );
     }

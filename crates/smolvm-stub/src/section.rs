@@ -1,6 +1,6 @@
 //! Mach-O section reading for embedded assets (macOS only).
 //!
-//! On macOS, single-file packed binaries store assets in the `__DATA,__smolvm`
+//! On macOS, single-file packed binaries store assets in the `__SMOLVM,__smolvm`
 //! section. This module provides functions to read from that section at runtime.
 
 #[cfg(target_os = "macos")]
@@ -63,8 +63,8 @@ pub fn read_embedded_section() -> Option<EmbeddedData> {
             return None;
         }
 
-        // Get section data
-        let segname = CStr::from_bytes_with_nul(b"__DATA\0").unwrap();
+        // Get section data from our custom segment
+        let segname = CStr::from_bytes_with_nul(b"__SMOLVM\0").unwrap();
         let sectname = CStr::from_bytes_with_nul(b"__smolvm\0").unwrap();
         let mut size: usize = 0;
 

@@ -161,7 +161,7 @@ impl Packer {
     /// Pack everything into a single executable file (embedded format).
     ///
     /// On macOS, this uses Mach-O section manipulation to embed assets inside
-    /// the `__DATA,__smolvm` section, allowing proper code signing.
+    /// the `__SMOLVM,__smolvm` section, allowing proper code signing.
     ///
     /// On other platforms, this appends assets to the binary (simpler but
     /// not signable on macOS).
@@ -218,7 +218,7 @@ impl Packer {
         };
 
         // Check for __smolvm section
-        if macho.find_section("__DATA", "__smolvm").is_none() {
+        if macho.find_section("__SMOLVM", "__smolvm").is_none() {
             return Err(PackedEmbeddedError::NotMachO(Box::new(self))); // No section, fall back
         }
 
@@ -231,7 +231,7 @@ impl Packer {
 
     /// Pack using Mach-O section manipulation (macOS), inner implementation.
     ///
-    /// This writes assets to the `__DATA,__smolvm` section, keeping the
+    /// This writes assets to the `__SMOLVM,__smolvm` section, keeping the
     /// binary as a valid Mach-O that can be properly code-signed.
     #[cfg(target_os = "macos")]
     fn pack_embedded_macho_inner(
@@ -284,7 +284,7 @@ impl Packer {
 
         // Write section data to Mach-O
         macho
-            .write_section("__DATA", "__smolvm", &section_data)
+            .write_section("__SMOLVM", "__smolvm", &section_data)
             .map_err(|e| crate::PackError::Signing(format!("failed to write section: {}", e)))?;
 
         // Sign the binary with adhoc signature
