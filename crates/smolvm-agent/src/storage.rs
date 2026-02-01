@@ -1428,9 +1428,10 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
         if !is_mountpoint(&virtiofs_mount) {
             info!(tag = %tag, mount_point = %virtiofs_mount.display(), "mounting virtiofs");
 
-            // Use cache=none to ensure writes are synchronously persisted to host
+            // Mount virtiofs with sync option to ensure writes are persisted immediately
+            // Note: cache=none is not supported by libkrunfw's kernel, use sync instead
             let status = Command::new("mount")
-                .args(["-t", "virtiofs", "-o", "cache=none", tag])
+                .args(["-t", "virtiofs", "-o", "sync", tag])
                 .arg(&virtiofs_mount)
                 .status()?;
 

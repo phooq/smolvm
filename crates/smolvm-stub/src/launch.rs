@@ -112,6 +112,7 @@ struct LibKrun {
         *const *const libc::c_char,
         *const *const libc::c_char,
     ) -> i32,
+    set_port_map: unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32,
     add_disk2:
         unsafe extern "C" fn(u32, *const libc::c_char, *const libc::c_char, u32, bool) -> i32,
     add_vsock_port2: unsafe extern "C" fn(u32, u32, *const libc::c_char, bool) -> i32,
@@ -198,6 +199,7 @@ impl LibKrun {
             set_root: load_sym!(krun_set_root),
             set_workdir: load_sym!(krun_set_workdir),
             set_exec: load_sym!(krun_set_exec),
+            set_port_map: load_sym!(krun_set_port_map),
             add_disk2: load_sym!(krun_add_disk2),
             add_vsock_port2: load_sym!(krun_add_vsock_port2),
             add_virtiofs: load_sym!(krun_add_virtiofs),
@@ -799,55 +801,18 @@ fn launch_vm_child(
             return Err("failed to set VM config".to_string());
         }
 
+        // Set empty port map (required by libkrun for proper initialization)
+        let empty_ports: Vec<*const libc::c_char> = vec![std::ptr::null()];
+        if (krun.set_port_map)(ctx, empty_ports.as_ptr()) < 0 {
+            (krun.free_ctx)(ctx);
+            return Err("failed to set port map".to_string());
+        }
+
         // Set root filesystem
         let root = path_to_cstring(rootfs_path)?;
         if (krun.set_root)(ctx, root.as_ptr()) < 0 {
             (krun.free_ctx)(ctx);
             return Err("failed to set root filesystem".to_string());
-        }
-
-        // Add storage disk
-        let block_id = CString::new("storage").unwrap();
-        let disk_path = path_to_cstring(storage_path)?;
-        if (krun.add_disk2)(ctx, block_id.as_ptr(), disk_path.as_ptr(), 0, false) < 0 {
-            if debug {
-                eprintln!("debug: failed to add storage disk");
-            }
-        }
-
-        // Add vsock port
-        let socket_path = path_to_cstring(vsock_path)?;
-        if (krun.add_vsock_port2)(ctx, ports::AGENT_CONTROL, socket_path.as_ptr(), true) < 0 {
-            if debug {
-                eprintln!("debug: failed to add vsock port");
-            }
-        }
-
-        // Add virtiofs mount for packed layers
-        // This mounts the host layers directory so the agent can access pre-packaged OCI layers
-        if layers_dir.exists() {
-            let layers_tag = CString::new("smolvm_layers").unwrap();
-            let layers_path = path_to_cstring(layers_dir)?;
-            if (krun.add_virtiofs)(ctx, layers_tag.as_ptr(), layers_path.as_ptr()) < 0 {
-                if debug {
-                    eprintln!("debug: failed to add layers virtiofs mount");
-                }
-            }
-        }
-
-        // Add user-specified virtiofs mounts
-        for (i, mount) in mounts.iter().enumerate() {
-            let tag = CString::new(format!("smolvm{}", i)).map_err(|_| "invalid mount tag")?;
-            let host_path = path_to_cstring(&mount.host_path)?;
-
-            if (krun.add_virtiofs)(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
-                if debug {
-                    eprintln!(
-                        "debug: failed to add virtiofs mount: {}",
-                        mount.host_path.display()
-                    );
-                }
-            }
         }
 
         // Set working directory
@@ -890,7 +855,7 @@ fn launch_vm_child(
         let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
         envp.push(std::ptr::null());
 
-        // Set exec command
+        // Set exec command (MUST be before add_virtiofs - libkrun requires this order)
         let exec_path = CString::new("/sbin/init").unwrap();
         let argv_strings = [CString::new("/sbin/init").unwrap()];
         let mut argv: Vec<*const libc::c_char> = argv_strings.iter().map(|s| s.as_ptr()).collect();
@@ -899,6 +864,67 @@ fn launch_vm_child(
         if (krun.set_exec)(ctx, exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr()) < 0 {
             (krun.free_ctx)(ctx);
             return Err("failed to set exec command".to_string());
+        }
+
+        // Add virtiofs mount for packed layers
+        // This mounts the host layers directory so the agent can access pre-packaged OCI layers
+        // NOTE: add_virtiofs must be called AFTER set_exec for proper libkrun initialization
+        if layers_dir.exists() {
+            let layers_tag = CString::new("smolvm_layers").unwrap();
+            let layers_path = path_to_cstring(layers_dir)?;
+            if (krun.add_virtiofs)(ctx, layers_tag.as_ptr(), layers_path.as_ptr()) < 0 {
+                if debug {
+                    eprintln!("debug: failed to add layers virtiofs mount");
+                }
+            }
+        }
+
+        // Add user-specified virtiofs mounts
+        if debug {
+            eprintln!("debug: adding {} user virtiofs mount(s)", mounts.len());
+        }
+        for (i, mount) in mounts.iter().enumerate() {
+            let tag = CString::new(format!("smolvm{}", i)).map_err(|_| "invalid mount tag")?;
+            let host_path = path_to_cstring(&mount.host_path)?;
+
+            if debug {
+                eprintln!(
+                    "debug: adding virtiofs mount: tag={}, host={}, guest={}",
+                    format!("smolvm{}", i),
+                    mount.host_path.display(),
+                    mount.guest_path
+                );
+            }
+
+            let ret = (krun.add_virtiofs)(ctx, tag.as_ptr(), host_path.as_ptr());
+            if ret < 0 {
+                if debug {
+                    eprintln!(
+                        "debug: krun_add_virtiofs failed with {}: {}",
+                        ret,
+                        mount.host_path.display()
+                    );
+                }
+            } else if debug {
+                eprintln!("debug: krun_add_virtiofs succeeded for tag smolvm{}", i);
+            }
+        }
+
+        // Add storage disk
+        let block_id = CString::new("storage").unwrap();
+        let disk_path = path_to_cstring(storage_path)?;
+        if (krun.add_disk2)(ctx, block_id.as_ptr(), disk_path.as_ptr(), 0, false) < 0 {
+            if debug {
+                eprintln!("debug: failed to add storage disk");
+            }
+        }
+
+        // Add vsock port
+        let socket_path = path_to_cstring(vsock_path)?;
+        if (krun.add_vsock_port2)(ctx, ports::AGENT_CONTROL, socket_path.as_ptr(), true) < 0 {
+            if debug {
+                eprintln!("debug: failed to add vsock port");
+            }
         }
 
         // Start VM
