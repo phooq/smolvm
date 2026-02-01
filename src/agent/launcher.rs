@@ -100,7 +100,11 @@ pub fn launch_agent_vm(
         if !port_mappings.is_empty() {
             let port_cstrings: Vec<CString> = port_mappings
                 .iter()
-                .map(|p| CString::new(format!("{}:{}", p.host, p.guest)).unwrap())
+                .map(|p| {
+                    // Port numbers are always valid ASCII, so this cannot fail
+                    CString::new(format!("{}:{}", p.host, p.guest))
+                        .expect("port mapping format cannot contain null bytes")
+                })
                 .collect();
             let mut port_ptrs: Vec<*const libc::c_char> =
                 port_cstrings.iter().map(|s| s.as_ptr()).collect();
@@ -118,7 +122,7 @@ pub fn launch_agent_vm(
         }
 
         // Add storage disk
-        let block_id = CString::new("storage").unwrap();
+        let block_id = CString::new("storage").expect("static string");
         let disk_path = path_to_cstring(storage_disk.path())?;
         if krun_add_disk2(ctx, block_id.as_ptr(), disk_path.as_ptr(), 0, false) < 0 {
             tracing::warn!("failed to add storage disk");
@@ -163,15 +167,15 @@ pub fn launch_agent_vm(
         }
 
         // Set working directory
-        let workdir = CString::new("/").unwrap();
+        let workdir = CString::new("/").expect("static string");
         krun_set_workdir(ctx, workdir.as_ptr());
 
         // Build environment
         let mut env_strings = vec![
-            CString::new("HOME=/root").unwrap(),
+            CString::new("HOME=/root").expect("static string"),
             CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-                .unwrap(),
-            CString::new("TERM=xterm-256color").unwrap(),
+                .expect("static string"),
+            CString::new("TERM=xterm-256color").expect("static string"),
         ];
 
         // Pass mount info to the agent via environment
@@ -201,8 +205,8 @@ pub fn launch_agent_vm(
         envp.push(std::ptr::null());
 
         // Set exec command (/sbin/init)
-        let exec_path = CString::new("/sbin/init").unwrap();
-        let argv_strings = [CString::new("/sbin/init").unwrap()];
+        let exec_path = CString::new("/sbin/init").expect("static string");
+        let argv_strings = [CString::new("/sbin/init").expect("static string")];
         let mut argv: Vec<*const libc::c_char> = argv_strings.iter().map(|s| s.as_ptr()).collect();
         argv.push(std::ptr::null());
 

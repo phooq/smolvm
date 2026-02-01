@@ -535,7 +535,10 @@ impl ImagesCmd {
                 },
                 "images": images,
             });
-            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).expect("JSON serialization failed")
+            );
         } else {
             // Print storage summary
             println!("Storage Usage:");

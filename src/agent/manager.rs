@@ -659,9 +659,10 @@ impl AgentManager {
             if self.vsock_socket.exists() {
                 // Log when socket first appears
                 if socket_appeared_at.is_none() {
-                    socket_appeared_at = Some(start.elapsed());
+                    let elapsed = start.elapsed();
+                    socket_appeared_at = Some(elapsed);
                     tracing::debug!(
-                        elapsed_ms = socket_appeared_at.unwrap().as_millis(),
+                        elapsed_ms = elapsed.as_millis(),
                         "vsock socket appeared"
                     );
                 }
@@ -672,9 +673,10 @@ impl AgentManager {
 
                         // Log when first connect succeeds
                         if first_connect_at.is_none() {
-                            first_connect_at = Some(start.elapsed());
+                            let elapsed = start.elapsed();
+                            first_connect_at = Some(elapsed);
                             tracing::debug!(
-                                elapsed_ms = first_connect_at.unwrap().as_millis(),
+                                elapsed_ms = elapsed.as_millis(),
                                 "vsock first connect succeeded"
                             );
                         }

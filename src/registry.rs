@@ -382,4 +382,93 @@ mirror = "ghcr-mirror.example.com"
             Some("ghcr-mirror.example.com")
         );
     }
+
+    #[test]
+    fn test_get_credentials_with_env_password() {
+        // Set environment variable for this test
+        std::env::set_var("SMOLVM_TEST_TOKEN", "env_password_123");
+
+        let mut config = RegistryConfig::default();
+        config.registries.insert(
+            "test.io".to_string(),
+            RegistryEntry {
+                username: Some("envuser".to_string()),
+                password: None,
+                password_env: Some("SMOLVM_TEST_TOKEN".to_string()),
+                mirror: None,
+            },
+        );
+
+        let creds = config.get_credentials("test.io");
+        assert!(creds.is_some());
+        let creds = creds.unwrap();
+        assert_eq!(creds.username, "envuser");
+        assert_eq!(creds.password, "env_password_123");
+
+        // Clean up
+        std::env::remove_var("SMOLVM_TEST_TOKEN");
+    }
+
+    #[test]
+    fn test_get_credentials_env_var_not_set() {
+        let mut config = RegistryConfig::default();
+        config.registries.insert(
+            "test.io".to_string(),
+            RegistryEntry {
+                username: Some("user".to_string()),
+                password: None,
+                password_env: Some("SMOLVM_NONEXISTENT_VAR".to_string()),
+                mirror: None,
+            },
+        );
+
+        // Should return None when env var is not set
+        assert!(config.get_credentials("test.io").is_none());
+    }
+
+    #[test]
+    fn test_has_registries() {
+        let mut config = RegistryConfig::default();
+        assert!(!config.has_registries());
+
+        config
+            .registries
+            .insert("docker.io".to_string(), RegistryEntry::default());
+        assert!(config.has_registries());
+    }
+
+    #[test]
+    fn test_extract_registry_edge_cases() {
+        // Image with tag containing colon (version)
+        assert_eq!(extract_registry("alpine:3.18.0"), "docker.io");
+
+        // Image with digest
+        assert_eq!(extract_registry("alpine@sha256:abc123"), "docker.io");
+
+        // Registry with port and path
+        assert_eq!(
+            extract_registry("registry.example.com:5000/myorg/myimage:latest"),
+            "registry.example.com:5000"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_image_registry_with_tag() {
+        assert_eq!(
+            rewrite_image_registry("alpine:3.18", "mirror.example.com"),
+            "mirror.example.com/library/alpine:3.18"
+        );
+
+        assert_eq!(
+            rewrite_image_registry("nginx:latest", "mirror.example.com"),
+            "mirror.example.com/library/nginx:latest"
+        );
+    }
+
+    #[test]
+    fn test_default_registry_custom() {
+        let mut config = RegistryConfig::default();
+        config.defaults.registry = Some("custom.registry.io".to_string());
+        assert_eq!(config.default_registry(), "custom.registry.io");
+    }
 }

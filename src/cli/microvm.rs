@@ -260,11 +260,9 @@ impl StartCmd {
         use smolvm::Error;
 
         // If no name provided, start default anonymous microvm
-        if self.name.is_none() {
+        let Some(name) = &self.name else {
             return self.start_anonymous();
-        }
-
-        let name = self.name.as_ref().unwrap();
+        };
         let mut config = SmolvmConfig::load()?;
 
         // Get VM record
@@ -383,11 +381,9 @@ pub struct StopCmd {
 impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
         // If no name provided, stop default anonymous microvm
-        if self.name.is_none() {
+        let Some(name) = &self.name else {
             return self.stop_anonymous();
-        }
-
-        let name = self.name.as_ref().unwrap();
+        };
         let mut config = SmolvmConfig::load()?;
 
         // Get VM record
@@ -588,7 +584,10 @@ impl LsCmd {
                     })
                 })
                 .collect();
-            println!("{}", serde_json::to_string_pretty(&json_vms).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json_vms).expect("JSON serialization failed")
+            );
         } else {
             println!(
                 "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",

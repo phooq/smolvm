@@ -382,9 +382,9 @@ impl LibkrunVm {
                 libc::_exit(1);
             } else {
                 // Parent process: store child process and wait
-                self.child = Some(crate::process::ChildProcess::new(pid));
-
-                let exit_code = self.child.as_mut().unwrap().wait();
+                let mut child = crate::process::ChildProcess::new(pid);
+                let exit_code = child.wait();
+                self.child = Some(child);
 
                 // Clear child reference after exit
                 self.child = None;
