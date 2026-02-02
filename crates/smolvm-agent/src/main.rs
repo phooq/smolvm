@@ -85,6 +85,9 @@ fn main() {
         "smolvm-agent started, vsock listener already ready"
     );
 
+    // Set up signal handlers for graceful shutdown (sync before exit)
+    setup_signal_handlers();
+
     // Mount storage disk (moved from init script for faster vsock availability)
     let t0 = uptime_ms();
     mount_storage_disk();
@@ -199,6 +202,64 @@ fn mount_essential_filesystems() {
     // No-op on non-Linux platforms
 }
 
+/// Sync filesystem caches before shutdown.
+/// This prevents ext4 corruption when the VM is terminated.
+#[cfg(target_os = "linux")]
+fn sync_and_unmount_storage() {
+    info!("syncing filesystems before shutdown");
+
+    // Sync all filesystem caches to disk
+    // SAFETY: sync() is always safe to call
+    unsafe {
+        libc::sync();
+    }
+
+    // Note: We don't unmount /storage here because:
+    // 1. The overlay filesystem uses /storage/layers and /storage/overlays
+    // 2. Unmounting /storage while overlay is active causes issues
+    // 3. The sync() call ensures all pending writes are flushed to disk
+    // 4. When the VM terminates, the kernel will clean up mounts
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn sync_and_unmount_storage() {
+    // No-op on non-Linux platforms
+}
+
+/// Set up signal handlers to sync filesystem on SIGTERM/SIGINT.
+/// This prevents ext4 corruption when the VM is forcefully stopped.
+#[cfg(target_os = "linux")]
+fn setup_signal_handlers() {
+    // SAFETY: Signal handler that calls sync() - sync is async-signal-safe
+    unsafe extern "C" fn handle_term_signal(_sig: libc::c_int) {
+        // sync() is async-signal-safe, so we can call it from a signal handler
+        libc::sync();
+        // Exit cleanly
+        libc::_exit(0);
+    }
+
+    // SAFETY: Setting up signal handlers with valid function pointer
+    unsafe {
+        // Handle SIGTERM (sent by VM stop)
+        libc::signal(
+            libc::SIGTERM,
+            handle_term_signal as *const () as libc::sighandler_t,
+        );
+        // Handle SIGINT (Ctrl+C, if attached to console)
+        libc::signal(
+            libc::SIGINT,
+            handle_term_signal as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn setup_signal_handlers() {
+    // No-op on non-Linux platforms
+}
+
 /// Mount the storage disk at /storage.
 /// This is done by the agent (instead of init script) to allow vsock listener
 /// to be created first, reducing cold start latency.
@@ -230,45 +291,65 @@ fn mount_storage_disk() {
         .args([STORAGE_DEVICE, STORAGE_MOUNT])
         .status();
 
+    let create_dirs = || {
+        let dirs = [
+            "layers",
+            "configs",
+            "manifests",
+            "overlays",
+            "containers/run",
+            "containers/logs",
+            "containers/exit",
+        ];
+        for dir in dirs {
+            let _ = std::fs::create_dir_all(std::path::Path::new(STORAGE_MOUNT).join(dir));
+        }
+    };
+
     match mount_result {
         Ok(status) if status.success() => {
             debug!("storage disk mounted successfully");
-            // Create directory structure
-            let dirs = [
-                "layers",
-                "configs",
-                "manifests",
-                "overlays",
-                "containers/run",
-                "containers/logs",
-                "containers/exit",
-            ];
-            for dir in dirs {
-                let _ = std::fs::create_dir_all(std::path::Path::new(STORAGE_MOUNT).join(dir));
-            }
+            create_dirs();
         }
         _ => {
-            // Mount failed - try formatting first (first boot)
-            warn!("mount failed, attempting to format storage disk");
+            // Mount failed - try fsck to repair filesystem first
+            warn!("mount failed, attempting filesystem repair with fsck");
+            let fsck_result = Command::new("fsck.ext4")
+                .args(["-y", "-f", STORAGE_DEVICE])
+                .status();
+
+            match fsck_result {
+                Ok(status) if status.success() || status.code() == Some(1) => {
+                    // fsck succeeded (0) or fixed errors (1) - try mounting again
+                    info!("fsck completed, attempting mount");
+                    let mount_after_fsck = Command::new("mount")
+                        .args([STORAGE_DEVICE, STORAGE_MOUNT])
+                        .status();
+
+                    if let Ok(status) = mount_after_fsck {
+                        if status.success() {
+                            info!("storage disk mounted after fsck repair");
+                            create_dirs();
+                            return;
+                        }
+                    }
+                    // Mount still failed after fsck, need to format
+                    warn!("mount failed after fsck, formatting storage disk");
+                }
+                _ => {
+                    // fsck failed - disk might be unformatted (first boot)
+                    info!("fsck failed, assuming first boot - formatting storage disk");
+                }
+            }
+
+            // Format as last resort
             let _ = Command::new("mkfs.ext4")
                 .args(["-F", "-q", STORAGE_DEVICE])
                 .status();
             let _ = Command::new("mount")
                 .args([STORAGE_DEVICE, STORAGE_MOUNT])
                 .status();
-            // Create directory structure
-            let dirs = [
-                "layers",
-                "configs",
-                "manifests",
-                "overlays",
-                "containers/run",
-                "containers/logs",
-                "containers/exit",
-            ];
-            for dir in dirs {
-                let _ = std::fs::create_dir_all(std::path::Path::new(STORAGE_MOUNT).join(dir));
-            }
+            create_dirs();
         }
     }
 }
@@ -520,6 +601,8 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
 
         AgentRequest::Shutdown => {
             info!("shutdown requested");
+            // Sync filesystem before shutdown to prevent corruption
+            sync_and_unmount_storage();
             AgentResponse::Ok {
                 data: Some(serde_json::json!({"shutdown": true})),
             }

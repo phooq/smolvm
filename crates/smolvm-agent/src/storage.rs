@@ -180,6 +180,22 @@ impl From<std::io::Error> for StorageError {
 
 type Result<T> = std::result::Result<T, StorageError>;
 
+/// Check if a layer directory is properly cached (exists and has content).
+///
+/// An empty layer directory indicates failed/incomplete extraction and should
+/// be re-extracted. This prevents issues where layer_dir.exists() returns true
+/// but the directory is empty due to interrupted extraction.
+fn is_layer_cached(layer_dir: &Path) -> bool {
+    if !layer_dir.exists() {
+        return false;
+    }
+    // Check if the directory has any entries
+    match std::fs::read_dir(layer_dir) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => false,
+    }
+}
+
 /// Initialize storage directories.
 ///
 /// This function ensures all required storage directories exist and are accessible.
@@ -478,9 +494,15 @@ pub fn pull_image_with_auth(
         let layer_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
         let layer_dir = root.join(LAYERS_DIR).join(layer_id);
 
-        if layer_dir.exists() {
+        if is_layer_cached(&layer_dir) {
             info!(layer = %layer_id, "layer already cached");
             continue;
+        }
+
+        // Clean up empty/incomplete layer directory if it exists
+        if layer_dir.exists() {
+            warn!(layer = %layer_id, "removing empty/incomplete layer directory");
+            let _ = std::fs::remove_dir_all(&layer_dir);
         }
 
         info!(
@@ -492,7 +514,7 @@ pub fn pull_image_with_auth(
         std::fs::create_dir_all(&layer_dir)?;
 
         // Stream layer directly to tar extraction
-        // Include auth credentials if provided
+        // Include auth credentials via Docker config if provided
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(format!(
             "crane blob '{}@{}' {} | tar -xzf - -C '{}'",
@@ -504,10 +526,20 @@ pub fn pull_image_with_auth(
             layer_dir.display()
         ));
 
-        // Pass credentials via environment variables
+        // Set up auth via Docker config file if credentials provided
         if let Some(a) = auth {
-            cmd.env("CRANE_USERNAME", &a.username);
-            cmd.env("CRANE_PASSWORD", &a.password);
+            let registry = extract_registry_from_image(image);
+            let docker_config_dir = std::path::Path::new("/tmp/crane-auth");
+            let _ = std::fs::create_dir_all(docker_config_dir);
+            let auth_b64 = base64_encode(&format!("{}:{}", a.username, a.password));
+            let config_json = format!(
+                r#"{{"auths":{{"{}":{{"auth":"{}"}}}}}}"#,
+                registry, auth_b64
+            );
+            let config_path = docker_config_dir.join("config.json");
+            if std::fs::write(&config_path, &config_json).is_ok() {
+                cmd.env("DOCKER_CONFIG", docker_config_dir);
+            }
         }
 
         let status = cmd.status()?;
@@ -525,6 +557,18 @@ pub fn pull_image_with_auth(
         if let Ok(size) = dir_size(&layer_dir) {
             total_size += size;
         }
+    }
+
+    // Sync filesystem to ensure all layer data is persisted to the ext4 journal.
+    // Defense in depth: even though shutdown waits for acknowledgment (which also
+    // syncs), we sync here because:
+    // 1. Commands may complete and VM may exit before shutdown is called
+    // 2. Protects against ungraceful termination (SIGKILL, host crash)
+    // 3. Empty layer directories cause "executable not found" errors that are
+    //    hard to diagnose - better to be safe than sorry
+    // SAFETY: sync() is always safe to call
+    unsafe {
+        libc::sync();
     }
 
     // Build ImageInfo
@@ -696,9 +740,15 @@ where
         // Report progress
         progress(i + 1, total_layers, layer_id);
 
-        if layer_dir.exists() {
+        if is_layer_cached(&layer_dir) {
             info!(layer = %layer_id, "layer already cached");
             continue;
+        }
+
+        // Clean up empty/incomplete layer directory if it exists
+        if layer_dir.exists() {
+            warn!(layer = %layer_id, "removing empty/incomplete layer directory");
+            let _ = std::fs::remove_dir_all(&layer_dir);
         }
 
         info!(
@@ -710,7 +760,7 @@ where
         std::fs::create_dir_all(&layer_dir)?;
 
         // Stream layer directly to tar extraction
-        // Include auth credentials if provided
+        // Include auth credentials via Docker config if provided
         let mut cmd = Command::new("sh");
         cmd.arg("-c").arg(format!(
             "crane blob '{}@{}' {} | tar -xzf - -C '{}'",
@@ -722,10 +772,20 @@ where
             layer_dir.display()
         ));
 
-        // Pass credentials via environment variables
+        // Set up auth via Docker config file if credentials provided
         if let Some(a) = auth {
-            cmd.env("CRANE_USERNAME", &a.username);
-            cmd.env("CRANE_PASSWORD", &a.password);
+            let registry = extract_registry_from_image(image);
+            let docker_config_dir = std::path::Path::new("/tmp/crane-auth");
+            let _ = std::fs::create_dir_all(docker_config_dir);
+            let auth_b64 = base64_encode(&format!("{}:{}", a.username, a.password));
+            let config_json = format!(
+                r#"{{"auths":{{"{}":{{"auth":"{}"}}}}}}"#,
+                registry, auth_b64
+            );
+            let config_path = docker_config_dir.join("config.json");
+            if std::fs::write(&config_path, &config_json).is_ok() {
+                cmd.env("DOCKER_CONFIG", docker_config_dir);
+            }
         }
 
         let status = cmd.status()?;
@@ -741,6 +801,18 @@ where
         if let Ok(size) = dir_size(&layer_dir) {
             total_size += size;
         }
+    }
+
+    // Sync filesystem to ensure all layer data is persisted to the ext4 journal.
+    // Defense in depth: even though shutdown waits for acknowledgment (which also
+    // syncs), we sync here because:
+    // 1. Commands may complete and VM may exit before shutdown is called
+    // 2. Protects against ungraceful termination (SIGKILL, host crash)
+    // 3. Empty layer directories cause "executable not found" errors that are
+    //    hard to diagnose - better to be safe than sorry
+    // SAFETY: sync() is always safe to call
+    unsafe {
+        libc::sync();
     }
 
     // Build ImageInfo
@@ -1755,10 +1827,53 @@ fn mount_overlay_sequential(
 // Helper functions
 // ============================================================================
 
+/// Extract the registry hostname from an image reference.
+/// e.g., "alpine:latest" -> "https://index.docker.io/v1/"
+/// e.g., "ghcr.io/owner/repo" -> "ghcr.io"
+fn extract_registry_from_image(image: &str) -> String {
+    if let Some(slash_pos) = image.find('/') {
+        let potential_registry = &image[..slash_pos];
+        if potential_registry.contains('.') || potential_registry.contains(':') {
+            return potential_registry.to_string();
+        }
+    }
+    // Docker Hub uses this URL in config.json
+    "https://index.docker.io/v1/".to_string()
+}
+
+/// Simple base64 encoding for auth string.
+fn base64_encode(input: &str) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = input.as_bytes();
+    let mut result = String::new();
+
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+
+        result.push(ALPHABET[b0 >> 2] as char);
+        result.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+
+        if chunk.len() > 1 {
+            result.push(ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
+        } else {
+            result.push('=');
+        }
+
+        if chunk.len() > 2 {
+            result.push(ALPHABET[b2 & 0x3f] as char);
+        } else {
+            result.push('=');
+        }
+    }
+
+    result
+}
+
 /// Run a crane command with the given operation.
 ///
-/// If auth is provided, sets CRANE_USERNAME and CRANE_PASSWORD environment variables
-/// which crane will use for registry authentication.
+/// If auth is provided, creates a temporary Docker config for crane to use.
 fn run_crane(
     operation: &str,
     image: &str,
@@ -1772,17 +1887,38 @@ fn run_crane(
         cmd.arg("--platform").arg(p);
     }
 
-    // Set credentials via environment if provided
-    // crane supports these environment variables for authentication
+    // Set credentials via Docker config if provided
+    // Create a temporary docker config.json that crane can read
     if let Some(a) = auth {
-        cmd.env("CRANE_USERNAME", &a.username);
-        cmd.env("CRANE_PASSWORD", &a.password);
-        debug!(
-            operation = %operation,
-            image = %image,
-            username = %a.username,
-            "using registry credentials"
+        // Extract registry from image (e.g., "docker.io" from "alpine:latest")
+        let registry = extract_registry_from_image(image);
+
+        // Create a temp docker config with the credentials
+        let docker_config_dir = std::path::Path::new("/tmp/crane-auth");
+        let _ = std::fs::create_dir_all(docker_config_dir);
+
+        // Base64 encode username:password for Docker auth format
+        let auth_str = format!("{}:{}", a.username, a.password);
+        let auth_b64 = base64_encode(&auth_str);
+
+        let config_json = format!(
+            r#"{{"auths":{{"{}":{{"auth":"{}"}}}}}}"#,
+            registry, auth_b64
         );
+
+        let config_path = docker_config_dir.join("config.json");
+        if let Err(e) = std::fs::write(&config_path, &config_json) {
+            warn!(error = %e, "failed to write docker config for crane auth");
+        } else {
+            cmd.env("DOCKER_CONFIG", docker_config_dir);
+            debug!(
+                operation = %operation,
+                image = %image,
+                username = %a.username,
+                registry = %registry,
+                "using registry credentials via docker config"
+            );
+        }
     }
 
     let output = cmd.output()?;
