@@ -72,9 +72,9 @@ fi
 
 # Build agent-rootfs
 echo "Building agent-rootfs..."
-ROOTFS_SRC="$PROJECT_ROOT/helper-rootfs/rootfs"
+ROOTFS_SRC="$PROJECT_ROOT/target/agent-rootfs"
 if [[ ! -d "$ROOTFS_SRC" ]]; then
-    echo "Error: helper-rootfs/rootfs not found"
+    echo "Error: target/agent-rootfs not found"
     echo "Run ./scripts/build-agent-rootfs.sh first to create the base rootfs."
     exit 1
 fi

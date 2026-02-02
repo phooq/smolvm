@@ -3,8 +3,9 @@
 #
 # This script creates an Alpine-based rootfs with:
 # - crane (for OCI image operations)
+# - crun (OCI container runtime)
 # - smolvm-agent daemon
-# - Required utilities (jq, e2fsprogs, etc.)
+# - Required utilities (jq, e2fsprogs, util-linux)
 #
 # Usage: ./scripts/build-agent-rootfs.sh [output-dir]
 
@@ -82,14 +83,13 @@ if command -v docker &> /dev/null; then
             jq \
             e2fsprogs \
             crun \
-            conmon \
             util-linux \
             libcap
     '
     echo "Packages installed successfully"
 else
     echo "Warning: Docker not found, skipping package installation"
-    echo "You may need to install packages manually: jq e2fsprogs crun conmon util-linux"
+    echo "You may need to install packages manually: jq e2fsprogs crun util-linux"
 fi
 
 # Create necessary directories
@@ -126,7 +126,7 @@ if [ -b /dev/vda ]; then
 
     # Create directory structure (fast, only if missing)
     mkdir -p /storage/layers /storage/configs /storage/manifests /storage/overlays
-    # Container runtime directories for conmon
+    # Container runtime directories for crun
     mkdir -p /storage/containers/run /storage/containers/logs /storage/containers/exit
 fi
 
