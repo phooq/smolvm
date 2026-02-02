@@ -561,14 +561,37 @@ impl AgentClient {
 
     /// Request agent shutdown.
     ///
-    /// This is a fire-and-forget operation - we send the shutdown command
-    /// but don't wait for a response since the agent may exit immediately.
+    /// Waits for the agent to acknowledge the shutdown request before returning.
+    /// This ensures the agent has called sync() to flush filesystem caches
+    /// before we send SIGTERM to terminate the VM.
+    ///
+    /// The acknowledgment is critical for data integrity - without it, the VM
+    /// may be killed before ext4 journal commits are flushed, causing layer
+    /// corruption on next boot.
     pub fn shutdown(&mut self) -> Result<()> {
-        // Just send the shutdown request, don't wait for response
-        // The agent may exit immediately, causing the socket to close
+        // Set a short timeout for shutdown acknowledgment
+        // The agent just needs to call sync() which is fast
+        let _ = self
+            .stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)));
+
         let data = encode_message(&AgentRequest::Shutdown)
             .map_err(|e| Error::AgentError(e.to_string()))?;
-        let _ = self.stream.write_all(&data);
+        self.stream
+            .write_all(&data)
+            .map_err(|e| Error::AgentError(format!("failed to send shutdown: {}", e)))?;
+
+        // Wait for acknowledgment - this confirms sync() completed
+        // If the agent crashes or times out, we proceed anyway
+        match self.read_response() {
+            Ok(_) => {
+                tracing::debug!("agent acknowledged shutdown (sync complete)");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "shutdown acknowledgment failed, proceeding anyway");
+            }
+        }
+
         Ok(())
     }
 

@@ -599,14 +599,24 @@ impl AgentManager {
             inner.child.as_ref().map(|c| c.pid())
         };
 
-        // Try graceful shutdown via vsock (fire-and-forget, don't wait for response)
+        // Graceful shutdown via vsock - waits for agent to acknowledge
+        // The agent calls sync() before responding, ensuring ext4 journal is flushed
         if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket) {
             let _ = client.shutdown();
         }
 
         if let Some(pid) = child_pid {
-            // Use optimized stop with aggressive polling for fast response
+            // Now safe to terminate - agent has synced filesystem
             let _ = process::stop_process_fast(pid, AGENT_STOP_TIMEOUT, true);
+        }
+
+        // Defense in depth: sync host's view of the storage file
+        // This catches any writes that made it to the host buffer but weren't flushed
+        // Combined with agent-side sync(), this provides robust data integrity
+        if let Ok(file) = std::fs::File::open(self.storage_disk.path()) {
+            if file.sync_all().is_ok() {
+                tracing::debug!("storage disk synced to host");
+            }
         }
 
         // Clean up
