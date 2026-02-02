@@ -36,10 +36,10 @@ echo "Building release binaries..."
 LIBKRUN_BUNDLE="$LIB_DIR" cargo build --release --bin smolvm
 cargo build --release -p smolvm-stub
 
-# Build smolvm-agent for Linux
-echo "Building smolvm-agent for Linux..."
+# Build smolvm-agent for Linux (size-optimized)
+echo "Building smolvm-agent for Linux (optimized for size)..."
 docker run --rm -v "$PROJECT_ROOT:/work" -w /work rust:alpine sh -c \
-    "apk add musl-dev && cargo build --release -p smolvm-agent"
+    "apk add musl-dev && cargo build --profile release-small -p smolvm-agent"
 
 # Sign binary (macOS only)
 if [[ "$(uname -s)" == "Darwin" ]]; then
@@ -84,9 +84,9 @@ fi
 mkdir -p "$DIST_DIR/agent-rootfs"
 cp -a "$ROOTFS_SRC"/* "$DIST_DIR/agent-rootfs/"
 
-# Copy freshly built agent binary
-cp ./target/release/smolvm-agent "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
-cp ./target/release/smolvm-agent "$DIST_DIR/agent-rootfs/sbin/init"
+# Copy freshly built agent binary (from release-small profile)
+cp ./target/release-small/smolvm-agent "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
+cp ./target/release-small/smolvm-agent "$DIST_DIR/agent-rootfs/sbin/init"
 chmod +x "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
 chmod +x "$DIST_DIR/agent-rootfs/sbin/init"
 

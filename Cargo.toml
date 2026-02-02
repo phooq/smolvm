@@ -57,3 +57,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 tracing = "0.1"
+
+# Release profile optimizations
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# Smaller binary profile for agent (use with --profile release-small)
+[profile.release-small]
+inherits = "release"
+opt-level = "z"      # Optimize for size
+lto = true
+codegen-units = 1
+panic = "abort"      # No unwinding - saves ~10% binary size
+strip = true
