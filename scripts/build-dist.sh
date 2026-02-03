@@ -85,6 +85,9 @@ mkdir -p "$DIST_DIR/agent-rootfs"
 cp -a "$ROOTFS_SRC"/* "$DIST_DIR/agent-rootfs/"
 
 # Copy freshly built agent binary (from release-small profile)
+# Remove existing symlinks first (busybox creates init as symlink)
+rm -f "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
+rm -f "$DIST_DIR/agent-rootfs/sbin/init"
 cp ./target/release-small/smolvm-agent "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
 cp ./target/release-small/smolvm-agent "$DIST_DIR/agent-rootfs/sbin/init"
 chmod +x "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
