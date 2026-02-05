@@ -47,7 +47,10 @@ impl ServeCmd {
     pub fn run(self) -> Result<()> {
         // Parse listen address
         let addr: SocketAddr = self.listen.parse().map_err(|e| {
-            smolvm::error::Error::Config(format!("invalid listen address '{}': {}", self.listen, e))
+            smolvm::error::Error::config(
+                "parse listen address",
+                format!("invalid address '{}': {}", self.listen, e),
+            )
         })?;
 
         // Set up verbose logging if requested
@@ -80,7 +83,7 @@ impl ServeCmd {
 
         // Create shared state and load persisted sandboxes
         let state = Arc::new(ApiState::new().map_err(|e| {
-            smolvm::error::Error::Config(format!("failed to initialize API state: {:?}", e))
+            smolvm::error::Error::config("initialize api state", format!("{:?}", e))
         })?);
         let loaded = state.load_persisted_sandboxes();
         if !loaded.is_empty() {

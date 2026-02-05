@@ -136,10 +136,10 @@ impl RegistriesCmd {
                 let status = std::process::Command::new(&editor).arg(&path).status()?;
 
                 if !status.success() {
-                    return Err(smolvm::Error::Config(format!(
-                        "editor '{}' exited with non-zero status",
-                        editor
-                    )));
+                    return Err(smolvm::Error::config(
+                        "edit config",
+                        format!("editor '{}' exited with non-zero status", editor),
+                    ));
                 }
 
                 // Validate the config after editing

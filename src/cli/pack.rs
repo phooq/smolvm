@@ -90,7 +90,8 @@ impl PackCmd {
         info!(image = %self.image, output = %self.output.display(), "packing image");
 
         // Create temporary staging directory
-        let temp_dir = tempfile::tempdir().map_err(|e| Error::AgentError(e.to_string()))?;
+        let temp_dir = tempfile::tempdir()
+            .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
         let staging_dir = temp_dir.path().join("staging");
 
         // Start agent to pull image and export layers
@@ -122,21 +123,21 @@ impl PackCmd {
 
         // Create asset collector
         let mut collector = AssetCollector::new(staging_dir.clone())
-            .map_err(|e| Error::AgentError(e.to_string()))?;
+            .map_err(|e| Error::agent("collect assets", e.to_string()))?;
 
         // Find and collect libraries
         println!("Collecting runtime libraries...");
         let lib_dir = self.find_lib_dir()?;
         collector
             .collect_libraries(&lib_dir)
-            .map_err(|e| Error::AgentError(e.to_string()))?;
+            .map_err(|e| Error::agent("collect libraries", e.to_string()))?;
 
         // Find and collect agent rootfs
         println!("Collecting agent rootfs...");
         let rootfs_dir = self.find_rootfs_dir()?;
         collector
             .collect_agent_rootfs(&rootfs_dir)
-            .map_err(|e| Error::AgentError(e.to_string()))?;
+            .map_err(|e| Error::agent("collect rootfs", e.to_string()))?;
 
         // Export and collect layers
         println!("Exporting {} layers...", image_info.layer_count);
@@ -154,7 +155,7 @@ impl PackCmd {
             // Add to collector
             collector
                 .add_layer(layer_digest, &layer_data)
-                .map_err(|e| Error::AgentError(e.to_string()))?;
+                .map_err(|e| Error::agent("collect layers", e.to_string()))?;
         }
 
         // Stop agent (no longer needed for remaining steps)
@@ -164,7 +165,7 @@ impl PackCmd {
         println!("Creating storage template...");
         collector
             .create_storage_template()
-            .map_err(|e| Error::AgentError(e.to_string()))?;
+            .map_err(|e| Error::agent("create storage template", e.to_string()))?;
 
         // Build manifest
         let platform = format!("{}/{}", image_info.os, image_info.architecture);
@@ -187,8 +188,8 @@ impl PackCmd {
         // Recreate collector for compression (we consumed it above)
         // Note: We use with_asset_collector instead of with_assets to avoid
         // overwriting the manifest.assets we just set (which includes storage_template)
-        let collector =
-            AssetCollector::new(staging_dir).map_err(|e| Error::AgentError(e.to_string()))?;
+        let collector = AssetCollector::new(staging_dir)
+            .map_err(|e| Error::agent("collect assets", e.to_string()))?;
 
         // Pack the binary
         let packer = Packer::new(manifest)
@@ -199,12 +200,12 @@ impl PackCmd {
             println!("Assembling single-file packed binary...");
             packer
                 .pack_embedded(&self.output)
-                .map_err(|e| Error::AgentError(e.to_string()))?
+                .map_err(|e| Error::agent("pack binary", e.to_string()))?
         } else {
             println!("Assembling packed binary...");
             packer
                 .pack(&self.output)
-                .map_err(|e| Error::AgentError(e.to_string()))?
+                .map_err(|e| Error::agent("pack binary", e.to_string()))?
         };
 
         println!(
@@ -279,8 +280,9 @@ impl PackCmd {
             }
         }
 
-        Err(Error::AgentError(
-            "Could not find libkrun library. Use --lib-dir to specify the location.".to_string(),
+        Err(Error::agent(
+            "find libkrun",
+            "could not find libkrun library. Use --lib-dir to specify the location.",
         ))
     }
 
@@ -309,8 +311,9 @@ impl PackCmd {
             }
         }
 
-        Err(Error::AgentError(
-            "Could not find agent rootfs. Use --rootfs-dir to specify the location.".to_string(),
+        Err(Error::agent(
+            "find agent rootfs",
+            "could not find agent rootfs. Use --rootfs-dir to specify the location.",
         ))
     }
 
@@ -340,11 +343,11 @@ impl PackCmd {
             }
         }
 
-        Err(Error::AgentError(
-            "Could not find smolvm-stub executable. Build it with:\n  \
+        Err(Error::agent(
+            "find smolvm-stub",
+            "could not find smolvm-stub executable. Build it with:\n  \
              cargo build --release -p smolvm-stub\n\
-             Or use --stub to specify the path."
-                .to_string(),
+             Or use --stub to specify the path.",
         ))
     }
 
@@ -368,10 +371,10 @@ impl PackCmd {
         match response {
             AgentResponse::LayerData { data, done: true } => Ok(data),
             AgentResponse::LayerData { .. } => {
-                Err(Error::AgentError("unexpected chunked response".to_string()))
+                Err(Error::agent("export layer", "unexpected chunked response"))
             }
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response type".to_string())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("export layer", message)),
+            _ => Err(Error::agent("export layer", "unexpected response type")),
         }
     }
 }

@@ -134,7 +134,7 @@ impl StorageDisk {
     pub fn default_path() -> Result<PathBuf> {
         let data_dir = dirs::data_local_dir()
             .or_else(dirs::data_dir)
-            .ok_or_else(|| Error::Storage("could not determine data directory".into()))?;
+            .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
 
         let smolvm_dir = data_dir.join("smolvm");
         Ok(smolvm_dir.join(STORAGE_DISK_FILENAME))
@@ -150,8 +150,9 @@ impl StorageDisk {
     pub fn open_or_create_at(path: &Path, size_gb: u64) -> Result<Self> {
         // Validate size
         if size_gb == 0 {
-            return Err(crate::error::Error::Config(
-                "storage disk size must be greater than 0 GB".to_string(),
+            return Err(Error::config(
+                "validate storage size",
+                "disk size must be greater than 0 GB",
             ));
         }
 
@@ -266,14 +267,13 @@ impl StorageDisk {
 
         // Ensure parent directory exists
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                Error::Storage(format!("failed to create storage directory: {}", e))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::storage("create directory", e.to_string()))?;
         }
 
         // Copy the template file
         std::fs::copy(template_path, &self.path)
-            .map_err(|e| Error::Storage(format!("failed to copy storage template: {}", e)))?;
+            .map_err(|e| Error::storage("copy template", e.to_string()))?;
 
         // Resize to the desired size (template is 512MB, we want 20GB)
         // This just extends the sparse file - doesn't use actual disk space
@@ -281,14 +281,14 @@ impl StorageDisk {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .open(&self.path)
-            .map_err(|e| Error::Storage(format!("failed to open storage for resize: {}", e)))?;
+            .map_err(|e| Error::storage("open for resize", e.to_string()))?;
 
         file.seek(SeekFrom::Start(self.size_bytes - 1))
-            .map_err(|e| Error::Storage(format!("failed to seek for resize: {}", e)))?;
+            .map_err(|e| Error::storage("seek for resize", e.to_string()))?;
         file.write_all(&[0])
-            .map_err(|e| Error::Storage(format!("failed to extend storage: {}", e)))?;
+            .map_err(|e| Error::storage("extend storage", e.to_string()))?;
         file.sync_all()
-            .map_err(|e| Error::Storage(format!("failed to sync storage: {}", e)))?;
+            .map_err(|e| Error::storage("sync storage", e.to_string()))?;
 
         // Filesystem resize happens inside the VM (guest runs resize2fs on boot).
 
@@ -312,27 +312,29 @@ impl StorageDisk {
             } else {
                 "On Linux, install with: apt install e2fsprogs (or equivalent for your distro)"
             };
-            Error::Storage(format!(
-                "mkfs.ext4 not found - required for storage disk formatting.\n  {}\n  \
-                 After installing, run your smolvm command again.",
-                hint
-            ))
+            Error::storage(
+                "find mkfs.ext4",
+                format!(
+                    "mkfs.ext4 not found - required for storage disk formatting.\n  {}\n  \
+                     After installing, run your smolvm command again.",
+                    hint
+                ),
+            )
         })?;
 
-        let path_str = self
-            .path
-            .to_str()
-            .ok_or_else(|| Error::Storage("invalid disk path".into()))?;
+        let path_str = self.path.to_str().ok_or_else(|| {
+            Error::storage("validate path", "disk path contains invalid characters")
+        })?;
 
         // Format with ext4 (-F = force, -q = quiet, -m 0 = no reserved blocks)
         let output = std::process::Command::new(mkfs_path)
             .args(["-F", "-q", "-m", "0", "-L", "smolvm", path_str])
             .output()
-            .map_err(|e| Error::Storage(format!("failed to run mkfs.ext4: {}", e)))?;
+            .map_err(|e| Error::storage("run mkfs.ext4", e.to_string()))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(Error::Storage(format!("mkfs.ext4 failed: {}", stderr)));
+            return Err(Error::storage("format with mkfs.ext4", stderr.to_string()));
         }
 
         // Mark as formatted

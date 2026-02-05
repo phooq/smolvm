@@ -82,21 +82,21 @@ pub fn launch_agent_vm(
         // Create VM context
         let ctx = krun_create_ctx();
         if ctx < 0 {
-            return Err(Error::AgentError("failed to create libkrun context".into()));
+            return Err(Error::agent("create vm context", "krun_create_ctx failed"));
         }
         let ctx = ctx as u32;
 
         // Set VM config
         if krun_set_vm_config(ctx, resources.cpus, resources.mem) < 0 {
             krun_free_ctx(ctx);
-            return Err(Error::AgentError("failed to set VM config".into()));
+            return Err(Error::agent("configure vm", "krun_set_vm_config failed"));
         }
 
         // Set root filesystem
         let root = path_to_cstring(rootfs_path)?;
         if krun_set_root(ctx, root.as_ptr()) < 0 {
             krun_free_ctx(ctx);
-            return Err(Error::AgentError("failed to set root filesystem".into()));
+            return Err(Error::agent("set rootfs", "krun_set_root failed"));
         }
 
         // Configure TSI (Transparent Socket Impersonation) networking.
@@ -113,14 +113,20 @@ pub fn launch_agent_vm(
         // Always disable implicit vsock to take explicit control
         if krun_disable_implicit_vsock(ctx) < 0 {
             krun_free_ctx(ctx);
-            return Err(Error::AgentError("failed to disable implicit vsock".into()));
+            return Err(Error::agent(
+                "configure vsock",
+                "krun_disable_implicit_vsock failed",
+            ));
         }
 
         if resources.network || !port_mappings.is_empty() {
             // Add vsock with TSI HIJACK_INET flag to enable network access
             if krun_add_vsock(ctx, KRUN_TSI_HIJACK_INET) < 0 {
                 krun_free_ctx(ctx);
-                return Err(Error::AgentError("failed to add vsock with TSI".into()));
+                return Err(Error::agent(
+                    "configure vsock",
+                    "krun_add_vsock with TSI failed",
+                ));
             }
 
             // Set port mappings for TCP port forwarding
@@ -137,7 +143,7 @@ pub fn launch_agent_vm(
 
             if krun_set_port_map(ctx, port_ptrs.as_ptr()) < 0 {
                 krun_free_ctx(ctx);
-                return Err(Error::AgentError("failed to set port map".into()));
+                return Err(Error::agent("set port mapping", "krun_set_port_map failed"));
             }
 
             tracing::debug!(
@@ -151,7 +157,7 @@ pub fn launch_agent_vm(
             // Using 0 for tsi_features means no network interception.
             if krun_add_vsock(ctx, 0) < 0 {
                 krun_free_ctx(ctx);
-                return Err(Error::AgentError("failed to add vsock".into()));
+                return Err(Error::agent("configure vsock", "krun_add_vsock failed"));
             }
 
             tracing::debug!("configured vsock without TSI networking");
@@ -183,7 +189,7 @@ pub fn launch_agent_vm(
         // The guest must mount these manually (or via the agent)
         for (i, mount) in mounts.iter().enumerate() {
             let tag = CString::new(format!("smolvm{}", i))
-                .map_err(|_| Error::AgentError("invalid mount tag".into()))?;
+                .map_err(|_| Error::agent("configure mount", "invalid mount tag"))?;
             let host_path = path_to_cstring(&mount.source)?;
 
             tracing::debug!(
@@ -248,7 +254,7 @@ pub fn launch_agent_vm(
 
         if krun_set_exec(ctx, exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr()) < 0 {
             krun_free_ctx(ctx);
-            return Err(Error::AgentError("failed to set exec command".into()));
+            return Err(Error::agent("set exec command", "krun_set_exec failed"));
         }
 
         // Start VM (this replaces the process on success)
@@ -256,17 +262,17 @@ pub fn launch_agent_vm(
         let ret = krun_start_enter(ctx);
 
         // If we get here, something went wrong
-        Err(Error::AgentError(format!(
-            "krun_start_enter returned: {}",
-            ret
-        )))
+        Err(Error::agent(
+            "start vm",
+            format!("krun_start_enter returned: {}", ret),
+        ))
     }
 }
 
 /// Convert a Path to a CString.
 fn path_to_cstring(path: &Path) -> Result<CString> {
     CString::new(path.to_string_lossy().as_bytes())
-        .map_err(|_| Error::AgentError("path contains null byte".into()))
+        .map_err(|_| Error::agent("convert path", "path contains null byte"))
 }
 
 /// Raise file descriptor limits (required by libkrun).

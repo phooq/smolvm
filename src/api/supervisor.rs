@@ -161,7 +161,7 @@ impl Supervisor {
             .await
             // Guard dropped here, DB reopened (even on cancellation)
         }
-        .map_err(|e| crate::Error::AgentError(format!("spawn error: {}", e)))?;
+        .map_err(|e| crate::Error::agent("spawn task", e.to_string()))?;
 
         // Handle start result
         match start_result {

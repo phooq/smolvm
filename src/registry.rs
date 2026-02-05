@@ -89,19 +89,17 @@ impl RegistryConfig {
         }
 
         let contents = std::fs::read_to_string(&config_path).map_err(|e| {
-            Error::ConfigLoad(format!(
-                "failed to read registry config at {}: {}",
-                config_path.display(),
-                e
-            ))
+            Error::config(
+                format!("read registry config at {}", config_path.display()),
+                e.to_string(),
+            )
         })?;
 
         let config: Self = toml::from_str(&contents).map_err(|e| {
-            Error::ConfigLoad(format!(
-                "failed to parse registry config at {}: {}",
-                config_path.display(),
-                e
-            ))
+            Error::config(
+                format!("parse registry config at {}", config_path.display()),
+                e.to_string(),
+            )
         })?;
 
         tracing::debug!(
@@ -115,8 +113,8 @@ impl RegistryConfig {
 
     /// Get the path to the registry configuration file.
     pub fn config_path() -> Result<PathBuf> {
-        let config_dir =
-            dirs::config_dir().ok_or_else(|| Error::Config("no config directory found".into()))?;
+        let config_dir = dirs::config_dir()
+            .ok_or_else(|| Error::config("resolve path", "no config directory found"))?;
         Ok(config_dir.join("smolvm").join("registries.toml"))
     }
 

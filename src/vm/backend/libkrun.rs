@@ -272,7 +272,7 @@ impl LibkrunVm {
             // Add virtiofs mounts for host directories
             for (i, mount) in config.mounts.iter().enumerate() {
                 let tag = CString::new(format!("smolvm{}", i))
-                    .map_err(|_| Error::mount("invalid mount tag"))?;
+                    .map_err(|_| Error::mount("create mount tag", "tag contains null byte"))?;
                 let path = path_to_cstring(&mount.source)?;
 
                 if krun_add_virtiofs(ctx, tag.as_ptr(), path.as_ptr()) < 0 {
@@ -287,10 +287,12 @@ impl LibkrunVm {
             // Add Rosetta virtiofs mount if enabled
             if rosetta_enabled {
                 if let Some(runtime_path) = rosetta::runtime_path() {
-                    let tag = CString::new(rosetta::ROSETTA_TAG)
-                        .map_err(|_| Error::mount("invalid rosetta tag"))?;
-                    let path = CString::new(runtime_path)
-                        .map_err(|_| Error::mount("invalid rosetta path"))?;
+                    let tag = CString::new(rosetta::ROSETTA_TAG).map_err(|_| {
+                        Error::mount("create rosetta tag", "tag contains null byte")
+                    })?;
+                    let path = CString::new(runtime_path).map_err(|_| {
+                        Error::mount("create rosetta path", "path contains null byte")
+                    })?;
 
                     if krun_add_virtiofs(ctx, tag.as_ptr(), path.as_ptr()) < 0 {
                         tracing::warn!("failed to add Rosetta virtiofs mount");
@@ -423,7 +425,7 @@ impl VmHandle for LibkrunVm {
         // VM already exited since krun_start_enter blocks
         self.exit_reason
             .clone()
-            .ok_or_else(|| Error::VmNotFound(self.id.0.clone()))
+            .ok_or_else(|| Error::vm_not_found(&self.id.0))
     }
 
     fn stop(&mut self) -> Result<()> {

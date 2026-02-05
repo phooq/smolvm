@@ -92,8 +92,9 @@ impl ExecCmd {
 
         // Check if sandbox is running
         if manager.try_connect_existing().is_none() {
-            return Err(Error::AgentError(
-                "No sandbox running. Start one with: smolvm sandbox run -d <image>".to_string(),
+            return Err(Error::agent(
+                "connect",
+                "no sandbox running. Start one with: smolvm sandbox run -d <image>",
             ));
         }
 
@@ -106,8 +107,9 @@ impl ExecCmd {
         let container_id = match container {
             Some(c) => c.id.clone(),
             None => {
-                return Err(Error::AgentError(
-                    "No running container in sandbox".to_string(),
+                return Err(Error::agent(
+                    "find container",
+                    "no running container in sandbox",
                 ));
             }
         };
@@ -342,7 +344,7 @@ impl RunCmd {
 
         // Start agent VM
         let manager = AgentManager::new_default()
-            .map_err(|e| Error::AgentError(format!("failed to create agent manager: {}", e)))?;
+            .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
         // Show startup message
         let mode = if self.detach {
@@ -364,7 +366,7 @@ impl RunCmd {
 
         manager
             .ensure_running_with_full_config(mounts.clone(), ports, resources)
-            .map_err(|e| Error::AgentError(format!("failed to start sandbox: {}", e)))?;
+            .map_err(|e| Error::agent("start sandbox", e.to_string()))?;
 
         // Connect to agent
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;

@@ -239,7 +239,7 @@ impl AgentManager {
     pub fn default_rootfs_path() -> Result<PathBuf> {
         let data_dir = dirs::data_local_dir()
             .or_else(dirs::data_dir)
-            .ok_or_else(|| Error::Storage("could not determine data directory".into()))?;
+            .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
 
         Ok(data_dir.join("smolvm").join("agent-rootfs"))
     }
@@ -437,8 +437,9 @@ impl AgentManager {
         {
             let mut inner = self.inner.lock();
             if inner.state != AgentState::Stopped {
-                return Err(Error::AgentError(
-                    "agent already starting or running".into(),
+                return Err(Error::agent(
+                    "start agent",
+                    "agent already starting or running",
                 ));
             }
             inner.state = AgentState::Starting;
@@ -469,10 +470,10 @@ impl AgentManager {
         if !self.rootfs_path.exists() {
             let mut inner = self.inner.lock();
             inner.state = AgentState::Stopped;
-            return Err(Error::AgentError(format!(
-                "agent rootfs not found: {}",
-                self.rootfs_path.display()
-            )));
+            return Err(Error::agent(
+                "verify rootfs",
+                format!("agent rootfs not found: {}", self.rootfs_path.display()),
+            ));
         }
 
         // Pre-format storage disk on host (much faster than in-VM formatting)
@@ -545,7 +546,7 @@ impl AgentManager {
             Err(e) => {
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Stopped;
-                return Err(Error::AgentError(format!("fork failed: {}", e)));
+                return Err(Error::agent("fork process", e.to_string()));
             }
         };
 
@@ -660,8 +661,9 @@ impl AgentManager {
                 if let Some(ref mut child) = inner.child {
                     if !child.is_running() {
                         // Child exited
-                        return Err(Error::AgentError(
-                            "agent process exited during startup".into(),
+                        return Err(Error::agent(
+                            "monitor agent",
+                            "agent process exited during startup",
                         ));
                     }
                 }
@@ -720,10 +722,13 @@ impl AgentManager {
             std::thread::sleep(poll_interval);
         }
 
-        Err(Error::AgentError(format!(
-            "agent did not become ready within {} seconds",
-            timeout.as_secs()
-        )))
+        Err(Error::agent(
+            "wait for ready",
+            format!(
+                "agent did not become ready within {} seconds",
+                timeout.as_secs()
+            ),
+        ))
     }
 
     /// Wait for the agent to stop.
@@ -738,8 +743,9 @@ impl AgentManager {
             std::thread::sleep(AGENT_POLL_INTERVAL);
         }
 
-        Err(Error::AgentError(
-            "timeout waiting for agent to stop".into(),
+        Err(Error::agent(
+            "shutdown agent",
+            "timeout waiting for agent to stop",
         ))
     }
 

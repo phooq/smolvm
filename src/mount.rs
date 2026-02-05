@@ -55,43 +55,45 @@ impl MountBinding {
 
         // Validate source is absolute
         if !source.is_absolute() {
-            return Err(Error::Mount(format!(
-                "source must be absolute: {}",
-                source.display()
-            )));
+            return Err(Error::mount(
+                "validate source",
+                format!("path must be absolute: {}", source.display()),
+            ));
         }
 
         // Validate target is absolute
         if !target.is_absolute() {
-            return Err(Error::Mount(format!(
-                "target must be absolute: {}",
-                target.display()
-            )));
+            return Err(Error::mount(
+                "validate target",
+                format!("path must be absolute: {}", target.display()),
+            ));
         }
 
         // Validate source exists
         if !source.exists() {
-            return Err(Error::Mount(format!(
-                "source does not exist: {}",
-                source.display()
-            )));
+            return Err(Error::mount(
+                "validate source",
+                format!("path does not exist: {}", source.display()),
+            ));
         }
 
         // Validate source is a directory
         if !source.is_dir() {
-            return Err(Error::Mount(format!(
-                "source must be a directory (virtiofs limitation): {}",
-                source.display()
-            )));
+            return Err(Error::mount(
+                "validate source",
+                format!(
+                    "path must be a directory (virtiofs limitation): {}",
+                    source.display()
+                ),
+            ));
         }
 
         // Canonicalize source path
         let source = source.canonicalize().map_err(|e| {
-            Error::Mount(format!(
-                "failed to canonicalize source '{}': {}",
-                source.display(),
-                e
-            ))
+            Error::mount(
+                "canonicalize source",
+                format!("'{}': {}", source.display(), e),
+            )
         })?;
 
         Ok(Self {
@@ -184,7 +186,7 @@ impl From<&MountBinding> for HostMount {
 pub fn validate_mount(mount: &HostMount) -> Result<()> {
     // Source must be absolute
     if !mount.source.is_absolute() {
-        return Err(Error::InvalidMountPath(format!(
+        return Err(Error::invalid_mount_path(format!(
             "source path must be absolute: {}",
             mount.source.display()
         )));
@@ -192,7 +194,7 @@ pub fn validate_mount(mount: &HostMount) -> Result<()> {
 
     // Target must be absolute
     if !mount.target.is_absolute() {
-        return Err(Error::InvalidMountPath(format!(
+        return Err(Error::invalid_mount_path(format!(
             "target path must be absolute: {}",
             mount.target.display()
         )));
@@ -207,7 +209,7 @@ pub fn validate_mount(mount: &HostMount) -> Result<()> {
 
     // Source must be a directory (virtiofs doesn't support single file mounts)
     if mount.source.is_file() {
-        return Err(Error::InvalidMountPath(format!(
+        return Err(Error::invalid_mount_path(format!(
             "cannot mount single file '{}': virtiofs only supports directory mounts. \
              Mount the parent directory instead (e.g., -v {}:/mnt/data)",
             mount.source.display(),
@@ -236,8 +238,8 @@ pub fn parse_mount_spec(spec: &str) -> Result<HostMount> {
         [source, target] => Ok(HostMount::new_writable(source, target)),
         [source, target, "ro"] => Ok(HostMount::new(source, target)),
         [source, target, "rw"] => Ok(HostMount::new_writable(source, target)),
-        _ => Err(Error::InvalidMountPath(format!(
-            "invalid mount spec: {} (expected host:guest[:ro|:rw])",
+        _ => Err(Error::invalid_mount_path(format!(
+            "invalid format '{}' (expected host:guest[:ro|:rw])",
             spec
         ))),
     }

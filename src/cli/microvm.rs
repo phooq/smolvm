@@ -114,10 +114,13 @@ impl ExecCmd {
 
         // Check if microvm is running - exec requires a running VM
         if manager.try_connect_existing().is_none() {
-            return Err(smolvm::Error::AgentError(format!(
-                "microvm '{}' is not running. Use 'smolvm microvm start' first.",
-                label
-            )));
+            return Err(smolvm::Error::agent(
+                "exec command",
+                format!(
+                    "microvm '{}' is not running. Use 'smolvm microvm start' first.",
+                    label
+                ),
+            ));
         }
 
         // Connect to agent
@@ -206,10 +209,10 @@ impl CreateCmd {
 
         // Check if VM already exists
         if config.get_vm(&self.name).is_some() {
-            return Err(smolvm::Error::Config(format!(
-                "VM '{}' already exists",
-                self.name
-            )));
+            return Err(smolvm::Error::config(
+                "create vm",
+                format!("VM '{}' already exists", self.name),
+            ));
         }
 
         // Parse and validate volume mounts
@@ -279,7 +282,7 @@ impl StartCmd {
         // Get VM record
         let record = config
             .get_vm(name)
-            .ok_or_else(|| Error::VmNotFound(name.clone()))?
+            .ok_or_else(|| Error::vm_not_found(name))?
             .clone();
 
         // Check state
@@ -316,7 +319,7 @@ impl StartCmd {
 
         // Start agent VM for this named VM
         let manager = AgentManager::for_vm(name)
-            .map_err(|e| Error::AgentError(format!("failed to create agent manager: {}", e)))?;
+            .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
         // Show startup message
         let mount_info = if !mounts.is_empty() {
@@ -333,7 +336,7 @@ impl StartCmd {
 
         manager
             .ensure_running_with_full_config(mounts, ports, resources)
-            .map_err(|e| Error::AgentError(format!("failed to start microvm: {}", e)))?;
+            .map_err(|e| Error::agent("start microvm", e.to_string()))?;
 
         // Update state
         let pid = manager.child_pid();
@@ -488,7 +491,7 @@ impl DeleteCmd {
 
         // Check if VM exists
         if config.get_vm(&self.name).is_none() {
-            return Err(smolvm::Error::VmNotFound(self.name.clone()));
+            return Err(smolvm::Error::vm_not_found(&self.name));
         }
 
         // Confirm deletion unless --force

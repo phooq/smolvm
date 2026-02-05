@@ -50,13 +50,11 @@ impl SmolvmDb {
     pub fn open_at(path: &Path) -> Result<Self> {
         // Ensure parent directory exists
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                Error::Database(format!("failed to create database directory: {}", e))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::database("create directory", e.to_string()))?;
         }
 
-        let db = Database::create(path)
-            .map_err(|e| Error::Database(format!("failed to open database: {}", e)))?;
+        let db = Database::create(path).map_err(|e| Error::database("open", e.to_string()))?;
 
         let instance = Self {
             db: Arc::new(RwLock::new(Some(db))),
@@ -88,7 +86,7 @@ impl SmolvmDb {
         let mut db = self.db.write();
         if db.is_none() {
             let new_db = Database::create(&self.path)
-                .map_err(|e| Error::Database(format!("failed to reopen database: {}", e)))?;
+                .map_err(|e| Error::database("reopen", e.to_string()))?;
             *db = Some(new_db);
             tracing::debug!("database reopened");
         }
@@ -103,7 +101,7 @@ impl SmolvmDb {
     /// Get the default database path.
     fn default_path() -> Result<PathBuf> {
         let data_dir = dirs::data_local_dir().ok_or_else(|| {
-            Error::Database("could not determine local data directory".to_string())
+            Error::database_unavailable("could not determine local data directory")
         })?;
         Ok(data_dir.join("smolvm").join("server").join("smolvm.redb"))
     }
@@ -113,23 +111,23 @@ impl SmolvmDb {
         let db_guard = self.db.read();
         let db = db_guard
             .as_ref()
-            .ok_or_else(|| Error::Database("database is closed".to_string()))?;
+            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
 
         let write_txn = db
             .begin_write()
-            .map_err(|e| Error::Database(format!("failed to begin write transaction: {}", e)))?;
+            .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
 
         // Create tables if they don't exist
         write_txn
             .open_table(VMS_TABLE)
-            .map_err(|e| Error::Database(format!("failed to create vms table: {}", e)))?;
+            .map_err(|e| Error::database("create vms table", e.to_string()))?;
         write_txn
             .open_table(CONFIG_TABLE)
-            .map_err(|e| Error::Database(format!("failed to create config table: {}", e)))?;
+            .map_err(|e| Error::database("create config table", e.to_string()))?;
 
         write_txn
             .commit()
-            .map_err(|e| Error::Database(format!("failed to commit table creation: {}", e)))?;
+            .map_err(|e| Error::database("commit table creation", e.to_string()))?;
 
         Ok(())
     }
@@ -141,29 +139,29 @@ impl SmolvmDb {
     /// Insert or update a VM record.
     pub fn insert_vm(&self, name: &str, record: &VmRecord) -> Result<()> {
         let json = serde_json::to_vec(record)
-            .map_err(|e| Error::Database(format!("failed to serialize VmRecord: {}", e)))?;
+            .map_err(|e| Error::database("serialize vm record", e.to_string()))?;
 
         let db_guard = self.db.read();
         let db = db_guard
             .as_ref()
-            .ok_or_else(|| Error::Database("database is closed".to_string()))?;
+            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
 
         let write_txn = db
             .begin_write()
-            .map_err(|e| Error::Database(format!("failed to begin write transaction: {}", e)))?;
+            .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
 
         {
             let mut table = write_txn
                 .open_table(VMS_TABLE)
-                .map_err(|e| Error::Database(format!("failed to open vms table: {}", e)))?;
+                .map_err(|e| Error::database("open vms table", e.to_string()))?;
             table
                 .insert(name, json.as_slice())
-                .map_err(|e| Error::Database(format!("failed to insert VM '{}': {}", name, e)))?;
+                .map_err(|e| Error::database(format!("insert vm '{}'", name), e.to_string()))?;
         }
 
         write_txn
             .commit()
-            .map_err(|e| Error::Database(format!("failed to commit VM insert: {}", e)))?;
+            .map_err(|e| Error::database("commit vm insert", e.to_string()))?;
 
         Ok(())
     }
@@ -174,41 +172,41 @@ impl SmolvmDb {
     /// This provides atomic conflict detection at the database level.
     pub fn insert_vm_if_not_exists(&self, name: &str, record: &VmRecord) -> Result<bool> {
         let json = serde_json::to_vec(record)
-            .map_err(|e| Error::Database(format!("failed to serialize VmRecord: {}", e)))?;
+            .map_err(|e| Error::database("serialize vm record", e.to_string()))?;
 
         let db_guard = self.db.read();
         let db = db_guard
             .as_ref()
-            .ok_or_else(|| Error::Database("database is closed".to_string()))?;
+            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
 
         let write_txn = db
             .begin_write()
-            .map_err(|e| Error::Database(format!("failed to begin write transaction: {}", e)))?;
+            .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
 
         let inserted = {
             let mut table = write_txn
                 .open_table(VMS_TABLE)
-                .map_err(|e| Error::Database(format!("failed to open vms table: {}", e)))?;
+                .map_err(|e| Error::database("open vms table", e.to_string()))?;
 
             // Check if key already exists
             let exists = table
                 .get(name)
-                .map_err(|e| Error::Database(format!("failed to check VM '{}': {}", name, e)))?
+                .map_err(|e| Error::database(format!("check vm '{}'", name), e.to_string()))?
                 .is_some();
 
             if exists {
                 false
             } else {
-                table.insert(name, json.as_slice()).map_err(|e| {
-                    Error::Database(format!("failed to insert VM '{}': {}", name, e))
-                })?;
+                table
+                    .insert(name, json.as_slice())
+                    .map_err(|e| Error::database(format!("insert vm '{}'", name), e.to_string()))?;
                 true
             }
         };
 
         write_txn
             .commit()
-            .map_err(|e| Error::Database(format!("failed to commit VM insert: {}", e)))?;
+            .map_err(|e| Error::database("commit vm insert", e.to_string()))?;
 
         Ok(inserted)
     }
@@ -218,28 +216,25 @@ impl SmolvmDb {
         let db_guard = self.db.read();
         let db = db_guard
             .as_ref()
-            .ok_or_else(|| Error::Database("database is closed".to_string()))?;
+            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
 
         let read_txn = db
             .begin_read()
-            .map_err(|e| Error::Database(format!("failed to begin read transaction: {}", e)))?;
+            .map_err(|e| Error::database("begin read transaction", e.to_string()))?;
 
         let table = read_txn
             .open_table(VMS_TABLE)
-            .map_err(|e| Error::Database(format!("failed to open vms table: {}", e)))?;
+            .map_err(|e| Error::database("open vms table", e.to_string()))?;
 
         match table.get(name) {
             Ok(Some(guard)) => {
                 let record: VmRecord = serde_json::from_slice(guard.value()).map_err(|e| {
-                    Error::Database(format!("failed to deserialize VmRecord '{}': {}", name, e))
+                    Error::database(format!("deserialize vm record '{}'", name), e.to_string())
                 })?;
                 Ok(Some(record))
             }
             Ok(None) => Ok(None),
-            Err(e) => Err(Error::Database(format!(
-                "failed to get VM '{}': {}",
-                name, e
-            ))),
+            Err(e) => Err(Error::database(format!("get vm '{}'", name), e.to_string())),
         }
     }
 
@@ -255,24 +250,24 @@ impl SmolvmDb {
         let db_guard = self.db.read();
         let db = db_guard
             .as_ref()
-            .ok_or_else(|| Error::Database("database is closed".to_string()))?;
+            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
 
         let write_txn = db
             .begin_write()
-            .map_err(|e| Error::Database(format!("failed to begin write transaction: {}", e)))?;
+            .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
 
         {
             let mut table = write_txn
                 .open_table(VMS_TABLE)
-                .map_err(|e| Error::Database(format!("failed to open vms table: {}", e)))?;
+                .map_err(|e| Error::database("open vms table", e.to_string()))?;
             table
                 .remove(name)
-                .map_err(|e| Error::Database(format!("failed to remove VM '{}': {}", name, e)))?;
+                .map_err(|e| Error::database(format!("remove vm '{}'", name), e.to_string()))?;
         }
 
         write_txn
             .commit()
-            .map_err(|e| Error::Database(format!("failed to commit VM removal: {}", e)))?;
+            .map_err(|e| Error::database("commit vm removal", e.to_string()))?;
 
         Ok(existing)
     }
@@ -282,26 +277,26 @@ impl SmolvmDb {
         let db_guard = self.db.read();
         let db = db_guard
             .as_ref()
-            .ok_or_else(|| Error::Database("database is closed".to_string()))?;
+            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
 
         let read_txn = db
             .begin_read()
-            .map_err(|e| Error::Database(format!("failed to begin read transaction: {}", e)))?;
+            .map_err(|e| Error::database("begin read transaction", e.to_string()))?;
 
         let table = read_txn
             .open_table(VMS_TABLE)
-            .map_err(|e| Error::Database(format!("failed to open vms table: {}", e)))?;
+            .map_err(|e| Error::database("open vms table", e.to_string()))?;
 
         let mut vms = Vec::new();
         for entry in table
             .iter()
-            .map_err(|e| Error::Database(format!("failed to iterate vms table: {}", e)))?
+            .map_err(|e| Error::database("iterate vms table", e.to_string()))?
         {
             let (key, value) =
-                entry.map_err(|e| Error::Database(format!("failed to read vms entry: {}", e)))?;
+                entry.map_err(|e| Error::database("read vms entry", e.to_string()))?;
             let name = key.value().to_string();
             let record: VmRecord = serde_json::from_slice(value.value()).map_err(|e| {
-                Error::Database(format!("failed to deserialize VmRecord '{}': {}", name, e))
+                Error::database(format!("deserialize vm record '{}'", name), e.to_string())
             })?;
             vms.push((name, record));
         }
@@ -346,23 +341,23 @@ impl SmolvmDb {
         let db_guard = self.db.read();
         let db = db_guard
             .as_ref()
-            .ok_or_else(|| Error::Database("database is closed".to_string()))?;
+            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
 
         let read_txn = db
             .begin_read()
-            .map_err(|e| Error::Database(format!("failed to begin read transaction: {}", e)))?;
+            .map_err(|e| Error::database("begin read transaction", e.to_string()))?;
 
         let table = read_txn
             .open_table(CONFIG_TABLE)
-            .map_err(|e| Error::Database(format!("failed to open config table: {}", e)))?;
+            .map_err(|e| Error::database("open config table", e.to_string()))?;
 
         match table.get(key) {
             Ok(Some(guard)) => Ok(Some(guard.value().to_string())),
             Ok(None) => Ok(None),
-            Err(e) => Err(Error::Database(format!(
-                "failed to get config '{}': {}",
-                key, e
-            ))),
+            Err(e) => Err(Error::database(
+                format!("get config '{}'", key),
+                e.to_string(),
+            )),
         }
     }
 
@@ -371,24 +366,24 @@ impl SmolvmDb {
         let db_guard = self.db.read();
         let db = db_guard
             .as_ref()
-            .ok_or_else(|| Error::Database("database is closed".to_string()))?;
+            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
 
         let write_txn = db
             .begin_write()
-            .map_err(|e| Error::Database(format!("failed to begin write transaction: {}", e)))?;
+            .map_err(|e| Error::database("begin write transaction", e.to_string()))?;
 
         {
             let mut table = write_txn
                 .open_table(CONFIG_TABLE)
-                .map_err(|e| Error::Database(format!("failed to open config table: {}", e)))?;
+                .map_err(|e| Error::database("open config table", e.to_string()))?;
             table
                 .insert(key, value)
-                .map_err(|e| Error::Database(format!("failed to set config '{}': {}", key, e)))?;
+                .map_err(|e| Error::database(format!("set config '{}'", key), e.to_string()))?;
         }
 
         write_txn
             .commit()
-            .map_err(|e| Error::Database(format!("failed to commit config set: {}", e)))?;
+            .map_err(|e| Error::database("commit config set", e.to_string()))?;
 
         Ok(())
     }

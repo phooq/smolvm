@@ -58,10 +58,10 @@ pub fn parse_mounts(specs: &[String]) -> smolvm::Result<Vec<HostMount>> {
 fn parse_mount_spec(spec: &str) -> smolvm::Result<HostMount> {
     let parts: Vec<&str> = spec.split(':').collect();
     if parts.len() < 2 {
-        return Err(Error::Mount(format!(
-            "invalid volume specification '{}': expected host:container[:ro]",
-            spec
-        )));
+        return Err(Error::mount(
+            "parse volume spec",
+            format!("invalid format '{}': expected host:container[:ro]", spec),
+        ));
     }
 
     let host_path = PathBuf::from(parts[0]);
@@ -70,24 +70,27 @@ fn parse_mount_spec(spec: &str) -> smolvm::Result<HostMount> {
 
     // Validate host path exists
     if !host_path.exists() {
-        return Err(Error::Mount(format!(
-            "host path does not exist: {}",
-            host_path.display()
-        )));
+        return Err(Error::mount(
+            "validate host path",
+            format!("path does not exist: {}", host_path.display()),
+        ));
     }
 
     // Must be a directory (virtiofs limitation)
     if !host_path.is_dir() {
-        return Err(Error::Mount(format!(
-            "host path must be a directory (virtiofs limitation): {}",
-            host_path.display()
-        )));
+        return Err(Error::mount(
+            "validate host path",
+            format!(
+                "path must be a directory (virtiofs limitation): {}",
+                host_path.display()
+            ),
+        ));
     }
 
     // Canonicalize host path
     let host_path = host_path
         .canonicalize()
-        .map_err(|e| Error::Mount(format!("failed to resolve host path '{}': {}", parts[0], e)))?;
+        .map_err(|e| Error::mount("canonicalize host path", format!("'{}': {}", parts[0], e)))?;
 
     Ok(if read_only {
         HostMount::new(host_path, guest_path)

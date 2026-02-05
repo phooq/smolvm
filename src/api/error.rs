@@ -55,20 +55,21 @@ impl IntoResponse for ApiError {
 impl From<crate::error::Error> for ApiError {
     fn from(err: crate::error::Error) -> Self {
         match &err {
-            crate::error::Error::VmNotFound(name) => {
+            crate::error::Error::VmNotFound { name } => {
                 ApiError::NotFound(format!("sandbox not found: {}", name))
             }
             crate::error::Error::InvalidState { expected, actual } => ApiError::Conflict(format!(
                 "invalid state: expected {}, got {}",
                 expected, actual
             )),
-            crate::error::Error::AgentError(msg) => {
-                if msg.contains("not found") {
-                    ApiError::NotFound(msg.clone())
-                } else if msg.contains("already") {
-                    ApiError::Conflict(msg.clone())
+            // Handle structured Agent errors
+            crate::error::Error::Agent { reason, .. } => {
+                if reason.contains("not found") {
+                    ApiError::NotFound(reason.clone())
+                } else if reason.contains("already") {
+                    ApiError::Conflict(reason.clone())
                 } else {
-                    ApiError::Internal(msg.clone())
+                    ApiError::Internal(reason.clone())
                 }
             }
             _ => ApiError::Internal(err.to_string()),
@@ -107,15 +108,15 @@ mod tests {
     #[test]
     fn test_agent_error_keyword_detection() {
         // "not found" in message -> NotFound
-        let err = crate::error::Error::AgentError("container not found".into());
+        let err = crate::error::Error::agent("lookup", "container not found");
         assert!(matches!(ApiError::from(err), ApiError::NotFound(_)));
 
         // "already" in message -> Conflict
-        let err = crate::error::Error::AgentError("already exists".into());
+        let err = crate::error::Error::agent("create", "already exists");
         assert!(matches!(ApiError::from(err), ApiError::Conflict(_)));
 
         // No keywords -> Internal
-        let err = crate::error::Error::AgentError("connection refused".into());
+        let err = crate::error::Error::agent("connect", "connection refused");
         assert!(matches!(ApiError::from(err), ApiError::Internal(_)));
     }
 }

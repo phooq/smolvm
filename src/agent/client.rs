@@ -203,10 +203,10 @@ impl AgentClient {
     /// preventing indefinite hangs on read operations.
     fn set_read_timeout(&self, timeout: Duration) -> Result<()> {
         self.stream.set_read_timeout(Some(timeout)).map_err(|e| {
-            Error::AgentError(format!(
-                "failed to set socket read timeout to {:?}: {}",
-                timeout, e
-            ))
+            Error::agent(
+                "set read timeout",
+                format!("failed to set socket read timeout to {:?}: {}", timeout, e),
+            )
         })
     }
 
@@ -267,25 +267,25 @@ impl AgentClient {
     /// Internal connect implementation (single attempt).
     fn connect_once(socket_path: &Path) -> Result<Self> {
         let stream = UnixStream::connect(socket_path)
-            .map_err(|e| Error::AgentError(format!("failed to connect to agent: {}", e)))?;
+            .map_err(|e| Error::agent("connect to agent", e.to_string()))?;
 
         // Set timeouts - fail early if we can't set them to prevent indefinite hangs
         stream
             .set_read_timeout(Some(Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)))
             .map_err(|e| {
-                Error::AgentError(format!(
-                    "failed to set socket read timeout: {} (prevents indefinite hangs)",
-                    e
-                ))
+                Error::agent(
+                    "set read timeout",
+                    format!("{} (prevents indefinite hangs)", e),
+                )
             })?;
 
         stream
             .set_write_timeout(Some(Duration::from_secs(DEFAULT_WRITE_TIMEOUT_SECS)))
             .map_err(|e| {
-                Error::AgentError(format!(
-                    "failed to set socket write timeout: {} (prevents indefinite hangs)",
-                    e
-                ))
+                Error::agent(
+                    "set write timeout",
+                    format!("{} (prevents indefinite hangs)", e),
+                )
             })?;
 
         Ok(Self { stream })
@@ -294,10 +294,11 @@ impl AgentClient {
     /// Send a request and receive a response.
     fn request(&mut self, req: &AgentRequest) -> Result<AgentResponse> {
         // Encode and send request
-        let data = encode_message(req).map_err(|e| Error::AgentError(e.to_string()))?;
+        let data =
+            encode_message(req).map_err(|e| Error::agent("encode message", e.to_string()))?;
         self.stream
             .write_all(&data)
-            .map_err(|e| Error::AgentError(format!("write failed: {}", e)))?;
+            .map_err(|e| Error::agent("send message", e.to_string()))?;
 
         // Read response
         self.read_response()
@@ -309,26 +310,29 @@ impl AgentClient {
         let mut header = [0u8; 4];
         self.stream
             .read_exact(&mut header)
-            .map_err(|e| Error::AgentError(format!("read header failed: {}", e)))?;
+            .map_err(|e| Error::agent("read header", e.to_string()))?;
 
         let len = u32::from_be_bytes(header) as usize;
 
         // Validate frame size to prevent OOM from malicious/buggy responses
         if len > MAX_FRAME_SIZE as usize {
-            return Err(Error::AgentError(format!(
-                "frame too large: {} bytes (max: {} bytes)",
-                len, MAX_FRAME_SIZE
-            )));
+            return Err(Error::agent(
+                "validate frame",
+                format!(
+                    "frame too large: {} bytes (max: {} bytes)",
+                    len, MAX_FRAME_SIZE
+                ),
+            ));
         }
 
         // Read payload
         let mut buf = vec![0u8; len];
         self.stream
             .read_exact(&mut buf)
-            .map_err(|e| Error::AgentError(format!("read payload failed: {}", e)))?;
+            .map_err(|e| Error::agent("read payload", e.to_string()))?;
 
         // Parse response
-        serde_json::from_slice(&buf).map_err(|e| Error::AgentError(format!("parse failed: {}", e)))
+        serde_json::from_slice(&buf).map_err(|e| Error::agent("parse response", e.to_string()))
     }
 
     /// Ping the helper daemon.
@@ -337,8 +341,8 @@ impl AgentClient {
 
         match resp {
             AgentResponse::Pong { version } => Ok(version),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("ping", message)),
+            _ => Err(Error::agent("ping", "unexpected response type")),
         }
     }
 
@@ -430,11 +434,11 @@ impl AgentClient {
             platform: platform.map(String::from),
             auth: auth.cloned(),
         })
-        .map_err(|e| Error::AgentError(e.to_string()))?;
+        .map_err(|e| Error::agent("encode message", e.to_string()))?;
 
         self.stream
             .write_all(&data)
-            .map_err(|e| Error::AgentError(format!("write failed: {}", e)))?;
+            .map_err(|e| Error::agent("send request", e.to_string()))?;
 
         // Read responses - loop until we get Ok or Error (skip Progress)
         loop {
@@ -459,13 +463,13 @@ impl AgentClient {
                 }
                 AgentResponse::Ok { data: Some(data) } => {
                     return serde_json::from_value(data)
-                        .map_err(|e| Error::AgentError(e.to_string()));
+                        .map_err(|e| Error::agent("parse response", e.to_string()));
                 }
                 AgentResponse::Error { message, .. } => {
-                    return Err(Error::AgentError(message));
+                    return Err(Error::agent("pull image", message));
                 }
                 _ => {
-                    return Err(Error::AgentError("unexpected response".into()));
+                    return Err(Error::agent("pull image", "unexpected response type"));
                 }
             }
         }
@@ -516,13 +520,13 @@ impl AgentClient {
 
         match resp {
             AgentResponse::Ok { data: Some(data) } => {
-                let info: ImageInfo =
-                    serde_json::from_value(data).map_err(|e| Error::AgentError(e.to_string()))?;
+                let info: ImageInfo = serde_json::from_value(data)
+                    .map_err(|e| Error::agent("parse response", e.to_string()))?;
                 Ok(Some(info))
             }
             AgentResponse::Error { code, .. } if code.as_deref() == Some("NOT_FOUND") => Ok(None),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("query image", message)),
+            _ => Err(Error::agent("query image", "unexpected response type")),
         }
     }
 
@@ -531,11 +535,10 @@ impl AgentClient {
         let resp = self.request(&AgentRequest::ListImages)?;
 
         match resp {
-            AgentResponse::Ok { data: Some(data) } => {
-                serde_json::from_value(data).map_err(|e| Error::AgentError(e.to_string()))
-            }
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Ok { data: Some(data) } => serde_json::from_value(data)
+                .map_err(|e| Error::agent("parse response", e.to_string())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("list images", message)),
+            _ => Err(Error::agent("list images", "unexpected response type")),
         }
     }
 
@@ -552,8 +555,8 @@ impl AgentClient {
                 let freed = data["freed_bytes"].as_u64().unwrap_or(0);
                 Ok(freed)
             }
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("garbage collect", message)),
+            _ => Err(Error::agent("garbage collect", "unexpected response type")),
         }
     }
 
@@ -570,11 +573,10 @@ impl AgentClient {
         })?;
 
         match resp {
-            AgentResponse::Ok { data: Some(data) } => {
-                serde_json::from_value(data).map_err(|e| Error::AgentError(e.to_string()))
-            }
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Ok { data: Some(data) } => serde_json::from_value(data)
+                .map_err(|e| Error::agent("parse response", e.to_string())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("prepare overlay", message)),
+            _ => Err(Error::agent("prepare overlay", "unexpected response type")),
         }
     }
 
@@ -586,8 +588,8 @@ impl AgentClient {
 
         match resp {
             AgentResponse::Ok { .. } => Ok(()),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("cleanup overlay", message)),
+            _ => Err(Error::agent("cleanup overlay", "unexpected response type")),
         }
     }
 
@@ -597,8 +599,8 @@ impl AgentClient {
 
         match resp {
             AgentResponse::Ok { .. } => Ok(()),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("format storage", message)),
+            _ => Err(Error::agent("format storage", "unexpected response type")),
         }
     }
 
@@ -607,11 +609,10 @@ impl AgentClient {
         let resp = self.request(&AgentRequest::StorageStatus)?;
 
         match resp {
-            AgentResponse::Ok { data: Some(data) } => {
-                serde_json::from_value(data).map_err(|e| Error::AgentError(e.to_string()))
-            }
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Ok { data: Some(data) } => serde_json::from_value(data)
+                .map_err(|e| Error::agent("parse response", e.to_string())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("storage status", message)),
+            _ => Err(Error::agent("storage status", "unexpected response type")),
         }
     }
 
@@ -624,8 +625,8 @@ impl AgentClient {
 
         match resp {
             AgentResponse::Ok { data: Some(data) } => Ok(data),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("network test", message)),
+            _ => Err(Error::agent("network test", "unexpected response type")),
         }
     }
 
@@ -646,10 +647,10 @@ impl AgentClient {
             .set_read_timeout(Some(Duration::from_secs(STATUS_CHECK_TIMEOUT_SECS)));
 
         let data = encode_message(&AgentRequest::Shutdown)
-            .map_err(|e| Error::AgentError(e.to_string()))?;
+            .map_err(|e| Error::agent("encode message", e.to_string()))?;
         self.stream
             .write_all(&data)
-            .map_err(|e| Error::AgentError(format!("failed to send shutdown: {}", e)))?;
+            .map_err(|e| Error::agent("send shutdown", e.to_string()))?;
 
         // Wait for acknowledgment - this confirms sync() completed.
         // If the agent crashes or times out, we proceed anyway since
@@ -733,8 +734,8 @@ impl AgentClient {
                 stdout,
                 stderr,
             } => Ok((exit_code, stdout, stderr)),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("vm exec", message)),
+            _ => Err(Error::agent("vm exec", "unexpected response type")),
         }
     }
 
@@ -784,10 +785,13 @@ impl AgentClient {
         match started {
             AgentResponse::Started => {}
             AgentResponse::Error { message, .. } => {
-                return Err(Error::AgentError(message));
+                return Err(Error::agent("vm exec interactive", message));
             }
             _ => {
-                return Err(Error::AgentError("expected Started response".into()));
+                return Err(Error::agent(
+                    "vm exec interactive",
+                    "expected Started response",
+                ));
             }
         }
 
@@ -807,7 +811,7 @@ impl AgentClient {
                     return Ok(exit_code);
                 }
                 AgentResponse::Error { message, .. } => {
-                    return Err(Error::AgentError(message));
+                    return Err(Error::agent("vm exec interactive", message));
                 }
                 _ => {
                     // Ignore unexpected responses
@@ -916,8 +920,8 @@ impl AgentClient {
                 stdout,
                 stderr,
             } => Ok((exit_code, stdout, stderr)),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("run command", message)),
+            _ => Err(Error::agent("run command", "unexpected response type")),
         }
     }
 
@@ -959,10 +963,10 @@ impl AgentClient {
         match started {
             AgentResponse::Started => {}
             AgentResponse::Error { message, .. } => {
-                return Err(Error::AgentError(message));
+                return Err(Error::agent("run interactive", message));
             }
             _ => {
-                return Err(Error::AgentError("expected Started response".into()));
+                return Err(Error::agent("run interactive", "expected Started response"));
             }
         }
 
@@ -982,7 +986,7 @@ impl AgentClient {
                     return Ok(exit_code);
                 }
                 AgentResponse::Error { message, .. } => {
-                    return Err(Error::AgentError(message));
+                    return Err(Error::agent("run interactive", message));
                 }
                 _ => {
                     // Ignore unexpected responses
@@ -1040,11 +1044,10 @@ impl AgentClient {
         })?;
 
         match resp {
-            AgentResponse::Ok { data: Some(data) } => {
-                serde_json::from_value(data).map_err(|e| Error::AgentError(e.to_string()))
-            }
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Ok { data: Some(data) } => serde_json::from_value(data)
+                .map_err(|e| Error::agent("parse response", e.to_string())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("create container", message)),
+            _ => Err(Error::agent("create container", "unexpected response type")),
         }
     }
 
@@ -1056,8 +1059,8 @@ impl AgentClient {
 
         match resp {
             AgentResponse::Ok { .. } => Ok(()),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("start container", message)),
+            _ => Err(Error::agent("start container", "unexpected response type")),
         }
     }
 
@@ -1075,8 +1078,8 @@ impl AgentClient {
 
         match resp {
             AgentResponse::Ok { .. } => Ok(()),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("stop container", message)),
+            _ => Err(Error::agent("stop container", "unexpected response type")),
         }
     }
 
@@ -1094,8 +1097,8 @@ impl AgentClient {
 
         match resp {
             AgentResponse::Ok { .. } => Ok(()),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("delete container", message)),
+            _ => Err(Error::agent("delete container", "unexpected response type")),
         }
     }
 
@@ -1104,12 +1107,11 @@ impl AgentClient {
         let resp = self.request(&AgentRequest::ListContainers)?;
 
         match resp {
-            AgentResponse::Ok { data: Some(data) } => {
-                serde_json::from_value(data).map_err(|e| Error::AgentError(e.to_string()))
-            }
+            AgentResponse::Ok { data: Some(data) } => serde_json::from_value(data)
+                .map_err(|e| Error::agent("parse response", e.to_string())),
             AgentResponse::Ok { data: None } => Ok(Vec::new()),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("list containers", message)),
+            _ => Err(Error::agent("list containers", "unexpected response type")),
         }
     }
 
@@ -1164,8 +1166,8 @@ impl AgentClient {
                 stdout,
                 stderr,
             } => Ok((exit_code, stdout, stderr)),
-            AgentResponse::Error { message, .. } => Err(Error::AgentError(message)),
-            _ => Err(Error::AgentError("unexpected response".into())),
+            AgentResponse::Error { message, .. } => Err(Error::agent("exec command", message)),
+            _ => Err(Error::agent("exec command", "unexpected response type")),
         }
     }
 
@@ -1218,10 +1220,13 @@ impl AgentClient {
         match started {
             AgentResponse::Started => {}
             AgentResponse::Error { message, .. } => {
-                return Err(Error::AgentError(message));
+                return Err(Error::agent("exec interactive", message));
             }
             _ => {
-                return Err(Error::AgentError("expected Started response".into()));
+                return Err(Error::agent(
+                    "exec interactive",
+                    "expected Started response",
+                ));
             }
         }
 
@@ -1241,7 +1246,7 @@ impl AgentClient {
                     return Ok(exit_code);
                 }
                 AgentResponse::Error { message, .. } => {
-                    return Err(Error::AgentError(message));
+                    return Err(Error::agent("exec interactive", message));
                 }
                 _ => {
                     // Ignore unexpected responses
@@ -1264,7 +1269,7 @@ impl AgentClient {
     /// Low-level send without waiting for response.
     fn send(&mut self, request: &AgentRequest) -> Result<()> {
         let json = serde_json::to_vec(request)
-            .map_err(|e| Error::AgentError(format!("serialize error: {}", e)))?;
+            .map_err(|e| Error::agent("serialize request", e.to_string()))?;
         let len = json.len() as u32;
 
         self.stream.write_all(&len.to_be_bytes())?;
@@ -1282,17 +1287,20 @@ impl AgentClient {
 
         // Validate frame size to prevent OOM from malicious/buggy responses
         if len > MAX_FRAME_SIZE as usize {
-            return Err(Error::AgentError(format!(
-                "frame too large: {} bytes (max: {} bytes)",
-                len, MAX_FRAME_SIZE
-            )));
+            return Err(Error::agent(
+                "validate frame",
+                format!(
+                    "frame too large: {} bytes (max: {} bytes)",
+                    len, MAX_FRAME_SIZE
+                ),
+            ));
         }
 
         let mut buf = vec![0u8; len];
         self.stream.read_exact(&mut buf)?;
 
         let resp: AgentResponse = serde_json::from_slice(&buf)
-            .map_err(|e| Error::AgentError(format!("deserialize error: {}", e)))?;
+            .map_err(|e| Error::agent("deserialize response", e.to_string()))?;
         Ok(resp)
     }
 }
