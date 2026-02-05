@@ -163,17 +163,25 @@ pub fn launch_agent_vm(
             tracing::debug!("configured vsock without TSI networking");
         }
 
-        // Add storage disk
+        // Add storage disk (critical - VM needs storage to function)
         let block_id = CString::new("storage").expect("static string");
         let disk_path = path_to_cstring(storage_disk.path())?;
         if krun_add_disk2(ctx, block_id.as_ptr(), disk_path.as_ptr(), 0, false) < 0 {
-            tracing::warn!("failed to add storage disk");
+            krun_free_ctx(ctx);
+            return Err(Error::agent(
+                "add storage disk",
+                "krun_add_disk2 failed - VM cannot function without storage",
+            ));
         }
 
-        // Add vsock port for control channel (host listens)
+        // Add vsock port for control channel (critical - host-guest communication)
         let socket_path = path_to_cstring(vsock_socket)?;
         if krun_add_vsock_port2(ctx, ports::AGENT_CONTROL, socket_path.as_ptr(), true) < 0 {
-            tracing::warn!("failed to add vsock port");
+            krun_free_ctx(ctx);
+            return Err(Error::agent(
+                "add vsock port",
+                "krun_add_vsock_port2 failed - control channel required for host-guest communication",
+            ));
         }
 
         // Set console output if specified
@@ -201,10 +209,14 @@ pub fn launch_agent_vm(
             );
 
             if krun_add_virtiofs(ctx, tag.as_ptr(), host_path.as_ptr()) < 0 {
-                tracing::warn!(
-                    host = %mount.source.display(),
-                    "failed to add virtiofs mount"
-                );
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "add virtiofs mount",
+                    format!(
+                        "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
+                        mount.source.display()
+                    ),
+                ));
             }
         }
 
