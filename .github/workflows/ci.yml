@@ -157,6 +157,8 @@ jobs:
           int krun_set_port_map(int ctx, char** map) { return -1; }
           int krun_add_vsock_port(int ctx, int port, const char* path) { return -1; }
           int krun_add_vsock_port2(int ctx, int port, const char* path, int flags) { return -1; }
+          int krun_disable_implicit_vsock(int ctx) { return -1; }
+          int krun_add_vsock(int ctx, int tsi_features) { return -1; }
           int krun_set_passt_fd(int ctx, int fd) { return -1; }
           int krun_add_virtiofs(int ctx, const char* tag, const char* path) { return -1; }
           int krun_add_virtiofs2(int ctx, const char* tag, const char* path, int flags) { return -1; }
