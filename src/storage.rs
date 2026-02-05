@@ -26,6 +26,40 @@ pub const DEFAULT_STORAGE_SIZE_GB: u64 = 20;
 /// Storage disk filename.
 pub const STORAGE_DISK_FILENAME: &str = "storage.raw";
 
+/// Common search paths for e2fsprogs tools (mkfs.ext4, e2fsck, resize2fs).
+const E2FSPROGS_PATH_PREFIXES: &[&str] = &[
+    "/opt/homebrew/opt/e2fsprogs/sbin", // macOS ARM (Homebrew)
+    "/usr/local/opt/e2fsprogs/sbin",    // macOS Intel (Homebrew)
+    "/opt/homebrew/sbin",               // macOS ARM (Homebrew alt)
+    "/usr/local/sbin",                  // macOS Intel (Homebrew alt)
+    "/sbin",                            // Linux
+    "/usr/sbin",                        // Linux alt
+];
+
+/// Find an e2fsprogs tool by name (e.g., "mkfs.ext4", "e2fsck", "resize2fs").
+///
+/// Searches common installation paths, then falls back to PATH lookup.
+fn find_e2fsprogs_tool(name: &str) -> Option<String> {
+    // Check known paths first
+    for prefix in E2FSPROGS_PATH_PREFIXES {
+        let path = format!("{}/{}", prefix, name);
+        if std::path::Path::new(&path).exists() {
+            return Some(path);
+        }
+    }
+
+    // Fall back to PATH lookup
+    if std::process::Command::new(name)
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        return Some(name.to_string());
+    }
+
+    None
+}
+
 /// Disk format version info (stored at `/.smolvm/version.json` in ext4 disk).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiskVersion {
@@ -256,6 +290,8 @@ impl StorageDisk {
         file.sync_all()
             .map_err(|e| Error::Storage(format!("failed to sync storage: {}", e)))?;
 
+        // Filesystem resize happens inside the VM (guest runs resize2fs on boot).
+
         // Mark as formatted
         self.mark_formatted()?;
 
@@ -263,48 +299,25 @@ impl StorageDisk {
         Ok(())
     }
 
-    /// Format the disk using mkfs.ext4.
+    /// Format the disk using mkfs.ext4 (fallback when no template available).
     ///
-    /// This requires e2fsprogs to be installed on the host.
+    /// This is only used if the pre-formatted storage template is missing.
+    /// Requires e2fsprogs to be installed on the host.
     fn format_with_mkfs(&self) -> Result<()> {
         tracing::info!(path = %self.path.display(), "formatting disk with mkfs.ext4");
 
-        // Find mkfs.ext4 binary
-        let mkfs_paths = [
-            "/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4", // macOS ARM (Homebrew)
-            "/usr/local/opt/e2fsprogs/sbin/mkfs.ext4",    // macOS Intel (Homebrew)
-            "/opt/homebrew/sbin/mkfs.ext4",               // macOS ARM (Homebrew alt)
-            "/usr/local/sbin/mkfs.ext4",                  // macOS Intel (Homebrew alt)
-            "/sbin/mkfs.ext4",                            // Linux
-            "/usr/sbin/mkfs.ext4",                        // Linux alt
-            "mkfs.ext4",                                  // PATH lookup
-        ];
-
-        let mkfs_path = mkfs_paths
-            .iter()
-            .find(|p| {
-                if p.contains('/') {
-                    std::path::Path::new(p).exists()
-                } else {
-                    // Check if command exists in PATH
-                    std::process::Command::new(p)
-                        .arg("--version")
-                        .output()
-                        .is_ok()
-                }
-            })
-            .ok_or_else(|| {
-                let hint = if Os::current().is_macos() {
-                    "On macOS, install with: brew install e2fsprogs"
-                } else {
-                    "On Linux, install with: apt install e2fsprogs (or equivalent for your distro)"
-                };
-                Error::Storage(format!(
-                    "mkfs.ext4 not found - required for storage disk formatting.\n  {}\n  \
-                    After installing, run your smolvm command again.",
-                    hint
-                ))
-            })?;
+        let mkfs_path = find_e2fsprogs_tool("mkfs.ext4").ok_or_else(|| {
+            let hint = if Os::current().is_macos() {
+                "On macOS, install with: brew install e2fsprogs"
+            } else {
+                "On Linux, install with: apt install e2fsprogs (or equivalent for your distro)"
+            };
+            Error::Storage(format!(
+                "mkfs.ext4 not found - required for storage disk formatting.\n  {}\n  \
+                 After installing, run your smolvm command again.",
+                hint
+            ))
+        })?;
 
         let path_str = self
             .path

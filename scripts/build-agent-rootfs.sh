@@ -124,6 +124,13 @@ if [ -b /dev/vda ]; then
         mount /dev/vda /storage
     fi
 
+    # Resize filesystem to fill disk (online resize, runs once)
+    # Host copies 512MB template and extends sparse file to 20GB.
+    # We resize the ext4 filesystem here to use all available space.
+    if command -v resize2fs >/dev/null 2>&1; then
+        resize2fs /dev/vda 2>/dev/null || true
+    fi
+
     # Create directory structure (fast, only if missing)
     mkdir -p /storage/layers /storage/configs /storage/manifests /storage/overlays
     # Container runtime directories for crun
