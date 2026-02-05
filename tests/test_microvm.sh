@@ -257,6 +257,82 @@ test_db_delete_removes_from_db() {
 }
 
 # =============================================================================
+# Network
+# Tests verify that network access is disabled by default and works when enabled.
+# Note: libkrun uses TSI (Transparent Socket Impersonation) which routes network
+# traffic through the host. DNS works reliably; direct HTTP may have limitations.
+# =============================================================================
+
+test_microvm_network_disabled_by_default() {
+    local vm_name="net-disabled-test-$$"
+
+    # Clean up any existing
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create VM without --net (network disabled by default)
+    $SMOLVM microvm create "$vm_name" 2>&1 || return 1
+    $SMOLVM microvm start "$vm_name" 2>&1 || { $SMOLVM microvm delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # DNS resolution should fail when network is disabled
+    local exit_code=0
+    $SMOLVM microvm exec --name "$vm_name" -- nslookup cloudflare.com 2>&1 || exit_code=$?
+
+    # Clean up
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Should fail (non-zero exit code) because network is disabled
+    [[ $exit_code -ne 0 ]]
+}
+
+test_microvm_network_dns_resolution() {
+    local vm_name="net-dns-test-$$"
+
+    # Clean up any existing
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create VM with --net (network enabled)
+    $SMOLVM microvm create "$vm_name" --net 2>&1 || return 1
+    $SMOLVM microvm start "$vm_name" 2>&1 || { $SMOLVM microvm delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Test DNS resolution
+    local output exit_code=0
+    output=$($SMOLVM microvm exec --name "$vm_name" -- nslookup cloudflare.com 2>&1) || exit_code=$?
+
+    # Clean up
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Should succeed and contain resolved address info
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
+}
+
+test_microvm_network_multiple_dns_lookups() {
+    local vm_name="net-multi-dns-test-$$"
+
+    # Clean up any existing
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create VM with --net (network enabled)
+    $SMOLVM microvm create "$vm_name" --net 2>&1 || return 1
+    $SMOLVM microvm start "$vm_name" 2>&1 || { $SMOLVM microvm delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Test multiple DNS lookups
+    local output exit_code=0
+    output=$($SMOLVM microvm exec --name "$vm_name" -- sh -c "nslookup google.com && nslookup github.com" 2>&1) || exit_code=$?
+
+    # Clean up
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Should succeed and contain addresses for both
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -273,5 +349,8 @@ run_test "Exec when stopped fails" test_microvm_exec_when_stopped || true
 run_test "DB persistence across restart" test_db_persistence_across_restart || true
 run_test "DB VM state update" test_db_vm_state_update || true
 run_test "DB delete removes from database" test_db_delete_removes_from_db || true
+run_test "Network: disabled by default" test_microvm_network_disabled_by_default || true
+run_test "Network: DNS resolution" test_microvm_network_dns_resolution || true
+run_test "Network: multiple DNS lookups" test_microvm_network_multiple_dns_lookups || true
 
 print_summary "MicroVM Tests"

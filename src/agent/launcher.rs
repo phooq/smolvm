@@ -99,21 +99,24 @@ pub fn launch_agent_vm(
             return Err(Error::AgentError("failed to set root filesystem".into()));
         }
 
-        // Enable TSI (Transparent Socket Impersonation) networking when requested.
+        // Configure TSI (Transparent Socket Impersonation) networking.
         // TSI allows the guest to access the network via the host's network stack
         // by intercepting socket system calls and proxying them through vsock.
         //
         // Note: TSI supports TCP/UDP but not raw sockets (e.g., ICMP/ping).
         //
-        // The default implicit vsock uses heuristics that may not enable TSI,
-        // so we explicitly configure it when network access is needed.
-        if resources.network || !port_mappings.is_empty() {
-            // Disable implicit vsock to take explicit control
-            if krun_disable_implicit_vsock(ctx) < 0 {
-                krun_free_ctx(ctx);
-                return Err(Error::AgentError("failed to disable implicit vsock".into()));
-            }
+        // We must explicitly disable the implicit vsock and add our own vsock
+        // to control whether network access is enabled or disabled.
+        // Without this, libkrun's implicit vsock uses heuristics that may
+        // inadvertently enable network access.
 
+        // Always disable implicit vsock to take explicit control
+        if krun_disable_implicit_vsock(ctx) < 0 {
+            krun_free_ctx(ctx);
+            return Err(Error::AgentError("failed to disable implicit vsock".into()));
+        }
+
+        if resources.network || !port_mappings.is_empty() {
             // Add vsock with TSI HIJACK_INET flag to enable network access
             if krun_add_vsock(ctx, KRUN_TSI_HIJACK_INET) < 0 {
                 krun_free_ctx(ctx);
@@ -142,6 +145,16 @@ pub fn launch_agent_vm(
                 port_count = port_mappings.len(),
                 "configured TSI networking with HIJACK_INET"
             );
+        } else {
+            // Add vsock without TSI features - this is needed for the control
+            // channel but doesn't enable network interception.
+            // Using 0 for tsi_features means no network interception.
+            if krun_add_vsock(ctx, 0) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::AgentError("failed to add vsock".into()));
+            }
+
+            tracing::debug!("configured vsock without TSI networking");
         }
 
         // Add storage disk

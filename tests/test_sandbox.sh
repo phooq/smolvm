@@ -295,6 +295,41 @@ test_sandbox_command_not_found() {
 }
 
 # =============================================================================
+# Network
+# Tests verify that network access is disabled by default and works when enabled.
+# Note: libkrun uses TSI (Transparent Socket Impersonation) which routes network
+# traffic through the host. DNS works reliably; direct HTTP may have limitations.
+# =============================================================================
+
+test_network_disabled_by_default() {
+    # Without --net, network should be disabled
+    # DNS resolution should fail when network is disabled
+    local exit_code=0
+    $SMOLVM sandbox run alpine:latest -- nslookup cloudflare.com 2>&1 || exit_code=$?
+
+    # Should fail (non-zero exit code) because network is disabled
+    [[ $exit_code -ne 0 ]]
+}
+
+test_network_dns_resolution() {
+    # With --net, DNS resolution should work
+    local output exit_code=0
+    output=$($SMOLVM sandbox run --net alpine:latest -- nslookup cloudflare.com 2>&1) || exit_code=$?
+
+    # Should succeed and contain resolved address info
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
+}
+
+test_network_multiple_dns_lookups() {
+    # With --net, multiple DNS lookups should work
+    local output exit_code=0
+    output=$($SMOLVM sandbox run --net alpine:latest -- sh -c "nslookup google.com && nslookup github.com" 2>&1) || exit_code=$?
+
+    # Should succeed and contain addresses for both
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"Address"* ]]
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -316,5 +351,8 @@ run_test "Command not found fails" test_sandbox_command_not_found || true
 run_test "TSI: overlayfs rootfs write works" test_tsi_overlayfs_rootfs_write_works || true
 run_test "TSI: virtiofs mount write works" test_tsi_virtiofs_mount_write_works || true
 run_test "TSI: coding agent workflow" test_tsi_coding_agent_workflow || true
+run_test "Network: disabled by default" test_network_disabled_by_default || true
+run_test "Network: DNS resolution" test_network_dns_resolution || true
+run_test "Network: multiple DNS lookups" test_network_multiple_dns_lookups || true
 
 print_summary "Sandbox Tests"
