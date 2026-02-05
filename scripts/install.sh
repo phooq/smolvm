@@ -312,6 +312,12 @@ install_smolvm() {
     if [[ -f "$prefix/smolvm-bin" ]]; then
         rm -f "$prefix/smolvm-bin"
     fi
+    if [[ -f "$prefix/smolvm-stub" ]]; then
+        rm -f "$prefix/smolvm-stub"
+    fi
+    if [[ -f "$prefix/storage-template.ext4" ]]; then
+        rm -f "$prefix/storage-template.ext4"
+    fi
 
     # Copy files
     cp -r "$extracted_dir/lib" "$prefix/"
@@ -319,6 +325,17 @@ install_smolvm() {
     cp "$extracted_dir/smolvm-bin" "$prefix/"
     chmod +x "$prefix/smolvm"
     chmod +x "$prefix/smolvm-bin"
+
+    # Copy smolvm-stub if present (needed for 'smolvm pack' command)
+    if [[ -f "$extracted_dir/smolvm-stub" ]]; then
+        cp "$extracted_dir/smolvm-stub" "$prefix/"
+        chmod +x "$prefix/smolvm-stub"
+    fi
+
+    # Copy storage template if present
+    if [[ -f "$extracted_dir/storage-template.ext4" ]]; then
+        cp "$extracted_dir/storage-template.ext4" "$prefix/"
+    fi
 
     # Install agent-rootfs to data directory
     local data_dir
