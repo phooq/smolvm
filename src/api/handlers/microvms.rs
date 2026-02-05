@@ -37,6 +37,7 @@ use crate::api::types::{
     MicrovmExecRequest, MicrovmInfo,
 };
 use crate::config::{RecordState, VmRecord};
+use crate::mount::MountBinding;
 
 /// Maximum microvm name length.
 ///
@@ -150,12 +151,15 @@ pub async fn create_microvm(
     let cpus = req.cpus;
     let mem = req.mem;
 
-    // Convert mounts to storage format
-    let mounts: Vec<(String, String, bool)> = req
-        .mounts
-        .iter()
-        .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
-        .collect();
+    // Validate and convert mounts to storage format
+    let mut mounts: Vec<(String, String, bool)> = Vec::with_capacity(req.mounts.len());
+    for mount_spec in &req.mounts {
+        // Validate mount paths (checks: absolute paths, source exists, source is directory)
+        let binding =
+            MountBinding::new(&mount_spec.source, &mount_spec.target, mount_spec.readonly)
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        mounts.push(binding.to_tuple());
+    }
 
     // Convert ports to storage format
     let ports: Vec<(u16, u16)> = req.ports.iter().map(|p| (p.host, p.guest)).collect();
