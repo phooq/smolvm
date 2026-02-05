@@ -6,6 +6,7 @@
 mod client;
 mod launcher;
 mod manager;
+pub mod terminal;
 
 pub use crate::vm::config::HostMount;
 pub use client::{AgentClient, PullOptions, RunConfig};
