@@ -196,6 +196,45 @@ pub struct AgentClient {
     stream: UnixStream,
 }
 
+// ============================================================================
+// Response match helpers
+// ============================================================================
+
+/// Extract typed data from an `Ok` response.
+fn expect_data<T: serde::de::DeserializeOwned>(resp: AgentResponse, op: &str) -> Result<T> {
+    match resp {
+        AgentResponse::Ok {
+            data: Some(data), ..
+        } => {
+            serde_json::from_value(data).map_err(|e| Error::agent("parse response", e.to_string()))
+        }
+        AgentResponse::Error { message, .. } => Err(Error::agent(op, message)),
+        _ => Err(Error::agent(op, "unexpected response type")),
+    }
+}
+
+/// Expect an `Ok` response, ignoring any data.
+fn expect_ok(resp: AgentResponse, op: &str) -> Result<()> {
+    match resp {
+        AgentResponse::Ok { .. } => Ok(()),
+        AgentResponse::Error { message, .. } => Err(Error::agent(op, message)),
+        _ => Err(Error::agent(op, "unexpected response type")),
+    }
+}
+
+/// Extract exit code, stdout, stderr from a `Completed` response.
+fn expect_completed(resp: AgentResponse, op: &str) -> Result<(i32, String, String)> {
+    match resp {
+        AgentResponse::Completed {
+            exit_code,
+            stdout,
+            stderr,
+        } => Ok((exit_code, stdout, stderr)),
+        AgentResponse::Error { message, .. } => Err(Error::agent(op, message)),
+        _ => Err(Error::agent(op, "unexpected response type")),
+    }
+}
+
 impl AgentClient {
     /// Set socket read timeout, returning an error if it fails.
     ///
@@ -301,38 +340,7 @@ impl AgentClient {
             .map_err(|e| Error::agent("send message", e.to_string()))?;
 
         // Read response
-        self.read_response()
-    }
-
-    /// Read a response from the stream.
-    fn read_response(&mut self) -> Result<AgentResponse> {
-        // Read length header
-        let mut header = [0u8; 4];
-        self.stream
-            .read_exact(&mut header)
-            .map_err(|e| Error::agent("read header", e.to_string()))?;
-
-        let len = u32::from_be_bytes(header) as usize;
-
-        // Validate frame size to prevent OOM from malicious/buggy responses
-        if len > MAX_FRAME_SIZE as usize {
-            return Err(Error::agent(
-                "validate frame",
-                format!(
-                    "frame too large: {} bytes (max: {} bytes)",
-                    len, MAX_FRAME_SIZE
-                ),
-            ));
-        }
-
-        // Read payload
-        let mut buf = vec![0u8; len];
-        self.stream
-            .read_exact(&mut buf)
-            .map_err(|e| Error::agent("read payload", e.to_string()))?;
-
-        // Parse response
-        serde_json::from_slice(&buf).map_err(|e| Error::agent("parse response", e.to_string()))
+        self.receive()
     }
 
     /// Ping the helper daemon.
@@ -442,7 +450,7 @@ impl AgentClient {
 
         // Read responses - loop until we get Ok or Error (skip Progress)
         loop {
-            let resp = self.read_response();
+            let resp = self.receive();
 
             // Reset timeout on final response
             if !matches!(resp, Ok(AgentResponse::Progress { .. })) {
@@ -533,13 +541,7 @@ impl AgentClient {
     /// List all cached images.
     pub fn list_images(&mut self) -> Result<Vec<ImageInfo>> {
         let resp = self.request(&AgentRequest::ListImages)?;
-
-        match resp {
-            AgentResponse::Ok { data: Some(data) } => serde_json::from_value(data)
-                .map_err(|e| Error::agent("parse response", e.to_string())),
-            AgentResponse::Error { message, .. } => Err(Error::agent("list images", message)),
-            _ => Err(Error::agent("list images", "unexpected response type")),
-        }
+        expect_data(resp, "list images")
     }
 
     /// Run garbage collection.
@@ -571,13 +573,7 @@ impl AgentClient {
             image: image.to_string(),
             workload_id: workload_id.to_string(),
         })?;
-
-        match resp {
-            AgentResponse::Ok { data: Some(data) } => serde_json::from_value(data)
-                .map_err(|e| Error::agent("parse response", e.to_string())),
-            AgentResponse::Error { message, .. } => Err(Error::agent("prepare overlay", message)),
-            _ => Err(Error::agent("prepare overlay", "unexpected response type")),
-        }
+        expect_data(resp, "prepare overlay")
     }
 
     /// Clean up an overlay filesystem.
@@ -585,35 +581,19 @@ impl AgentClient {
         let resp = self.request(&AgentRequest::CleanupOverlay {
             workload_id: workload_id.to_string(),
         })?;
-
-        match resp {
-            AgentResponse::Ok { .. } => Ok(()),
-            AgentResponse::Error { message, .. } => Err(Error::agent("cleanup overlay", message)),
-            _ => Err(Error::agent("cleanup overlay", "unexpected response type")),
-        }
+        expect_ok(resp, "cleanup overlay")
     }
 
     /// Format the storage disk.
     pub fn format_storage(&mut self) -> Result<()> {
         let resp = self.request(&AgentRequest::FormatStorage)?;
-
-        match resp {
-            AgentResponse::Ok { .. } => Ok(()),
-            AgentResponse::Error { message, .. } => Err(Error::agent("format storage", message)),
-            _ => Err(Error::agent("format storage", "unexpected response type")),
-        }
+        expect_ok(resp, "format storage")
     }
 
     /// Get storage status.
     pub fn storage_status(&mut self) -> Result<StorageStatus> {
         let resp = self.request(&AgentRequest::StorageStatus)?;
-
-        match resp {
-            AgentResponse::Ok { data: Some(data) } => serde_json::from_value(data)
-                .map_err(|e| Error::agent("parse response", e.to_string())),
-            AgentResponse::Error { message, .. } => Err(Error::agent("storage status", message)),
-            _ => Err(Error::agent("storage status", "unexpected response type")),
-        }
+        expect_data(resp, "storage status")
     }
 
     /// Test network connectivity directly from the agent (not via chroot).
@@ -659,7 +639,7 @@ impl AgentClient {
         // Note: EAGAIN (os error 35) is common here because the VM may be
         // torn down before the response arrives - this is benign since
         // sync() has already completed by that point.
-        match self.read_response() {
+        match self.receive() {
             Ok(_) => {
                 tracing::debug!("agent acknowledged shutdown (sync complete)");
             }
@@ -728,41 +708,14 @@ impl AgentClient {
         // Reset timeout (warning-only since operation completed)
         self.reset_read_timeout();
 
-        match resp {
-            AgentResponse::Completed {
-                exit_code,
-                stdout,
-                stderr,
-            } => Ok((exit_code, stdout, stderr)),
-            AgentResponse::Error { message, .. } => Err(Error::agent("vm exec", message)),
-            _ => Err(Error::agent("vm exec", "unexpected response type")),
-        }
+        expect_completed(resp, "vm exec")
     }
 
-    /// Execute a command directly in the VM with interactive I/O.
+    /// Run an interactive I/O session.
     ///
-    /// This method streams output directly to stdout/stderr and forwards stdin.
-    /// It blocks until the command exits.
-    ///
-    /// # Arguments
-    ///
-    /// * `command` - Command and arguments
-    /// * `env` - Environment variables
-    /// * `workdir` - Working directory in the VM
-    /// * `timeout` - Optional timeout duration
-    /// * `tty` - Whether to allocate a PTY
-    ///
-    /// # Returns
-    ///
-    /// The exit code of the command
-    pub fn vm_exec_interactive(
-        &mut self,
-        command: Vec<String>,
-        env: Vec<(String, String)>,
-        workdir: Option<String>,
-        timeout: Option<Duration>,
-        tty: bool,
-    ) -> Result<i32> {
+    /// Sends `request`, waits for `Started`, then runs the poll loop
+    /// streaming stdout/stderr and forwarding stdin until `Exited`.
+    fn interactive_session(&mut self, request: AgentRequest, tty: bool, op: &str) -> Result<i32> {
         use crate::agent::terminal::{
             check_sigwinch, get_terminal_size, install_sigwinch_handler, poll_io, stdin_is_tty,
             NonBlockingStdin, RawModeGuard,
@@ -776,30 +729,17 @@ impl AgentClient {
             .set_read_timeout(None)
             .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
 
-        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
-
-        // Send the vm_exec request with interactive mode
-        self.send(&AgentRequest::VmExec {
-            command,
-            env,
-            workdir,
-            timeout_ms,
-            interactive: true,
-            tty,
-        })?;
+        self.send(&request)?;
 
         // Wait for Started response
         let started = self.receive()?;
         match started {
             AgentResponse::Started => {}
             AgentResponse::Error { message, .. } => {
-                return Err(Error::agent("vm exec interactive", message));
+                return Err(Error::agent(op, message));
             }
             _ => {
-                return Err(Error::agent(
-                    "vm exec interactive",
-                    "expected Started response",
-                ));
+                return Err(Error::agent(op, "expected Started response"));
             }
         }
 
@@ -860,7 +800,7 @@ impl AgentClient {
                         break exit_code;
                     }
                     Ok(AgentResponse::Error { message, .. }) => {
-                        return Err(Error::agent("vm exec interactive", message));
+                        return Err(Error::agent(op, message));
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -890,6 +830,30 @@ impl AgentClient {
         };
 
         Ok(exit_code)
+    }
+
+    /// Execute a command directly in the VM with interactive I/O.
+    pub fn vm_exec_interactive(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+        tty: bool,
+    ) -> Result<i32> {
+        let timeout_ms = timeout.map(|t| t.as_millis() as u64);
+        self.interactive_session(
+            AgentRequest::VmExec {
+                command,
+                env,
+                workdir,
+                timeout_ms,
+                interactive: true,
+                tty,
+            },
+            tty,
+            "vm exec interactive",
+        )
     }
 
     /// Run a command in an image's rootfs.
@@ -985,15 +949,7 @@ impl AgentClient {
         // Reset timeout (warning-only since operation completed)
         self.reset_read_timeout();
 
-        match resp {
-            AgentResponse::Completed {
-                exit_code,
-                stdout,
-                stderr,
-            } => Ok((exit_code, stdout, stderr)),
-            AgentResponse::Error { message, .. } => Err(Error::agent("run command", message)),
-            _ => Err(Error::agent("run command", "unexpected response type")),
-        }
+        expect_completed(resp, "run command")
     }
 
     /// Run a command interactively with streaming I/O.
@@ -1009,128 +965,22 @@ impl AgentClient {
     ///
     /// The exit code of the command
     pub fn run_interactive(&mut self, config: RunConfig) -> Result<i32> {
-        use crate::agent::terminal::{
-            check_sigwinch, get_terminal_size, install_sigwinch_handler, poll_io, stdin_is_tty,
-            NonBlockingStdin, RawModeGuard,
-        };
-        use std::io::{stderr, stdin, stdout, Read, Write};
-        use std::os::unix::io::AsRawFd;
-
-        // Disable socket read timeout for interactive sessions
-        self.stream
-            .set_read_timeout(None)
-            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
-
         let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
         let tty = config.tty;
-
-        // Send the run request with interactive mode
-        self.send(&AgentRequest::Run {
-            image: config.image,
-            command: config.command,
-            env: config.env,
-            workdir: config.workdir,
-            mounts: config.mounts,
-            timeout_ms,
-            interactive: true,
+        self.interactive_session(
+            AgentRequest::Run {
+                image: config.image,
+                command: config.command,
+                env: config.env,
+                workdir: config.workdir,
+                mounts: config.mounts,
+                timeout_ms,
+                interactive: true,
+                tty,
+            },
             tty,
-        })?;
-
-        // Wait for Started response
-        let started = self.receive()?;
-        match started {
-            AgentResponse::Started => {}
-            AgentResponse::Error { message, .. } => {
-                return Err(Error::agent("run interactive", message));
-            }
-            _ => {
-                return Err(Error::agent("run interactive", "expected Started response"));
-            }
-        }
-
-        // Enable raw mode if TTY requested and stdin is a TTY
-        let _raw_mode = if tty && stdin_is_tty() {
-            RawModeGuard::new(stdin().as_raw_fd())
-        } else {
-            None
-        };
-
-        // Send initial terminal size and install resize handler
-        if tty {
-            if let Some((cols, rows)) = get_terminal_size() {
-                self.send(&AgentRequest::Resize { cols, rows })?;
-            }
-            install_sigwinch_handler();
-        }
-
-        // Set stdin to non-blocking
-        let _nonblock_stdin = NonBlockingStdin::new()
-            .map_err(|e| Error::agent("set stdin nonblocking", e.to_string()))?;
-
-        // Socket stays blocking — poll() determines readiness
-        let mut stdin_handle = stdin();
-        let stdin_fd = stdin_handle.as_raw_fd();
-        let socket_fd = self.stream.as_raw_fd();
-        let mut stdin_buf = [0u8; 4096];
-        let mut stdin_eof = false;
-
-        let exit_code = loop {
-            let effective_stdin_fd = if stdin_eof { -1 } else { stdin_fd };
-            let poll_result = poll_io(effective_stdin_fd, socket_fd, 100)
-                .map_err(|e| Error::agent("poll", e.to_string()))?;
-
-            // Check for terminal resize
-            if tty && check_sigwinch() {
-                if let Some((cols, rows)) = get_terminal_size() {
-                    self.send(&AgentRequest::Resize { cols, rows })?;
-                }
-            }
-
-            // Handle socket data FIRST
-            if poll_result.socket_ready {
-                match self.receive() {
-                    Ok(AgentResponse::Stdout { data }) => {
-                        stdout().write_all(&data)?;
-                        stdout().flush()?;
-                    }
-                    Ok(AgentResponse::Stderr { data }) => {
-                        stderr().write_all(&data)?;
-                        stderr().flush()?;
-                    }
-                    Ok(AgentResponse::Exited { exit_code }) => {
-                        break exit_code;
-                    }
-                    Ok(AgentResponse::Error { message, .. }) => {
-                        return Err(Error::agent("run interactive", message));
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        return Err(e);
-                    }
-                }
-            }
-
-            // Handle stdin input
-            if poll_result.stdin_ready && !stdin_eof {
-                match stdin_handle.read(&mut stdin_buf) {
-                    Ok(0) => {
-                        stdin_eof = true;
-                        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
-                    }
-                    Ok(n) => {
-                        self.send(&AgentRequest::Stdin {
-                            data: stdin_buf[..n].to_vec(),
-                        })?;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        tracing::warn!(error = %e, "error reading stdin");
-                    }
-                }
-            }
-        };
-
-        Ok(exit_code)
+            "run interactive",
+        )
     }
 
     /// Send stdin data to a running interactive command.
@@ -1180,12 +1030,7 @@ impl AgentClient {
             mounts,
         })?;
 
-        match resp {
-            AgentResponse::Ok { data: Some(data) } => serde_json::from_value(data)
-                .map_err(|e| Error::agent("parse response", e.to_string())),
-            AgentResponse::Error { message, .. } => Err(Error::agent("create container", message)),
-            _ => Err(Error::agent("create container", "unexpected response type")),
-        }
+        expect_data(resp, "create container")
     }
 
     /// Start a created container.
@@ -1193,12 +1038,7 @@ impl AgentClient {
         let resp = self.request(&AgentRequest::StartContainer {
             container_id: container_id.to_string(),
         })?;
-
-        match resp {
-            AgentResponse::Ok { .. } => Ok(()),
-            AgentResponse::Error { message, .. } => Err(Error::agent("start container", message)),
-            _ => Err(Error::agent("start container", "unexpected response type")),
-        }
+        expect_ok(resp, "start container")
     }
 
     /// Stop a running container.
@@ -1212,12 +1052,7 @@ impl AgentClient {
             container_id: container_id.to_string(),
             timeout_secs,
         })?;
-
-        match resp {
-            AgentResponse::Ok { .. } => Ok(()),
-            AgentResponse::Error { message, .. } => Err(Error::agent("stop container", message)),
-            _ => Err(Error::agent("stop container", "unexpected response type")),
-        }
+        expect_ok(resp, "stop container")
     }
 
     /// Delete a container.
@@ -1231,12 +1066,7 @@ impl AgentClient {
             container_id: container_id.to_string(),
             force,
         })?;
-
-        match resp {
-            AgentResponse::Ok { .. } => Ok(()),
-            AgentResponse::Error { message, .. } => Err(Error::agent("delete container", message)),
-            _ => Err(Error::agent("delete container", "unexpected response type")),
-        }
+        expect_ok(resp, "delete container")
     }
 
     /// List all containers.
@@ -1297,15 +1127,7 @@ impl AgentClient {
         // Reset timeout (warning-only since operation completed)
         self.reset_read_timeout();
 
-        match resp {
-            AgentResponse::Completed {
-                exit_code,
-                stdout,
-                stderr,
-            } => Ok((exit_code, stdout, stderr)),
-            AgentResponse::Error { message, .. } => Err(Error::agent("exec command", message)),
-            _ => Err(Error::agent("exec command", "unexpected response type")),
-        }
+        expect_completed(resp, "exec command")
     }
 
     /// Execute a command interactively in a running container with streaming I/O.
@@ -1334,129 +1156,20 @@ impl AgentClient {
         timeout: Option<Duration>,
         tty: bool,
     ) -> Result<i32> {
-        use crate::agent::terminal::{
-            check_sigwinch, get_terminal_size, install_sigwinch_handler, poll_io, stdin_is_tty,
-            NonBlockingStdin, RawModeGuard,
-        };
-        use std::io::{stderr, stdin, stdout, Read, Write};
-        use std::os::unix::io::AsRawFd;
-
-        // Disable socket read timeout for interactive sessions
-        self.stream
-            .set_read_timeout(None)
-            .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
-
         let timeout_ms = timeout.map(|t| t.as_millis() as u64);
-
-        // Send the exec request with interactive mode
-        self.send(&AgentRequest::Exec {
-            container_id: container_id.to_string(),
-            command,
-            env,
-            workdir,
-            timeout_ms,
-            interactive: true,
+        self.interactive_session(
+            AgentRequest::Exec {
+                container_id: container_id.to_string(),
+                command,
+                env,
+                workdir,
+                timeout_ms,
+                interactive: true,
+                tty,
+            },
             tty,
-        })?;
-
-        // Wait for Started response
-        let started = self.receive()?;
-        match started {
-            AgentResponse::Started => {}
-            AgentResponse::Error { message, .. } => {
-                return Err(Error::agent("exec interactive", message));
-            }
-            _ => {
-                return Err(Error::agent(
-                    "exec interactive",
-                    "expected Started response",
-                ));
-            }
-        }
-
-        // Enable raw mode if TTY requested and stdin is a TTY
-        let _raw_mode = if tty && stdin_is_tty() {
-            RawModeGuard::new(stdin().as_raw_fd())
-        } else {
-            None
-        };
-
-        // Send initial terminal size and install resize handler
-        if tty {
-            if let Some((cols, rows)) = get_terminal_size() {
-                self.send(&AgentRequest::Resize { cols, rows })?;
-            }
-            install_sigwinch_handler();
-        }
-
-        // Set stdin to non-blocking
-        let _nonblock_stdin = NonBlockingStdin::new()
-            .map_err(|e| Error::agent("set stdin nonblocking", e.to_string()))?;
-
-        // Socket stays blocking — poll() determines readiness
-        let mut stdin_handle = stdin();
-        let stdin_fd = stdin_handle.as_raw_fd();
-        let socket_fd = self.stream.as_raw_fd();
-        let mut stdin_buf = [0u8; 4096];
-        let mut stdin_eof = false;
-
-        let exit_code = loop {
-            let effective_stdin_fd = if stdin_eof { -1 } else { stdin_fd };
-            let poll_result = poll_io(effective_stdin_fd, socket_fd, 100)
-                .map_err(|e| Error::agent("poll", e.to_string()))?;
-
-            // Check for terminal resize
-            if tty && check_sigwinch() {
-                if let Some((cols, rows)) = get_terminal_size() {
-                    self.send(&AgentRequest::Resize { cols, rows })?;
-                }
-            }
-
-            // Handle socket data FIRST
-            if poll_result.socket_ready {
-                match self.receive() {
-                    Ok(AgentResponse::Stdout { data }) => {
-                        stdout().write_all(&data)?;
-                        stdout().flush()?;
-                    }
-                    Ok(AgentResponse::Stderr { data }) => {
-                        stderr().write_all(&data)?;
-                        stderr().flush()?;
-                    }
-                    Ok(AgentResponse::Exited { exit_code }) => {
-                        break exit_code;
-                    }
-                    Ok(AgentResponse::Error { message, .. }) => {
-                        return Err(Error::agent("exec interactive", message));
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        return Err(e);
-                    }
-                }
-            }
-
-            // Handle stdin input
-            if poll_result.stdin_ready && !stdin_eof {
-                match stdin_handle.read(&mut stdin_buf) {
-                    Ok(0) => {
-                        stdin_eof = true;
-                        self.send(&AgentRequest::Stdin { data: Vec::new() })?;
-                    }
-                    Ok(n) => {
-                        self.send(&AgentRequest::Stdin {
-                            data: stdin_buf[..n].to_vec(),
-                        })?;
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        tracing::warn!(error = %e, "error reading stdin");
-                    }
-                }
-            }
-        };
-
-        Ok(exit_code)
+            "exec interactive",
+        )
     }
 
     /// Low-level send without waiting for response (public).
