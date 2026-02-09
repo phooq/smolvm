@@ -14,6 +14,10 @@ use crate::assets::{crc32_file_range, AssetCollector};
 use crate::format::{PackFooter, PackManifest, FOOTER_SIZE, SIDECAR_EXTENSION};
 use crate::Result;
 
+/// Maximum allowed manifest size (16 MiB) to prevent malicious/corrupt sidecars
+/// from causing excessive memory allocation.
+const MAX_MANIFEST_SIZE: u64 = 16 * 1024 * 1024;
+
 /// Binary packer for creating self-contained executables.
 pub struct Packer {
     stub_path: Option<std::path::PathBuf>,
@@ -429,6 +433,9 @@ pub struct PackedInfo {
 }
 
 /// Read footer from a sidecar file.
+///
+/// Validates structural bounds: footer-derived sizes must be consistent with
+/// the actual file size and within safe limits.
 pub fn read_footer_from_sidecar(sidecar_path: impl AsRef<Path>) -> Result<PackFooter> {
     let mut file = File::open(sidecar_path.as_ref())?;
     let file_size = file.metadata()?.len();
@@ -444,7 +451,12 @@ pub fn read_footer_from_sidecar(sidecar_path: impl AsRef<Path>) -> Result<PackFo
     let mut footer_bytes = [0u8; FOOTER_SIZE];
     file.read_exact(&mut footer_bytes)?;
 
-    PackFooter::from_bytes(&footer_bytes)
+    let footer = PackFooter::from_bytes(&footer_bytes)?;
+
+    // Validate footer-derived sizes against actual file size
+    validate_footer_bounds(&footer, file_size)?;
+
+    Ok(footer)
 }
 
 /// Read manifest from a sidecar file.
@@ -530,6 +542,91 @@ pub fn verify_checksum(path: impl AsRef<Path>) -> Result<bool> {
         let actual = crc32_file_range(path.as_ref(), footer.assets_offset, checksum_size)?;
         Ok(actual == footer.checksum)
     }
+}
+
+/// Verify checksum of a sidecar file.
+///
+/// Computes CRC32 over the assets + manifest region and compares to the
+/// checksum stored in the footer.
+pub fn verify_sidecar_checksum(
+    sidecar_path: impl AsRef<Path>,
+    footer: &PackFooter,
+) -> Result<bool> {
+    let checksum_size = footer
+        .assets_size
+        .checked_add(footer.manifest_size)
+        .ok_or_else(|| {
+            crate::PackError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "assets_size + manifest_size overflow",
+            ))
+        })?;
+    let actual = crc32_file_range(sidecar_path.as_ref(), 0, checksum_size)?;
+    Ok(actual == footer.checksum)
+}
+
+/// Validate that footer-derived sizes are consistent with the actual file size.
+fn validate_footer_bounds(footer: &PackFooter, file_size: u64) -> Result<()> {
+    // Cap manifest size to prevent excessive memory allocation
+    if footer.manifest_size > MAX_MANIFEST_SIZE {
+        return Err(crate::PackError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "manifest size ({} bytes) exceeds maximum ({} bytes)",
+                footer.manifest_size, MAX_MANIFEST_SIZE
+            ),
+        )));
+    }
+
+    // Verify that assets + manifest + footer fit within the file
+    let content_end = footer
+        .assets_size
+        .checked_add(footer.manifest_size)
+        .and_then(|s| s.checked_add(FOOTER_SIZE as u64));
+
+    match content_end {
+        Some(end) if end <= file_size => {}
+        _ => {
+            return Err(crate::PackError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "footer sizes exceed file size (corrupt or truncated sidecar)",
+            )));
+        }
+    }
+
+    // In sidecar mode (assets_offset == 0), the layout is:
+    //   [assets_blob | manifest_json | footer]
+    // so manifest_offset MUST equal assets_size.  If it doesn't, the
+    // manifest bytes that read_manifest_from_sidecar parses could differ
+    // from the region covered by the checksum (0..assets_size+manifest_size),
+    // creating a trust gap between verified and parsed data.
+    if footer.assets_offset == 0 && footer.manifest_offset != footer.assets_size {
+        return Err(crate::PackError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "sidecar manifest_offset ({}) does not match assets_size ({}): corrupt footer",
+                footer.manifest_offset, footer.assets_size
+            ),
+        )));
+    }
+
+    // Verify manifest_offset + manifest_size doesn't exceed the pre-footer region
+    let manifest_end = footer
+        .manifest_offset
+        .checked_add(footer.manifest_size)
+        .and_then(|end| end.checked_add(FOOTER_SIZE as u64));
+
+    match manifest_end {
+        Some(end) if end <= file_size => {}
+        _ => {
+            return Err(crate::PackError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "manifest offset/size exceeds file bounds",
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Extract assets from a packed binary to a directory.
@@ -741,6 +838,101 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&layer_file).unwrap(),
             "embedded layer content"
+        );
+    }
+
+    #[test]
+    fn test_sidecar_checksum_verification() {
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Create a dummy stub
+        let stub_path = temp_dir.path().join("stub");
+        fs::write(&stub_path, b"#!/bin/sh\necho stub").unwrap();
+
+        let manifest = PackManifest::new(
+            "alpine:latest".to_string(),
+            "sha256:abc123".to_string(),
+            "linux/arm64".to_string(),
+        );
+
+        // Pack sidecar mode
+        let output_path = temp_dir.path().join("packed");
+        let packer = Packer::new(manifest).with_stub(&stub_path);
+        packer.pack(&output_path).unwrap();
+
+        let sidecar = sidecar_path_for(&output_path);
+        let footer = read_footer_from_sidecar(&sidecar).unwrap();
+
+        // Valid sidecar should pass
+        assert!(verify_sidecar_checksum(&sidecar, &footer).unwrap());
+
+        // Corrupt the sidecar by flipping a byte in the assets region
+        let mut data = fs::read(&sidecar).unwrap();
+        if !data.is_empty() {
+            data[0] ^= 0xFF;
+        }
+        fs::write(&sidecar, &data).unwrap();
+
+        // Corrupted sidecar should fail checksum
+        assert!(!verify_sidecar_checksum(&sidecar, &footer).unwrap());
+    }
+
+    #[test]
+    fn test_footer_bounds_reject_oversized_manifest() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sidecar = temp_dir.path().join("bad.smolmachine");
+
+        // Craft a footer with manifest_size exceeding the 16 MiB cap
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: 100,
+            manifest_offset: 100,
+            manifest_size: 32 * 1024 * 1024, // 32 MiB — exceeds cap
+            checksum: 0,
+        };
+
+        // Write a minimal sidecar: some bytes + footer
+        let footer_bytes = footer.to_bytes();
+        let mut data = vec![0u8; 200]; // some dummy content
+        data.extend_from_slice(&footer_bytes);
+        fs::write(&sidecar, &data).unwrap();
+
+        let result = read_footer_from_sidecar(&sidecar);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("exceeds maximum"), "got: {}", err_msg);
+    }
+
+    #[test]
+    fn test_footer_bounds_reject_manifest_offset_mismatch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let sidecar = temp_dir.path().join("mismatch.smolmachine");
+
+        // In sidecar mode (assets_offset=0), manifest_offset must == assets_size.
+        // Craft a footer where manifest_offset points elsewhere.
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0, // sidecar mode
+            assets_size: 100,
+            manifest_offset: 50, // should be 100 — points into assets region
+            manifest_size: 50,
+            checksum: 0,
+        };
+
+        let footer_bytes = footer.to_bytes();
+        // File needs: 100 (assets) + 50 (manifest) + 64 (footer) = 214 bytes
+        let mut data = vec![0u8; 150];
+        data.extend_from_slice(&footer_bytes);
+        fs::write(&sidecar, &data).unwrap();
+
+        let result = read_footer_from_sidecar(&sidecar);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("manifest_offset") && err_msg.contains("does not match"),
+            "got: {}",
+            err_msg
         );
     }
 

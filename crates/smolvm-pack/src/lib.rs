@@ -37,6 +37,7 @@
 #![deny(missing_docs)]
 
 pub mod assets;
+pub mod extract;
 pub mod format;
 #[cfg(target_os = "macos")]
 pub mod macho;
@@ -49,7 +50,7 @@ pub use format::{
 };
 pub use packer::{
     read_footer, read_footer_from_sidecar, read_manifest, read_manifest_from_sidecar,
-    sidecar_path_for, Packer,
+    sidecar_path_for, verify_sidecar_checksum, Packer,
 };
 
 use thiserror::Error;
