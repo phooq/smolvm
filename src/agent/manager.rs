@@ -276,24 +276,10 @@ impl AgentManager {
         }
     }
 
-    /// Return the effective agent state, correcting for stale cached state.
-    ///
-    /// If cached state is `Running` but the process is dead, returns `Stopped`.
-    /// Use this for API-facing status rather than `state()`.
-    pub fn effective_state(&self) -> AgentState {
-        let inner = self.inner.lock();
-        if inner.state == AgentState::Running && !self.is_process_alive_inner(&inner) {
-            AgentState::Stopped
-        } else {
-            inner.state
-        }
-    }
-
     /// Return consistent (state, pid) for API status responses.
     ///
-    /// Uses `effective_state` for the state and clears the PID when the
-    /// effective state is `Stopped`, so clients never see a stale PID
-    /// paired with a stopped state.
+    /// Clears the PID when effective state is `Stopped`, so clients never
+    /// see a stale PID paired with a stopped state.
     pub fn effective_status(&self) -> (AgentState, Option<i32>) {
         let inner = self.inner.lock();
         let state = if inner.state == AgentState::Running && !self.is_process_alive_inner(&inner) {

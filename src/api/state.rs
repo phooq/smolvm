@@ -461,29 +461,6 @@ impl ApiState {
         }
     }
 
-    /// Stop all sandboxes (for graceful shutdown).
-    pub fn stop_all_sandboxes(&self) {
-        // Collect names first to avoid holding read lock during slow stop operations.
-        // This allows other sandbox operations to proceed while we're stopping.
-        let names: Vec<String> = self.sandboxes.read().keys().cloned().collect();
-
-        for name in names {
-            // Re-acquire lock for each sandbox to minimize lock hold time
-            let entry = match self.sandboxes.read().get(&name).cloned() {
-                Some(e) => e,
-                None => continue, // Sandbox was removed while we were iterating
-            };
-
-            let entry = entry.lock();
-            if entry.manager.is_process_alive() {
-                tracing::info!(sandbox = %name, "stopping sandbox");
-                if let Err(e) = entry.manager.stop() {
-                    tracing::warn!(sandbox = %name, error = %e, "failed to stop sandbox");
-                }
-            }
-        }
-    }
-
     /// Get the underlying database handle.
     pub fn db(&self) -> &SmolvmDb {
         &self.db
@@ -602,17 +579,6 @@ where
     })
     .await?
     .map_err(ApiError::internal)
-}
-
-impl ApiState {
-    /// Create a new API state with default settings.
-    ///
-    /// # Panics
-    /// Panics if the database cannot be opened. For fallible construction,
-    /// use `ApiState::new()` instead.
-    pub fn new_or_panic() -> Self {
-        Self::new().expect("failed to create API state")
-    }
 }
 
 // ============================================================================
