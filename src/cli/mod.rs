@@ -66,3 +66,60 @@ pub fn flush_output() {
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 }
+
+/// Format bytes as human-readable string (e.g., "1.5 GB", "42.0 MB").
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// Pull an image with a CLI progress bar.
+pub fn pull_with_progress(
+    client: &mut smolvm::agent::AgentClient,
+    image: &str,
+    platform: Option<&str>,
+) -> smolvm::Result<smolvm_protocol::ImageInfo> {
+    print!("Pulling image {}...", image);
+    let _ = std::io::stdout().flush();
+
+    let mut last_percent = 0u8;
+    let result = client.pull_with_registry_config_and_progress(
+        image,
+        platform,
+        |percent, _total, _layer| {
+            let percent = percent as u8;
+            if percent != last_percent && percent <= 100 {
+                print!("\rPulling image {}... [", image);
+                let filled = (percent as usize) / 5;
+                for i in 0..20 {
+                    if i < filled {
+                        print!("=");
+                    } else if i == filled {
+                        print!(">");
+                    } else {
+                        print!(" ");
+                    }
+                }
+                print!("] {}%", percent);
+                let _ = std::io::stdout().flush();
+                last_percent = percent;
+            }
+        },
+    );
+    println!(
+        "\rPulling image {}... done.                              ",
+        image
+    );
+    result
+}

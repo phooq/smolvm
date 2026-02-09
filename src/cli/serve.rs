@@ -40,6 +40,10 @@ pub struct ServeCmd {
     /// Enable debug logging (or set RUST_LOG=debug)
     #[arg(short, long)]
     verbose: bool,
+
+    /// CORS allowed origins (repeatable). Defaults to localhost:8080 and localhost:3000.
+    #[arg(long = "cors-origin", value_name = "ORIGIN")]
+    cors_origins: Vec<String>,
 }
 
 impl ServeCmd {
@@ -106,7 +110,7 @@ impl ServeCmd {
         });
 
         // Create router
-        let app = smolvm::api::create_router(state);
+        let app = smolvm::api::create_router(state, self.cors_origins);
 
         // Create listener
         let listener = tokio::net::TcpListener::bind(addr)
@@ -126,7 +130,10 @@ impl ServeCmd {
         let _ = shutdown_tx.send(true);
 
         // Wait for supervisor to finish (with timeout)
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), supervisor_handle).await;
+        match tokio::time::timeout(std::time::Duration::from_secs(5), supervisor_handle).await {
+            Ok(_) => tracing::debug!("supervisor shut down cleanly"),
+            Err(_) => tracing::warn!("supervisor did not shut down within 5 seconds"),
+        }
 
         Ok(())
     }
@@ -137,17 +144,23 @@ impl ServeCmd {
 /// Use DELETE /api/v1/sandboxes/:id to stop specific VMs.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "failed to listen for Ctrl+C");
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]

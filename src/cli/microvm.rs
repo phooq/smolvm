@@ -9,9 +9,9 @@
 //! - status: Show microvm status
 //! - ls: List all named VMs
 
+use crate::cli::flush_output;
 use crate::cli::parsers::{parse_duration, parse_env_spec, parse_port};
 use crate::cli::vm_common::{self, CreateVmParams, DeleteVmOptions, VmKind};
-use crate::cli::flush_output;
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, PortMapping};
 use std::time::Duration;
@@ -184,11 +184,11 @@ pub struct CreateCmd {
     pub name: String,
 
     /// Number of virtual CPUs
-    #[arg(long, default_value = "1", value_name = "N")]
+    #[arg(long, default_value_t = smolvm::agent::DEFAULT_CPUS, value_name = "N")]
     pub cpus: u8,
 
     /// Memory allocation in MiB
-    #[arg(long, default_value = "512", value_name = "MiB")]
+    #[arg(long, default_value_t = smolvm::agent::DEFAULT_MEMORY_MIB, value_name = "MiB")]
     pub mem: u32,
 
     /// Mount host directory (can be used multiple times)

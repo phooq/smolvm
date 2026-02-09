@@ -4,9 +4,10 @@
 //! Containers can be created, started, stopped, and deleted independently.
 
 use crate::cli::parsers::{parse_duration, parse_env_list, parse_mounts_to_bindings};
+use crate::cli::vm_common;
 use crate::cli::{flush_output, truncate, truncate_id, COMMAND_WIDTH, IMAGE_NAME_WIDTH};
 use clap::{Args, Subcommand};
-use smolvm::agent::{AgentClient, AgentManager, PullOptions};
+use smolvm::agent::{AgentClient, AgentManager};
 use std::time::Duration;
 
 /// Manage containers inside a microVM
@@ -46,16 +47,15 @@ impl ContainerCmd {
     }
 }
 
-/// Get the agent manager for a microvm, ensuring it's running
+/// Get the agent manager for a microvm, ensuring it's running.
 fn ensure_microvm(name: &str) -> smolvm::Result<AgentManager> {
-    // "default" refers to the anonymous default microvm
-    let manager = if name == "default" {
-        AgentManager::new_default()?
+    let name_opt = if name == "default" {
+        None
     } else {
-        AgentManager::for_vm(name)?
+        Some(name.to_string())
     };
+    let manager = vm_common::get_vm_manager(&name_opt)?;
 
-    // Ensure microvm is running
     if manager.try_connect_existing().is_none() {
         println!("Starting microvm '{}'...", name);
         manager.ensure_running()?;
@@ -112,39 +112,7 @@ impl ContainerCreateCmd {
 
         // Pull image if needed
         if !std::path::Path::new(&self.image).exists() {
-            print!("Pulling image {}...", self.image);
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-
-            let image_name = self.image.clone();
-            let mut last_percent = 0u8;
-            client.pull(
-                &self.image,
-                PullOptions::new()
-                    .use_registry_config(true)
-                    .progress(|percent, _total, _layer| {
-                        let percent = percent as u8;
-                        if percent != last_percent && percent <= 100 {
-                            print!("\rPulling image {}... [", image_name);
-                            let filled = (percent as usize) / 5;
-                            for i in 0..20 {
-                                if i < filled {
-                                    print!("=");
-                                } else if i == filled {
-                                    print!(">");
-                                } else {
-                                    print!(" ");
-                                }
-                            }
-                            print!("] {}%", percent);
-                            let _ = std::io::Write::flush(&mut std::io::stdout());
-                            last_percent = percent;
-                        }
-                    }),
-            )?;
-            println!(
-                "\rPulling image {}... done.                              ",
-                self.image
-            );
+            crate::cli::pull_with_progress(&mut client, &self.image, None)?;
         }
 
         // Parse environment variables

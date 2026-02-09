@@ -9,6 +9,10 @@
 
 use clap::Args;
 use smolvm::agent::{AgentClient, AgentManager, PullOptions, VmResources};
+
+/// Default memory for packed VMs (lower than sandbox/microvm because
+/// packed VMs are typically single-purpose, minimal workloads).
+const PACK_DEFAULT_MEMORY_MIB: u32 = 256;
 use smolvm::platform::{Os, VmExecutor};
 use smolvm::Error;
 use smolvm_pack::assets::AssetCollector;
@@ -43,11 +47,12 @@ pub struct PackCmd {
     pub output: PathBuf,
 
     /// Default number of vCPUs for the packed VM
-    #[arg(long, default_value = "1", value_name = "N")]
+    #[arg(long, default_value_t = smolvm::agent::DEFAULT_CPUS, value_name = "N")]
     pub cpus: u8,
 
-    /// Default memory in MiB for the packed VM
-    #[arg(long, default_value = "256", value_name = "MiB")]
+    /// Default memory in MiB for the packed VM (lower than sandbox/microvm
+    /// because packed VMs are typically single-purpose, minimal workloads)
+    #[arg(long, default_value_t = PACK_DEFAULT_MEMORY_MIB, value_name = "MiB")]
     pub mem: u32,
 
     /// Target platform for multi-arch images (e.g., linux/arm64, linux/amd64)

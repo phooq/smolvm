@@ -197,11 +197,13 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         .ensure_running_with_full_config(mounts, ports, resources)
         .map_err(|e| Error::agent(format!("start {}", kind.label()), e.to_string()))?;
 
-    // Update state
+    // Update state with PID start time for safe process identification
     let pid = manager.child_pid();
+    let pid_start_time = pid.and_then(smolvm::process::process_start_time);
     config.update_vm(name, |r| {
         r.state = RecordState::Running;
         r.pid = pid;
+        r.pid_start_time = pid_start_time;
     });
     config.save()?;
 
@@ -298,6 +300,7 @@ pub fn stop_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     config.update_vm(name, |r| {
         r.state = RecordState::Stopped;
         r.pid = None;
+        r.pid_start_time = None;
     });
     config.save()?;
 
@@ -395,12 +398,7 @@ where
 
     if manager.try_connect_existing().is_some() {
         let pid_suffix = crate::cli::format_pid_suffix(manager.child_pid());
-        println!(
-            "{} '{}': running{}",
-            kind.display_name(),
-            label,
-            pid_suffix
-        );
+        println!("{} '{}': running{}", kind.display_name(), label, pid_suffix);
         extra(&manager);
         manager.detach();
     } else {

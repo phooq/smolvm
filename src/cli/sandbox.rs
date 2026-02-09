@@ -14,7 +14,7 @@ use crate::cli::parsers::{
     mounts_to_virtiofs_bindings, parse_duration, parse_env_spec, parse_mounts, parse_port,
 };
 use crate::cli::vm_common::{self, CreateVmParams, DeleteVmOptions, VmKind};
-use crate::cli::{flush_output, format_pid_suffix, truncate_id};
+use crate::cli::{flush_output, format_bytes, truncate_id};
 use clap::{Args, Subcommand};
 use smolvm::agent::{
     docker_config_mount, AgentClient, AgentManager, PortMapping, RunConfig, VmResources,
@@ -229,14 +229,7 @@ pub struct StatusCmd {
 
 impl StatusCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = vm_common::get_vm_manager(&self.name)?;
-        let label = vm_common::vm_label(&self.name);
-
-        if manager.try_connect_existing().is_some() {
-            let pid_suffix = format_pid_suffix(manager.child_pid());
-            println!("Sandbox '{}': running{}", label, pid_suffix);
-
-            // Try to list containers
+        vm_common::status_vm(KIND, &self.name, |manager| {
             if let Ok(mut client) = AgentClient::connect(manager.vsock_socket()) {
                 if let Ok(containers) = client.list_containers() {
                     if !containers.is_empty() {
@@ -247,13 +240,7 @@ impl StatusCmd {
                     }
                 }
             }
-
-            manager.detach();
-        } else {
-            println!("Sandbox '{}': not running", label);
-        }
-
-        Ok(())
+        })
     }
 }
 
@@ -338,7 +325,7 @@ pub struct RunCmd {
     /// Number of virtual CPUs
     #[arg(
         long,
-        default_value = "1",
+        default_value_t = smolvm::agent::DEFAULT_CPUS,
         value_name = "N",
         help_heading = "Resources"
     )]
@@ -347,7 +334,7 @@ pub struct RunCmd {
     /// Memory allocation in MiB
     #[arg(
         long,
-        default_value = "512",
+        default_value_t = smolvm::agent::DEFAULT_MEMORY_MIB,
         value_name = "MiB",
         help_heading = "Resources"
     )]
@@ -417,39 +404,7 @@ impl RunCmd {
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         // Pull image with progress display
-        // Use registry config for automatic credential lookup
-        print!("Pulling image {}...", self.image);
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-
-        let mut last_percent = 0u8;
-        client.pull_with_registry_config_and_progress(
-            &self.image,
-            self.platform.as_deref(),
-            |percent, _total, _layer| {
-                let percent = percent as u8;
-                if percent != last_percent && percent <= 100 {
-                    // Clear line and show progress bar
-                    print!("\rPulling image {}... [", self.image);
-                    let filled = (percent as usize) / 5; // 20 chars wide
-                    for i in 0..20 {
-                        if i < filled {
-                            print!("=");
-                        } else if i == filled {
-                            print!(">");
-                        } else {
-                            print!(" ");
-                        }
-                    }
-                    print!("] {}%", percent);
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
-                    last_percent = percent;
-                }
-            },
-        )?;
-        println!(
-            "\rPulling image {}... done.                              ",
-            self.image
-        );
+        crate::cli::pull_with_progress(&mut client, &self.image, self.platform.as_deref())?;
 
         // Build command - for detached mode, default to sleep infinity
         let command = if self.command.is_empty() {
@@ -555,11 +510,11 @@ pub struct CreateCmd {
     pub name: String,
 
     /// Number of virtual CPUs
-    #[arg(long, default_value = "1", value_name = "N")]
+    #[arg(long, default_value_t = smolvm::agent::DEFAULT_CPUS, value_name = "N")]
     pub cpus: u8,
 
     /// Memory allocation in MiB
-    #[arg(long, default_value = "512", value_name = "MiB")]
+    #[arg(long, default_value_t = smolvm::agent::DEFAULT_MEMORY_MIB, value_name = "MiB")]
     pub mem: u32,
 
     /// Mount host directory (can be used multiple times)
@@ -877,26 +832,5 @@ impl PruneCmd {
         }
 
         Ok(())
-    }
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-/// Format bytes as human-readable string.
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
     }
 }
