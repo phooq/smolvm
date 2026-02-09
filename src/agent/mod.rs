@@ -13,13 +13,21 @@ pub use client::{AgentClient, PullOptions, RunConfig};
 pub use manager::{docker_config_dir, docker_config_mount, AgentManager, AgentState};
 
 /// Default agent VM memory in MiB.
-pub const DEFAULT_MEMORY_MIB: u32 = 256;
+pub const DEFAULT_MEMORY_MIB: u32 = 512;
 
 /// Default agent VM CPU count.
 pub const DEFAULT_CPUS: u8 = 1;
 
 /// Agent VM name.
 pub const AGENT_VM_NAME: &str = "smolvm-agent";
+
+/// Generate a virtiofs mount tag for a given index.
+///
+/// Mount tags follow the format "smolvm0", "smolvm1", etc. and are used
+/// consistently across the host launcher, API handlers, and guest agent.
+pub fn mount_tag(index: usize) -> String {
+    format!("smolvm{}", index)
+}
 
 /// TCP port mapping from host to guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

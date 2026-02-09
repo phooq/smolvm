@@ -49,6 +49,34 @@ const TIMEOUT_BUFFER_SECS: u64 = 5;
 /// Used when checking agent status where we want to fail fast.
 const STATUS_CHECK_TIMEOUT_SECS: u64 = 5;
 
+/// RAII guard that resets the socket read timeout on drop.
+///
+/// Ensures the timeout is always restored, even if the operation
+/// returns early due to an error. Uses a cloned UnixStream handle
+/// (shares the underlying fd) to avoid borrow conflicts.
+struct ReadTimeoutGuard {
+    stream: UnixStream,
+}
+
+impl ReadTimeoutGuard {
+    /// Create a guard from a reference to the stream.
+    /// Clones the underlying fd so the guard doesn't borrow the original.
+    fn new(stream: &UnixStream) -> Option<Self> {
+        stream.try_clone().ok().map(|s| Self { stream: s })
+    }
+}
+
+impl Drop for ReadTimeoutGuard {
+    fn drop(&mut self) {
+        if let Err(e) = self
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(DEFAULT_READ_TIMEOUT_SECS)))
+        {
+            tracing::warn!(error = %e, "failed to reset socket read timeout to default");
+        }
+    }
+}
+
 /// Configuration for running a command interactively.
 #[derive(Debug, Clone)]
 pub struct RunConfig {
@@ -433,8 +461,10 @@ impl AgentClient {
         auth: Option<&RegistryAuth>,
         mut progress: Option<F>,
     ) -> Result<ImageInfo> {
-        // Use a long timeout for pull - large images can take minutes to download/extract
+        // Use a long timeout for pull - large images can take minutes to download/extract.
+        // The guard resets the timeout on drop (including error paths).
         self.set_read_timeout(Duration::from_secs(IMAGE_PULL_TIMEOUT_SECS))?;
+        let _timeout_guard = ReadTimeoutGuard::new(&self.stream);
 
         // Send the pull request
         let data = encode_message(&AgentRequest::Pull {
@@ -450,14 +480,7 @@ impl AgentClient {
 
         // Read responses - loop until we get Ok or Error (skip Progress)
         loop {
-            let resp = self.receive();
-
-            // Reset timeout on final response
-            if !matches!(resp, Ok(AgentResponse::Progress { .. })) {
-                self.reset_read_timeout();
-            }
-
-            match resp? {
+            match self.receive()? {
                 AgentResponse::Progress {
                     percent,
                     layer,

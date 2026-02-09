@@ -68,15 +68,6 @@ extern "C" {
     // Console output redirection
     fn krun_set_console_output(ctx: u32, filepath: *const libc::c_char) -> i32;
 
-    // Console setup - adds virtio console connected to given file descriptors
-    #[allow(dead_code)] // Reserved for future TTY support
-    fn krun_add_virtio_console_default(
-        ctx: u32,
-        input_fd: libc::c_int,
-        output_fd: libc::c_int,
-        error_fd: libc::c_int,
-    ) -> i32;
-
     // Start VM (blocks until exit)
     fn krun_start_enter(ctx: u32) -> i32;
 }
@@ -167,9 +158,6 @@ impl LibkrunVm {
         // Raise file descriptor limits (required by libkrun)
         set_rlimits();
 
-        // Check if we're running in a real TTY (reserved for future TTY support)
-        let _is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
-
         unsafe {
             // Initialize libkrun logging (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
             // Use 0 (off) in production - smolvm has its own logging via tracing
@@ -228,7 +216,7 @@ impl LibkrunVm {
                 .enumerate()
                 .map(|(i, m)| {
                     (
-                        format!("smolvm{}", i),
+                        crate::agent::mount_tag(i),
                         m.target.to_string_lossy().to_string(),
                     )
                 })
@@ -271,7 +259,7 @@ impl LibkrunVm {
 
             // Add virtiofs mounts for host directories
             for (i, mount) in config.mounts.iter().enumerate() {
-                let tag = CString::new(format!("smolvm{}", i))
+                let tag = CString::new(crate::agent::mount_tag(i))
                     .map_err(|_| Error::mount("create mount tag", "tag contains null byte"))?;
                 let path = path_to_cstring(&mount.source)?;
 

@@ -128,7 +128,7 @@ impl MountBinding {
     /// Returns (virtiofs_tag, target_path, read_only).
     pub fn to_agent_binding(&self, index: usize) -> (String, String, bool) {
         (
-            format!("smolvm{}", index),
+            crate::agent::mount_tag(index),
             self.target.to_string_lossy().to_string(),
             self.read_only,
         )
@@ -137,7 +137,7 @@ impl MountBinding {
     /// Convert to MountInfo for API responses.
     pub fn to_mount_info(&self, index: usize) -> MountInfo {
         MountInfo {
-            tag: format!("smolvm{}", index),
+            tag: crate::agent::mount_tag(index),
             source: self.source.to_string_lossy().to_string(),
             target: self.target.to_string_lossy().to_string(),
             readonly: self.read_only,

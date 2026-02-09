@@ -196,12 +196,12 @@ pub fn launch_agent_vm(
         // Each mount gets a tag like "smolvm0", "smolvm1", etc.
         // The guest must mount these manually (or via the agent)
         for (i, mount) in mounts.iter().enumerate() {
-            let tag = CString::new(format!("smolvm{}", i))
+            let tag = CString::new(crate::agent::mount_tag(i))
                 .map_err(|_| Error::agent("configure mount", "invalid mount tag"))?;
             let host_path = path_to_cstring(&mount.source)?;
 
             tracing::debug!(
-                tag = %format!("smolvm{}", i),
+                tag = %crate::agent::mount_tag(i),
                 host = %mount.source.display(),
                 guest = %mount.target.display(),
                 read_only = mount.read_only,
