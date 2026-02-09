@@ -11,7 +11,7 @@
 
 use crate::cli::parsers::{parse_duration, parse_env_spec, parse_port};
 use crate::cli::vm_common::{self, CreateVmParams, DeleteVmOptions, VmKind};
-use crate::cli::{flush_output, format_pid_suffix};
+use crate::cli::flush_output;
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, PortMapping};
 use std::time::Duration;
@@ -313,18 +313,7 @@ pub struct StatusCmd {
 
 impl StatusCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let manager = vm_common::get_vm_manager(&self.name)?;
-        let label = vm_common::vm_label(&self.name);
-
-        if manager.try_connect_existing().is_some() {
-            let pid_suffix = format_pid_suffix(manager.child_pid());
-            println!("MicroVM '{}': running{}", label, pid_suffix);
-            manager.detach();
-        } else {
-            println!("MicroVM '{}': stopped", label);
-        }
-
-        Ok(())
+        vm_common::status_vm(KIND, &self.name, |_| {})
     }
 }
 

@@ -23,16 +23,15 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
+use crate::agent::AgentManager;
 use crate::api::error::ApiError;
 use crate::api::state::{ApiState, DbCloseGuard};
 use crate::api::types::{
-    ApiErrorResponse, CreateMicrovmRequest, DeleteResponse, ExecResponse, ListMicrovmsResponse,
-    MicrovmExecRequest, MicrovmInfo,
+    ApiErrorResponse, CreateMicrovmRequest, DeleteResponse, EnvVar, ExecResponse,
+    ListMicrovmsResponse, MicrovmExecRequest, MicrovmInfo,
 };
 use crate::api::validation::validate_resource_name;
 use crate::config::{RecordState, VmRecord};
@@ -227,29 +226,9 @@ pub async fn start_microvm(
         return Ok(Json(record_to_info(&name, &record)));
     }
 
-    // Convert stored mounts to HostMount
-    let mounts: Vec<HostMount> = record
-        .mounts
-        .iter()
-        .map(|(host, guest, ro)| HostMount {
-            source: PathBuf::from(host),
-            target: PathBuf::from(guest),
-            read_only: *ro,
-        })
-        .collect();
-
-    // Convert stored ports to PortMapping
-    let ports: Vec<PortMapping> = record
-        .ports
-        .iter()
-        .map(|(host, guest)| PortMapping::new(*host, *guest))
-        .collect();
-
-    let resources = VmResources {
-        cpus: record.cpus,
-        mem: record.mem,
-        network: record.network,
-    };
+    let mounts = record.host_mounts();
+    let ports = record.port_mappings();
+    let resources = record.vm_resources();
 
     // Start agent VM in blocking task.
     // DbCloseGuard ensures the database fd is not inherited by the forked child.
@@ -429,11 +408,7 @@ pub async fn exec_microvm(
 
     let name_clone = name.clone();
     let command = req.command.clone();
-    let env: Vec<(String, String)> = req
-        .env
-        .iter()
-        .map(|e| (e.name.clone(), e.value.clone()))
-        .collect();
+    let env = EnvVar::to_tuples(&req.env);
     let workdir = req.workdir.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 

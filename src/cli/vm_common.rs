@@ -7,9 +7,8 @@
 
 use crate::cli::parsers::parse_mounts_as_tuples;
 use crate::cli::{format_pid_suffix, truncate};
-use smolvm::agent::{AgentManager, HostMount, PortMapping, VmResources};
+use smolvm::agent::{AgentManager, PortMapping};
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
-use std::path::PathBuf;
 
 // ============================================================================
 // VmKind
@@ -168,29 +167,9 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
         return Ok(());
     }
 
-    // Convert stored mounts to HostMount
-    let mounts: Vec<HostMount> = record
-        .mounts
-        .iter()
-        .map(|(host, guest, ro)| HostMount {
-            source: PathBuf::from(host),
-            target: PathBuf::from(guest),
-            read_only: *ro,
-        })
-        .collect();
-
-    // Convert stored ports to PortMapping
-    let ports: Vec<PortMapping> = record
-        .ports
-        .iter()
-        .map(|(host, guest)| PortMapping::new(*host, *guest))
-        .collect();
-
-    let resources = VmResources {
-        cpus: record.cpus,
-        mem: record.mem,
-        network: record.network,
-    };
+    let mounts = record.host_mounts();
+    let ports = record.port_mappings();
+    let resources = record.vm_resources();
 
     // Start agent VM
     let manager = AgentManager::for_vm(name)
@@ -396,6 +375,38 @@ pub fn delete_vm(
     config.save()?;
 
     println!("Deleted {}: {}", kind.label(), name);
+    Ok(())
+}
+
+// ============================================================================
+// Status
+// ============================================================================
+
+/// Show status of a named or default VM/sandbox.
+///
+/// The `extra` callback is invoked when the VM is running, allowing callers
+/// to display additional information (e.g., sandbox lists containers).
+pub fn status_vm<F>(kind: VmKind, name: &Option<String>, extra: F) -> smolvm::Result<()>
+where
+    F: FnOnce(&AgentManager),
+{
+    let manager = get_vm_manager(name)?;
+    let label = vm_label(name);
+
+    if manager.try_connect_existing().is_some() {
+        let pid_suffix = crate::cli::format_pid_suffix(manager.child_pid());
+        println!(
+            "{} '{}': running{}",
+            kind.display_name(),
+            label,
+            pid_suffix
+        );
+        extra(&manager);
+        manager.detach();
+    } else {
+        println!("{} '{}': not running", kind.display_name(), label);
+    }
+
     Ok(())
 }
 
