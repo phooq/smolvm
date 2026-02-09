@@ -184,8 +184,8 @@ impl PackCmd {
             manifest.entrypoint = vec![ep.clone()];
         }
 
-        // Get stub executable path
-        let stub_path = self.find_stub()?;
+        // Get the smolvm binary to embed as the packed runtime
+        let stub_path = self.find_smolvm_binary()?;
 
         // Update manifest with inventory
         manifest.assets = collector.into_inventory();
@@ -322,36 +322,40 @@ impl PackCmd {
         ))
     }
 
-    /// Find the stub executable.
-    fn find_stub(&self) -> smolvm::Result<PathBuf> {
+    /// Find the smolvm binary to embed as the packed runtime.
+    ///
+    /// The main smolvm binary auto-detects packed mode at startup, so it
+    /// serves as both the normal CLI and the packed binary runtime.
+    fn find_smolvm_binary(&self) -> smolvm::Result<PathBuf> {
         if let Some(ref path) = self.stub {
             return Ok(path.clone());
         }
 
-        // Check for pre-built stub
         let candidates = [
             // Build output
-            Some(PathBuf::from("target/release/smolvm-stub")),
-            Some(PathBuf::from("target/debug/smolvm-stub")),
-            // Distribution
+            Some(PathBuf::from("target/release/smolvm")),
+            Some(PathBuf::from("target/debug/smolvm")),
+            // Distribution layout: smolvm-bin next to the wrapper script
             std::env::current_exe()
                 .ok()
-                .and_then(|p| p.parent().map(|d| d.join("smolvm-stub"))),
+                .and_then(|p| p.parent().map(|d| d.join("smolvm-bin"))),
+            // The running executable itself
+            std::env::current_exe().ok(),
             // User data dir
-            dirs::data_dir().map(|d| d.join("smolvm/stubs/smolvm-stub")),
+            dirs::data_dir().map(|d| d.join("smolvm/smolvm-bin")),
         ];
 
         for candidate in candidates.into_iter().flatten() {
             if candidate.exists() {
-                debug!(stub = %candidate.display(), "found stub executable");
+                debug!(stub = %candidate.display(), "found smolvm binary for packing");
                 return Ok(candidate);
             }
         }
 
         Err(Error::agent(
-            "find smolvm-stub",
-            "could not find smolvm-stub executable. Build it with:\n  \
-             cargo build --release -p smolvm-stub\n\
+            "find smolvm binary",
+            "could not find smolvm binary. Build it with:\n  \
+             cargo build --release\n\
              Or use --stub to specify the path.",
         ))
     }

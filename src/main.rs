@@ -57,6 +57,13 @@ enum Commands {
 }
 
 fn main() {
+    // Auto-detect packed binary mode BEFORE parsing the normal CLI.
+    // If this executable has a `.smolmachine` sidecar, appended assets,
+    // or a Mach-O section with packed data, run as a packed binary instead.
+    if let Some(mode) = smolvm_pack::detect_packed_mode() {
+        cli::run_packed::run_as_packed_binary(mode);
+    }
+
     let cli = Cli::parse();
 
     // Initialize logging based on RUST_LOG or default to warn

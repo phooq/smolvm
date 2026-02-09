@@ -34,7 +34,6 @@ fi
 # Build release binaries
 echo "Building release binaries..."
 LIBKRUN_BUNDLE="$LIB_DIR" cargo build --release --bin smolvm
-cargo build --release -p smolvm-stub
 
 # Build smolvm-agent for Linux (size-optimized)
 echo "Building smolvm-agent for Linux (optimized for size)..."
@@ -94,11 +93,6 @@ chmod +x "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
 chmod +x "$DIST_DIR/agent-rootfs/sbin/init"
 
 echo "Agent rootfs size: $(du -sh "$DIST_DIR/agent-rootfs" | cut -f1)"
-
-# Copy smolvm-stub (for pack feature)
-echo "Copying smolvm-stub..."
-cp ./target/release/smolvm-stub "$DIST_DIR/smolvm-stub"
-chmod +x "$DIST_DIR/smolvm-stub"
 
 # Create pre-formatted storage template
 # This eliminates the e2fsprogs dependency for end users

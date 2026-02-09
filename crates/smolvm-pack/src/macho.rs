@@ -1043,10 +1043,7 @@ mod tests {
     #[test]
     fn test_parse_stub() {
         // This test requires the actual stub binary
-        let stub_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../target/release/smolvm-stub"
-        );
+        let stub_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/release/smolvm");
         if let Ok(data) = std::fs::read(stub_path) {
             let macho = MachoFile::parse(&data).expect("Failed to parse Mach-O");
             assert_eq!(macho.header.magic, MH_MAGIC_64);
@@ -1072,10 +1069,7 @@ mod tests {
     #[test]
     fn test_write_section_and_sign() {
         // This test requires the actual stub binary with the __smolvm section
-        let stub_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../target/release/smolvm-stub"
-        );
+        let stub_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/release/smolvm");
         let data = match std::fs::read(stub_path) {
             Ok(d) => d,
             Err(_) => return, // Skip if stub not built

@@ -37,6 +37,7 @@
 #![deny(missing_docs)]
 
 pub mod assets;
+pub mod detect;
 pub mod extract;
 pub mod format;
 #[cfg(target_os = "macos")]
@@ -44,6 +45,7 @@ pub mod macho;
 pub mod packer;
 pub mod signing;
 
+pub use detect::{detect_packed_mode, PackedMode};
 pub use format::{
     PackFooter, PackManifest, SectionHeader, FOOTER_SIZE, MAGIC, SECTION_HEADER_SIZE,
     SECTION_MAGIC, SIDECAR_EXTENSION,

@@ -1,16 +1,21 @@
 //! `run-packed` subcommand: run a VM from a `.smolmachine` sidecar file.
 //!
-//! This allows the main `smolvm` binary to act as a sidecar runner, booting
-//! a VM from extracted assets using the dlopen-based libkrun launcher and
-//! reusing the existing `AgentClient` for all I/O.
+//! This module provides two entry points:
+//!
+//! 1. **`RunPackedCmd`** — the explicit `smolvm run-packed` subcommand
+//! 2. **`run_as_packed_binary()`** — auto-detected packed binary mode,
+//!    called from `main()` before clap parses the normal CLI
+//!
+//! Both paths converge on the same VM launch infrastructure.
 
 use crate::cli::parsers::{parse_env_spec, parse_mounts, parse_port};
-use clap::Args;
+use clap::{Args, Parser, Subcommand};
 use smolvm::agent::launcher_dynamic::{
     launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig, PackedMount,
 };
 use smolvm::agent::{mount_tag, AgentClient, PortMapping, RunConfig, VmResources};
 use smolvm::Error;
+use smolvm_pack::detect::PackedMode;
 use smolvm_pack::extract;
 use smolvm_pack::packer::{
     read_footer_from_sidecar, read_manifest_from_sidecar, verify_sidecar_checksum,
@@ -553,4 +558,383 @@ fn execute_command(
         crate::cli::flush_output();
         Ok(exit_code)
     }
+}
+
+// ===========================================================================
+// Packed binary auto-detection entry point
+// ===========================================================================
+
+/// CLI parser for when the binary is running as a packed executable.
+///
+/// This is separate from `RunPackedCmd` because:
+/// - No `--sidecar` flag (mode is auto-detected)
+/// - Binary name shows as the packed binary name, not "smolvm"
+/// - Supports daemon subcommands (start/exec/stop/status)
+#[derive(Parser, Debug)]
+#[command(name = "packed-binary")]
+#[command(about = "Run a containerized application in a microVM")]
+struct PackedCli {
+    /// Daemon subcommand (start/exec/stop/status)
+    #[command(subcommand)]
+    daemon_command: Option<PackedDaemonCmd>,
+
+    /// Command to run (overrides image entrypoint/cmd)
+    #[arg(trailing_var_arg = true, conflicts_with = "daemon_command")]
+    command: Vec<String>,
+
+    /// Mount a volume (HOST:GUEST[:ro])
+    #[arg(
+        short = 'v',
+        long = "volume",
+        value_name = "HOST:GUEST[:ro]",
+        global = true
+    )]
+    volume: Vec<String>,
+
+    /// Set environment variable (KEY=VALUE)
+    #[arg(short = 'e', long = "env", value_name = "KEY=VALUE", global = true)]
+    env: Vec<String>,
+
+    /// Working directory inside the container
+    #[arg(short = 'w', long = "workdir", value_name = "PATH", global = true)]
+    workdir: Option<String>,
+
+    /// Keep stdin open for interactive input
+    #[arg(short = 'i', long)]
+    interactive: bool,
+
+    /// Allocate a pseudo-TTY (use with -i for interactive shells)
+    #[arg(short = 't', long)]
+    tty: bool,
+
+    /// Kill command after duration (e.g., "30s", "5m")
+    #[arg(long, value_parser = crate::cli::parsers::parse_duration, value_name = "DURATION")]
+    timeout: Option<Duration>,
+
+    /// Number of vCPUs (overrides default)
+    #[arg(long, value_name = "N", global = true)]
+    cpus: Option<u8>,
+
+    /// Memory in MiB (overrides default)
+    #[arg(long, value_name = "MiB", global = true)]
+    mem: Option<u32>,
+
+    /// Expose port from container to host
+    #[arg(short = 'p', long = "port", value_parser = parse_port, value_name = "HOST:GUEST")]
+    port: Vec<PortMapping>,
+
+    /// Enable outbound network access
+    #[arg(long)]
+    net: bool,
+
+    /// Show manifest info and exit
+    #[arg(long)]
+    info: bool,
+
+    /// Force re-extraction of assets
+    #[arg(long, global = true)]
+    force_extract: bool,
+
+    /// Print debug information
+    #[arg(long, global = true)]
+    debug: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum PackedDaemonCmd {
+    /// Start the VM daemon (keeps running for subsequent exec calls)
+    Start,
+    /// Execute a command in the running daemon VM (~50ms)
+    Exec {
+        /// Command to run
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    /// Stop the running daemon VM
+    Stop,
+    /// Check if the daemon VM is running
+    Status,
+}
+
+/// Entry point when auto-detection determines we are a packed binary.
+///
+/// Called from `main()` before clap parses the normal CLI.
+/// Parses its own `PackedCli` args and executes accordingly.
+/// Never returns — calls `std::process::exit()`.
+pub fn run_as_packed_binary(mode: PackedMode) -> ! {
+    let cli = PackedCli::parse();
+
+    let result = run_packed_inner(mode, cli);
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_packed_inner(mode: PackedMode, cli: PackedCli) -> smolvm::Result<()> {
+    // Handle daemon subcommands (not yet implemented)
+    if let Some(daemon_cmd) = cli.daemon_command {
+        return Err(Error::agent(
+            "daemon mode",
+            match daemon_cmd {
+                PackedDaemonCmd::Start => "daemon mode not yet implemented. Run commands directly.",
+                PackedDaemonCmd::Exec { .. } => "daemon mode not yet implemented.",
+                PackedDaemonCmd::Stop => "daemon mode not yet implemented.",
+                PackedDaemonCmd::Status => "daemon mode not yet implemented.",
+            },
+        ));
+    }
+
+    match mode {
+        PackedMode::Sidecar {
+            sidecar_path,
+            footer: _,
+        } => {
+            // Construct RunPackedCmd from PackedCli and delegate to existing path
+            let cmd = RunPackedCmd {
+                sidecar: Some(sidecar_path),
+                command: cli.command,
+                interactive: cli.interactive,
+                tty: cli.tty,
+                timeout: cli.timeout,
+                workdir: cli.workdir,
+                env: cli.env,
+                volume: cli.volume,
+                port: cli.port,
+                net: cli.net,
+                cpus: cli.cpus,
+                mem: cli.mem,
+                force_extract: cli.force_extract,
+                info: cli.info,
+                debug: cli.debug,
+            };
+            cmd.run()
+        }
+
+        #[cfg(target_os = "macos")]
+        PackedMode::Section {
+            manifest,
+            checksum,
+            assets_ptr,
+            assets_size,
+        } => run_section_mode(*manifest, checksum, assets_ptr, assets_size, cli),
+
+        PackedMode::Embedded { exe_path, footer } => run_embedded_mode(exe_path, footer, cli),
+    }
+}
+
+/// Run from Mach-O section-embedded assets.
+#[cfg(target_os = "macos")]
+fn run_section_mode(
+    manifest: smolvm_pack::PackManifest,
+    checksum: u32,
+    assets_ptr: *const u8,
+    assets_size: usize,
+    cli: PackedCli,
+) -> smolvm::Result<()> {
+    if cli.info {
+        print_manifest_info(&manifest, checksum);
+        return Ok(());
+    }
+
+    let cache_dir = extract::get_cache_dir(checksum)
+        .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
+
+    let needs_extract = cli.force_extract || !extract::is_extracted(&cache_dir);
+    if needs_extract {
+        unsafe {
+            extract::extract_from_section(&cache_dir, assets_ptr, assets_size, cli.debug)
+                .map_err(|e| Error::agent("extract section assets", e.to_string()))?;
+        }
+    }
+
+    run_from_cache(&cache_dir, &manifest, cli)
+}
+
+/// Run from binary-appended assets.
+fn run_embedded_mode(
+    exe_path: PathBuf,
+    footer: smolvm_pack::PackFooter,
+    cli: PackedCli,
+) -> smolvm::Result<()> {
+    // Read manifest from the binary
+    let manifest = smolvm_pack::read_manifest(&exe_path)
+        .map_err(|e| Error::agent("read manifest", e.to_string()))?;
+
+    if cli.info {
+        print_manifest_info(&manifest, footer.checksum);
+        return Ok(());
+    }
+
+    let cache_dir = extract::get_cache_dir(footer.checksum)
+        .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
+
+    let needs_extract = cli.force_extract || !extract::is_extracted(&cache_dir);
+    if needs_extract {
+        extract::extract_from_binary(&exe_path, &cache_dir, &footer, cli.debug)
+            .map_err(|e| Error::agent("extract embedded assets", e.to_string()))?;
+    }
+
+    run_from_cache(&cache_dir, &manifest, cli)
+}
+
+/// Shared launch path for section and embedded modes.
+///
+/// Assets are already extracted to `cache_dir`. Boot VM and run the command.
+fn run_from_cache(
+    cache_dir: &Path,
+    manifest: &smolvm_pack::PackManifest,
+    cli: PackedCli,
+) -> smolvm::Result<()> {
+    let rootfs_path = cache_dir.join("agent-rootfs");
+    let lib_dir = cache_dir.join("lib");
+    let layers_dir = cache_dir.join("layers");
+    let runtime_parent = cache_dir.join("runtime");
+    std::fs::create_dir_all(&runtime_parent)
+        .map_err(|e| Error::agent("create runtime parent", e.to_string()))?;
+    let runtime_dir = tempfile::tempdir_in(&runtime_parent)
+        .map_err(|e| Error::agent("create runtime dir", e.to_string()))?;
+
+    let storage_path = runtime_dir.path().join("storage.ext4");
+    let vsock_path = runtime_dir.path().join("agent.sock");
+
+    let template = manifest
+        .assets
+        .storage_template
+        .as_ref()
+        .map(|t| t.path.as_str());
+    extract::create_or_copy_storage_disk(cache_dir, template, &storage_path)
+        .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
+
+    let mounts = parse_mounts(&cli.volume)?;
+    let port_mappings: Vec<(u16, u16)> = cli.port.iter().map(|p| (p.host, p.guest)).collect();
+
+    let resources = VmResources {
+        cpus: cli.cpus.unwrap_or(manifest.cpus),
+        mem: cli.mem.unwrap_or(manifest.mem),
+        network: cli.net || !cli.port.is_empty(),
+    };
+
+    let packed_mounts: Vec<PackedMount> = mounts
+        .iter()
+        .enumerate()
+        .map(|(i, m)| PackedMount {
+            tag: mount_tag(i),
+            host_path: m.source.to_string_lossy().to_string(),
+            guest_path: m.target.to_string_lossy().to_string(),
+            read_only: m.read_only,
+        })
+        .collect();
+
+    smolvm::process::install_sigchld_handler();
+
+    let debug = cli.debug;
+    let vsock_path_clone = vsock_path.clone();
+    let child_pid = smolvm::process::fork_session_leader(move || {
+        let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("failed to load libkrun: {}", e);
+                smolvm::process::exit_child(1);
+            }
+        };
+
+        let config = PackedLaunchConfig {
+            rootfs_path: &rootfs_path,
+            storage_path: &storage_path,
+            vsock_socket: &vsock_path_clone,
+            layers_dir: &layers_dir,
+            mounts: &packed_mounts,
+            port_mappings: &port_mappings,
+            resources,
+            debug,
+        };
+
+        if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
+            eprintln!("VM launch failed: {}", e);
+        }
+        smolvm::process::exit_child(1);
+    })
+    .map_err(|e| Error::agent("fork VM process", e.to_string()))?;
+
+    let child_start_time = {
+        let mut st = smolvm::process::process_start_time(child_pid);
+        if st.is_none() && smolvm::process::is_alive(child_pid) {
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(1));
+                st = smolvm::process::process_start_time(child_pid);
+                if st.is_some() {
+                    break;
+                }
+            }
+        }
+        if st.is_none() && smolvm::process::is_alive(child_pid) {
+            let _ = smolvm::process::stop_process_fast(child_pid, Duration::from_secs(5), true);
+            let _ = std::fs::remove_dir_all(runtime_dir.path());
+            return Err(Error::agent(
+                "verify child process",
+                "unable to capture child start time for safe lifecycle management",
+            ));
+        }
+        st
+    };
+
+    let child_guard = ChildGuard {
+        pid: child_pid,
+        start_time: child_start_time,
+        runtime_dir,
+    };
+
+    let mut client = wait_for_agent(&vsock_path, debug)?;
+
+    // Build a minimal RunPackedCmd-like struct for execute_command
+    let args = RunPackedCmd {
+        sidecar: None,
+        command: cli.command,
+        interactive: cli.interactive,
+        tty: cli.tty,
+        timeout: cli.timeout,
+        workdir: cli.workdir,
+        env: cli.env,
+        volume: Vec::new(), // already parsed
+        port: Vec::new(),   // already parsed
+        net: cli.net,
+        cpus: cli.cpus,
+        mem: cli.mem,
+        force_extract: false,
+        info: false,
+        debug,
+    };
+
+    let exit_code = execute_command(&mut client, manifest, &args, &mounts)?;
+
+    drop(child_guard);
+    std::process::exit(exit_code);
+}
+
+fn print_manifest_info(manifest: &smolvm_pack::PackManifest, checksum: u32) {
+    println!("Image:      {}", manifest.image);
+    println!("Digest:     {}", manifest.digest);
+    println!("Platform:   {}", manifest.platform);
+    println!("CPUs:       {}", manifest.cpus);
+    println!("Memory:     {} MiB", manifest.mem);
+    if !manifest.entrypoint.is_empty() {
+        println!("Entrypoint: {}", manifest.entrypoint.join(" "));
+    }
+    if !manifest.cmd.is_empty() {
+        println!("Cmd:        {}", manifest.cmd.join(" "));
+    }
+    if let Some(ref wd) = manifest.workdir {
+        println!("Workdir:    {}", wd);
+    }
+    if !manifest.env.is_empty() {
+        println!("Env:");
+        for e in &manifest.env {
+            println!("  {}", e);
+        }
+    }
+    println!("Checksum:   {:08x}", checksum);
 }
