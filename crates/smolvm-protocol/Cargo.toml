@@ -1,9 +1,9 @@
 [package]
 name = "smolvm-protocol"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Protocol types for smolvm host-guest communication"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [dependencies]
 base64 = { workspace = true }

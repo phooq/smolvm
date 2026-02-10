@@ -1,9 +1,9 @@
 [package]
 name = "smolvm-agent"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2021"
 description = "Guest agent for smolvm VMs (handles OCI operations and command execution)"
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [[bin]]
 name = "smolvm-agent"

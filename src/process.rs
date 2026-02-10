@@ -218,7 +218,14 @@ pub fn process_start_time(pid: libc::pid_t) -> Option<u64> {
         )
     };
     if ret > 0 {
-        Some(info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec)
+        let usec = info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec;
+        // proc_pidinfo can return a zeroed struct for session-leader children
+        // (e.g., VM processes that called setsid()). Treat 0 as unavailable.
+        if usec > 0 {
+            Some(usec)
+        } else {
+            None
+        }
     } else {
         None
     }

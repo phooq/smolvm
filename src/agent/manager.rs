@@ -785,13 +785,28 @@ impl AgentManager {
 
         // Graceful shutdown via vsock - waits for agent to acknowledge
         // The agent calls sync() before responding, ensuring ext4 journal is flushed
-        if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket) {
-            let _ = client.shutdown();
-        }
+        let shutdown_acked = if let Ok(mut client) = super::AgentClient::connect(&self.vsock_socket)
+        {
+            client.shutdown().is_ok()
+        } else {
+            false
+        };
 
         if let Some(pid) = child_pid {
-            // Verify PID identity before signaling to prevent killing wrong process
-            if process::is_our_process_strict(pid, pid_start_time) {
+            // Verify PID identity before signaling to prevent killing wrong process.
+            // Session-leader children (VM processes) may return None from
+            // process_start_time() because proc_pidinfo can't read their BSD info
+            // from a different session. In that case, if the agent acknowledged
+            // shutdown over vsock, we know it's our process — proceed with kill.
+            let identity_verified = process::is_our_process_strict(pid, pid_start_time);
+            if identity_verified || shutdown_acked {
+                if !identity_verified {
+                    tracing::debug!(
+                        pid,
+                        "PID identity not verified (session-leader child), \
+                         but shutdown was acknowledged over vsock"
+                    );
+                }
                 let _ = process::stop_process_fast(pid, AGENT_STOP_TIMEOUT, true);
             } else {
                 tracing::warn!(pid, "skipping stop_process_fast: PID identity not verified");
