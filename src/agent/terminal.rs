@@ -111,6 +111,8 @@ pub struct PollResult {
     pub stdin_ready: bool,
     /// True if the socket has data available to read.
     pub socket_ready: bool,
+    /// True if the socket has hung up (peer closed connection).
+    pub socket_hangup: bool,
 }
 
 /// Poll stdin and a socket for readability.
@@ -140,6 +142,7 @@ pub fn poll_io(stdin_fd: RawFd, socket_fd: RawFd, timeout_ms: i32) -> io::Result
             return Ok(PollResult {
                 stdin_ready: false,
                 socket_ready: false,
+                socket_hangup: false,
             });
         }
         return Err(err);
@@ -148,6 +151,7 @@ pub fn poll_io(stdin_fd: RawFd, socket_fd: RawFd, timeout_ms: i32) -> io::Result
     Ok(PollResult {
         stdin_ready: fds[0].revents & libc::POLLIN != 0,
         socket_ready: fds[1].revents & libc::POLLIN != 0,
+        socket_hangup: fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0,
     })
 }
 

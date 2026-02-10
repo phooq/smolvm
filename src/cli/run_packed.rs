@@ -449,18 +449,26 @@ fn wait_for_agent(vsock_path: &Path, debug: bool) -> smolvm::Result<AgentClient>
         }
 
         if vsock_path.exists() {
+            // Connect opens the Unix socket to the muxer, but the guest agent
+            // may not be listening on vsock port 6000 yet. We must ping to
+            // verify end-to-end connectivity before declaring the agent ready.
             match AgentClient::connect(vsock_path) {
-                Ok(client) => {
-                    if debug {
-                        eprintln!(
-                            "debug: agent ready after {:.1}s",
-                            start.elapsed().as_secs_f64()
-                        );
+                Ok(mut client) => match client.ping() {
+                    Ok(_) => {
+                        if debug {
+                            eprintln!(
+                                "debug: agent ready after {:.1}s",
+                                start.elapsed().as_secs_f64()
+                            );
+                        }
+                        return Ok(client);
                     }
-                    return Ok(client);
-                }
+                    Err(_) => {
+                        // Muxer accepted but guest agent not ready yet
+                    }
+                },
                 Err(_) => {
-                    // Socket exists but agent not ready yet
+                    // Socket exists but not connectable yet
                 }
             }
         }

@@ -364,6 +364,19 @@ impl Error {
     pub fn kvm_permission(reason: impl Into<String>) -> Self {
         Self::KvmPermission(reason.into())
     }
+
+    /// Returns true if this is an `Io` variant.
+    pub fn is_io(&self) -> bool {
+        matches!(self, Self::Io(_))
+    }
+
+    /// If this is an `Io` variant, return the inner `ErrorKind`.
+    pub fn source_io_error_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Self::Io(e) => Some(e.kind()),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

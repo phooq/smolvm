@@ -827,9 +827,26 @@ impl AgentClient {
                     }
                     Ok(_) => {}
                     Err(e) => {
+                        // EAGAIN/WouldBlock can occur when poll() reports readiness
+                        // but the data isn't available yet (common with vsock on macOS).
+                        // Retry on next poll iteration instead of crashing.
+                        if e.is_io()
+                            && matches!(
+                                e.source_io_error_kind(),
+                                Some(std::io::ErrorKind::WouldBlock)
+                            )
+                        {
+                            tracing::debug!("socket read returned EAGAIN, retrying");
+                            continue;
+                        }
                         return Err(e);
                     }
                 }
+            }
+
+            // Socket peer closed without sending Exited — VM crashed or was killed
+            if poll_result.socket_hangup && !poll_result.socket_ready {
+                return Err(Error::agent(op, "connection to VM lost".to_string()));
             }
 
             // Handle stdin input — send to agent
