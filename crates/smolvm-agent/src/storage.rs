@@ -823,7 +823,7 @@ where
             .ok_or_else(|| StorageError::new("failed to capture crane stdout".to_string()))?;
 
         let mut tar_cmd = Command::new("tar");
-        tar_cmd.args(["-xzf", "-", "-C"]);
+        tar_cmd.args(["--no-same-owner", "-xzf", "-", "-C"]);
         tar_cmd.arg(&layer_dir);
         tar_cmd.stdin(crane_stdout);
         tar_cmd.stdout(Stdio::null());
