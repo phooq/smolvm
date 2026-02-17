@@ -97,53 +97,11 @@ mkdir -p "$OUTPUT_DIR/storage"
 mkdir -p "$OUTPUT_DIR/etc/init.d"
 mkdir -p "$OUTPUT_DIR/run"
 
-# Remove existing init (it's a symlink to busybox)
+# Remove existing init (it's a symlink to busybox) and replace with
+# symlink to the agent binary. The agent handles overlayfs setup +
+# pivot_root internally before starting the vsock listener.
 rm -f "$OUTPUT_DIR/sbin/init"
-
-# Create init script
-cat > "$OUTPUT_DIR/sbin/init" << 'INIT_EOF'
-#!/bin/sh
-# Helper VM init script - optimized for fast boot
-# Disk is pre-formatted on host, so we skip mkfs here
-
-# Mount essential filesystems
-mount -t proc proc /proc
-mount -t sysfs sysfs /sys
-mount -t devtmpfs devtmpfs /dev
-
-# Create device nodes if needed
-[ -e /dev/vda ] || mknod /dev/vda b 253 0
-
-# Mount storage disk (pre-formatted on host for speed)
-if [ -b /dev/vda ]; then
-    # Try to mount directly (disk should be pre-formatted)
-    if ! mount /dev/vda /storage 2>/dev/null; then
-        # Fallback: format if mount fails (first boot without host formatting)
-        echo "Formatting storage disk..."
-        mkfs.ext4 -F -q /dev/vda
-        mount /dev/vda /storage
-    fi
-
-    # Resize filesystem to fill disk (online resize, runs once)
-    # Host copies 512MB template and extends sparse file to 20GB.
-    # We resize the ext4 filesystem here to use all available space.
-    if command -v resize2fs >/dev/null 2>&1; then
-        resize2fs /dev/vda 2>/dev/null || true
-    fi
-
-    # Create directory structure (fast, only if missing)
-    mkdir -p /storage/layers /storage/configs /storage/manifests /storage/overlays
-    # Container runtime directories for crun
-    mkdir -p /storage/containers/run /storage/containers/logs /storage/containers/exit
-fi
-
-# Set up networking (if available)
-ip link set lo up 2>/dev/null || true
-
-# Start agent daemon
-exec /usr/local/bin/smolvm-agent
-INIT_EOF
-chmod +x "$OUTPUT_DIR/sbin/init"
+ln -sf /usr/local/bin/smolvm-agent "$OUTPUT_DIR/sbin/init"
 
 # Create resolv.conf
 echo "nameserver 1.1.1.1" > "$OUTPUT_DIR/etc/resolv.conf"

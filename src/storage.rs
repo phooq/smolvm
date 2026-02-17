@@ -453,6 +453,211 @@ impl StorageDisk {
     }
 }
 
+// ============================================================================
+// Overlay Disk
+// ============================================================================
+
+/// Default size for the rootfs overlay disk (2 GB sparse).
+pub const DEFAULT_OVERLAY_SIZE_GB: u64 = 2;
+
+/// Overlay disk filename.
+pub const OVERLAY_DISK_FILENAME: &str = "overlay.raw";
+
+/// Persistent rootfs overlay disk.
+///
+/// A sparse ext4 disk image used as the upper layer of an overlayfs
+/// on top of the initramfs. Changes to the root filesystem (e.g.,
+/// `apk add git`) persist across VM reboots.
+///
+/// The overlay is set up by the agent's `setup_persistent_rootfs()`
+/// function early in boot, before the vsock listener starts.
+#[derive(Debug, Clone)]
+pub struct OverlayDisk {
+    /// Path to the disk image file.
+    path: PathBuf,
+    /// Size in bytes.
+    #[allow(dead_code)]
+    size_bytes: u64,
+}
+
+impl OverlayDisk {
+    /// Open or create the overlay disk at a custom path.
+    pub fn open_or_create_at(path: &Path, size_gb: u64) -> Result<Self> {
+        if size_gb == 0 {
+            return Err(Error::config(
+                "validate overlay size",
+                "disk size must be greater than 0 GB",
+            ));
+        }
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let size_bytes = size_gb * 1024 * 1024 * 1024;
+
+        if path.exists() {
+            let metadata = std::fs::metadata(path)?;
+            Ok(Self {
+                path: path.to_path_buf(),
+                size_bytes: metadata.len(),
+            })
+        } else {
+            // Create sparse disk image
+            Self::create_sparse(path, size_bytes)?;
+            Ok(Self {
+                path: path.to_path_buf(),
+                size_bytes,
+            })
+        }
+    }
+
+    /// Create a sparse disk image.
+    fn create_sparse(path: &Path, size_bytes: u64) -> Result<()> {
+        use std::fs::OpenOptions;
+        use std::io::{Seek, SeekFrom, Write};
+
+        assert!(size_bytes > 0, "disk size must be greater than 0");
+
+        tracing::info!(
+            path = %path.display(),
+            size_gb = size_bytes / (1024 * 1024 * 1024),
+            "creating sparse overlay disk"
+        );
+
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.seek(SeekFrom::Start(size_bytes - 1))?;
+        file.write_all(&[0])?;
+        file.sync_all()?;
+
+        Ok(())
+    }
+
+    /// Pre-format the overlay disk with ext4 on the host.
+    pub fn ensure_formatted(&self) -> Result<()> {
+        if !self.needs_format() {
+            tracing::debug!(path = %self.path.display(), "overlay disk already formatted");
+            return Ok(());
+        }
+
+        self.format_with_mkfs()
+    }
+
+    /// Format the disk using mkfs.ext4.
+    fn format_with_mkfs(&self) -> Result<()> {
+        tracing::info!(path = %self.path.display(), "formatting overlay disk with mkfs.ext4");
+
+        let mkfs_path = find_e2fsprogs_tool("mkfs.ext4").ok_or_else(|| {
+            let hint = if crate::platform::Os::current().is_macos() {
+                "On macOS, install with: brew install e2fsprogs"
+            } else {
+                "On Linux, install with: apt install e2fsprogs (or equivalent)"
+            };
+            Error::storage(
+                "find mkfs.ext4",
+                format!(
+                    "mkfs.ext4 not found - required for overlay disk formatting.\n  {}",
+                    hint
+                ),
+            )
+        })?;
+
+        let path_str = self.path.to_str().ok_or_else(|| {
+            Error::storage(
+                "validate path",
+                "overlay disk path contains invalid characters",
+            )
+        })?;
+
+        let output = std::process::Command::new(mkfs_path)
+            .args(["-F", "-q", "-m", "0", "-L", "smolvm-overlay", path_str])
+            .output()
+            .map_err(|e| Error::storage("run mkfs.ext4", e.to_string()))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(Error::storage(
+                "format overlay with mkfs.ext4",
+                stderr.to_string(),
+            ));
+        }
+
+        self.mark_formatted()?;
+
+        tracing::info!(path = %self.path.display(), "overlay disk formatted successfully");
+        Ok(())
+    }
+
+    /// Get the path to the disk image.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Check if the disk needs to be formatted.
+    fn needs_format(&self) -> bool {
+        let marker_path = self.marker_path();
+        if !marker_path.exists() {
+            return true;
+        }
+        if !self.path.exists() {
+            let _ = std::fs::remove_file(&marker_path);
+            return true;
+        }
+
+        // Validate disk appears to be ext4 (detect corruption)
+        if !self.appears_valid_ext4() {
+            tracing::warn!(
+                path = %self.path.display(),
+                "overlay disk appears corrupt, will reformat"
+            );
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(&marker_path);
+            return true;
+        }
+
+        false
+    }
+
+    /// Check if the disk file appears to be a valid ext4 filesystem.
+    fn appears_valid_ext4(&self) -> bool {
+        let output = std::process::Command::new("file")
+            .arg("-b")
+            .arg(&self.path)
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => {
+                let desc = String::from_utf8_lossy(&output.stdout);
+                desc.contains("ext4") || desc.contains("ext2") || desc.contains("ext3")
+            }
+            _ => true, // If `file` command unavailable, assume valid
+        }
+    }
+
+    /// Mark the disk as formatted.
+    fn mark_formatted(&self) -> Result<()> {
+        std::fs::write(self.marker_path(), "1")?;
+        Ok(())
+    }
+
+    /// Get the path to the format marker file.
+    fn marker_path(&self) -> PathBuf {
+        self.path.with_extension("formatted")
+    }
+
+    /// Delete the overlay disk and its marker.
+    pub fn delete(&self) -> Result<()> {
+        if self.path.exists() {
+            std::fs::remove_file(&self.path)?;
+        }
+        let marker = self.marker_path();
+        if marker.exists() {
+            std::fs::remove_file(&marker)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,5 +779,76 @@ mod tests {
         file.seek(SeekFrom::Start(1080)).unwrap();
         file.write_all(&[0x00, 0x00]).unwrap();
         file.sync_all().unwrap();
+    }
+
+    #[test]
+    fn test_overlay_disk_create_and_delete() {
+        let temp_dir = std::env::temp_dir().join("smolvm_test_overlay");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let disk_path = temp_dir.join("test_overlay.raw");
+
+        // Clean up any existing file
+        let _ = std::fs::remove_file(&disk_path);
+        let _ = std::fs::remove_file(disk_path.with_extension("formatted"));
+
+        // Create overlay disk (1 GB for testing)
+        let disk = OverlayDisk::open_or_create_at(&disk_path, 1).unwrap();
+
+        assert!(disk_path.exists());
+        assert!(disk.needs_format());
+
+        // Write ext4 magic so appears_valid_ext4() passes
+        write_ext4_magic(&disk_path);
+
+        // Mark as formatted
+        disk.mark_formatted().unwrap();
+        assert!(!disk.needs_format());
+
+        // Delete disk
+        disk.delete().unwrap();
+        assert!(!disk_path.exists());
+
+        // Clean up temp dir
+        let _ = std::fs::remove_dir(&temp_dir);
+    }
+
+    #[test]
+    fn test_overlay_disk_zero_size_rejected() {
+        let temp_dir = std::env::temp_dir().join("smolvm_test_overlay_zero");
+        let disk_path = temp_dir.join("zero_overlay.raw");
+        assert!(OverlayDisk::open_or_create_at(&disk_path, 0).is_err());
+    }
+
+    #[test]
+    fn test_overlay_disk_ensure_formatted() {
+        // Skip if mkfs.ext4 is not available (CI without e2fsprogs)
+        if find_e2fsprogs_tool("mkfs.ext4").is_none() {
+            eprintln!("skipping test_overlay_disk_ensure_formatted: mkfs.ext4 not found");
+            return;
+        }
+
+        let temp_dir = std::env::temp_dir().join("smolvm_test_overlay_fmt");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let disk_path = temp_dir.join("fmt_overlay.raw");
+
+        // Clean up any existing files
+        let _ = std::fs::remove_file(&disk_path);
+        let _ = std::fs::remove_file(disk_path.with_extension("formatted"));
+
+        // Create overlay disk (1 GB sparse)
+        let disk = OverlayDisk::open_or_create_at(&disk_path, 1).unwrap();
+        assert!(disk.needs_format());
+
+        // Format it — this calls mkfs.ext4 for real
+        disk.ensure_formatted().unwrap();
+        assert!(!disk.needs_format());
+
+        // Calling ensure_formatted again should be a no-op
+        disk.ensure_formatted().unwrap();
+
+        // Clean up
+        disk.delete().unwrap();
+        assert!(!disk_path.exists());
+        let _ = std::fs::remove_dir(&temp_dir);
     }
 }

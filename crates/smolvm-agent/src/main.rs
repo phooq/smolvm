@@ -64,10 +64,20 @@ fn uptime_ms() -> u64 {
 }
 
 fn main() {
+    // Quick --version check (used by init script to detect rootfs updates)
+    if std::env::args().any(|a| a == "--version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
     // CRITICAL: Mount essential filesystems FIRST, before anything else.
     // When running as init (PID 1), we need these for the system to function.
     // This must happen before logging (which needs /dev for output).
     mount_essential_filesystems();
+
+    // Set up persistent rootfs overlay (if /dev/vdb exists).
+    // This does overlayfs + pivot_root before anything else touches the filesystem.
+    setup_persistent_rootfs();
 
     // CRITICAL: Create vsock listener IMMEDIATELY after mounts.
     // This must happen before logging setup to minimize time to listener ready.
@@ -75,7 +85,7 @@ fn main() {
     let listener = match vsock::listen(ports::AGENT_CONTROL) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("failed to create vsock listener: {}", e);
+            eprintln!("smolvm-agent: FAILED to create vsock listener: {}", e);
             std::process::exit(1);
         }
     };
@@ -145,18 +155,18 @@ fn main() {
     }
 }
 
+/// Helper to create a CString from a static str.
+/// Used by boot functions that call libc mount/mknod/pivot_root.
+#[cfg(target_os = "linux")]
+fn cstr(s: &str) -> std::ffi::CString {
+    std::ffi::CString::new(s).expect("static string without null bytes")
+}
+
 /// Mount essential filesystems (proc, sysfs, devtmpfs).
 /// This must be done first when running as init (PID 1).
 /// Uses direct syscalls to avoid any overhead.
 #[cfg(target_os = "linux")]
 fn mount_essential_filesystems() {
-    use std::ffi::CString;
-
-    // Helper to create CString from static str (safe: no null bytes in literals)
-    fn cstr(s: &str) -> CString {
-        CString::new(s).expect("static string without null bytes")
-    }
-
     // Mount proc
     let _ = std::fs::create_dir_all("/proc");
     // SAFETY: libc::mount with valid CString pointers for proc filesystem
@@ -210,6 +220,171 @@ fn mount_essential_filesystems() {
 /// Stub for non-Linux platforms (agent only runs on Linux inside VM).
 #[cfg(not(target_os = "linux"))]
 fn mount_essential_filesystems() {
+    // No-op on non-Linux platforms
+}
+
+/// Set up persistent rootfs overlay using overlayfs on /dev/vdb.
+///
+/// If /dev/vdb exists (overlay disk attached by host), this function:
+/// 1. Mounts /dev/vdb as ext4 (formats on first boot)
+/// 2. Creates overlayfs with initramfs as lower layer, /dev/vdb as upper
+/// 3. Moves /proc, /sys, /dev into the new root
+/// 4. Calls pivot_root to switch to the overlayfs root
+///
+/// After pivot_root, the old initramfs stays at /oldroot (needed as
+/// overlay lower layer). All subsequent writes go through overlayfs
+/// and are persisted to /dev/vdb.
+///
+/// If /dev/vdb doesn't exist, this is a no-op (backward compatible).
+#[cfg(target_os = "linux")]
+fn setup_persistent_rootfs() {
+    use std::path::Path;
+
+    const OVERLAY_DEVICE: &str = "/dev/vdb";
+    const OVERLAY_MOUNT: &str = "/mnt/overlay";
+    const NEWROOT: &str = "/mnt/newroot";
+
+    // Make root mount private — required for mount --move and pivot_root.
+    // libkrun's init.c sets MS_SHARED; we override with MS_PRIVATE.
+    let root = cstr("/");
+    // SAFETY: mount with MS_PRIVATE|MS_REC on root, no filesystem type
+    unsafe {
+        libc::mount(
+            std::ptr::null(),
+            root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_PRIVATE | libc::MS_REC,
+            std::ptr::null(),
+        );
+    }
+
+    // If overlay device doesn't exist, no overlay disk attached — skip.
+    // On devtmpfs, the kernel creates /dev/vdb automatically when libkrun
+    // attaches a second virtio-blk disk. No mknod needed.
+    if !Path::new(OVERLAY_DEVICE).exists() {
+        eprintln!("smolvm-agent: no overlay device, skipping");
+        return;
+    }
+    eprintln!("smolvm-agent: overlay device found, setting up overlayfs");
+
+    let _ = std::fs::create_dir_all(OVERLAY_MOUNT);
+
+    // Try to mount overlay disk (should be pre-formatted ext4)
+    let dev = cstr(OVERLAY_DEVICE);
+    let mnt = cstr(OVERLAY_MOUNT);
+    let ext4 = cstr("ext4");
+    // SAFETY: mount /dev/vdb as ext4 at /mnt/overlay
+    let mounted = unsafe {
+        libc::mount(
+            dev.as_ptr(),
+            mnt.as_ptr(),
+            ext4.as_ptr(),
+            0,
+            std::ptr::null(),
+        ) == 0
+    };
+
+    if !mounted {
+        eprintln!("smolvm-agent: formatting overlay disk on first boot");
+        // First boot — format the disk
+        let _ = std::process::Command::new("mkfs.ext4")
+            .args(["-F", "-q", "-L", "smolvm-overlay", OVERLAY_DEVICE])
+            .status();
+
+        let dev = cstr(OVERLAY_DEVICE);
+        let mnt = cstr(OVERLAY_MOUNT);
+        let ext4 = cstr("ext4");
+        // SAFETY: retry mount after formatting
+        if unsafe {
+            libc::mount(
+                dev.as_ptr(),
+                mnt.as_ptr(),
+                ext4.as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            eprintln!("smolvm-agent: failed to mount overlay disk after formatting");
+            return;
+        }
+    }
+
+    // Create overlay directories
+    let _ = std::fs::create_dir_all(format!("{}/upper", OVERLAY_MOUNT));
+    let _ = std::fs::create_dir_all(format!("{}/work", OVERLAY_MOUNT));
+    let _ = std::fs::create_dir_all(NEWROOT);
+
+    // Mount overlayfs: initramfs (lower, read-only) + persistent disk (upper)
+    let overlay_src = cstr("overlay");
+    let newroot = cstr(NEWROOT);
+    let overlay_type = cstr("overlay");
+    let overlay_opts = cstr(&format!(
+        "lowerdir=/,upperdir={}/upper,workdir={}/work",
+        OVERLAY_MOUNT, OVERLAY_MOUNT
+    ));
+    // SAFETY: mount overlayfs with the specified options
+    let result = unsafe {
+        libc::mount(
+            overlay_src.as_ptr(),
+            newroot.as_ptr(),
+            overlay_type.as_ptr(),
+            0,
+            overlay_opts.as_ptr() as *const libc::c_void,
+        )
+    };
+    if result != 0 {
+        let err = std::io::Error::last_os_error();
+        eprintln!("smolvm-agent: failed to mount overlayfs: {}", err);
+        return;
+    }
+    eprintln!("smolvm-agent: overlayfs mounted, doing pivot_root");
+
+    // Create mount point directories in new root and move special mounts
+    for dir in &["proc", "sys", "dev"] {
+        let _ = std::fs::create_dir_all(format!("{}/{}", NEWROOT, dir));
+        let src = cstr(&format!("/{}", dir));
+        let dst = cstr(&format!("{}/{}", NEWROOT, dir));
+        // SAFETY: mount --move for each special filesystem
+        unsafe {
+            libc::mount(
+                src.as_ptr(),
+                dst.as_ptr(),
+                std::ptr::null(),
+                libc::MS_MOVE,
+                std::ptr::null(),
+            );
+        }
+    }
+
+    // Prepare for pivot_root
+    let _ = std::fs::create_dir_all(format!("{}/oldroot", NEWROOT));
+
+    if std::env::set_current_dir(NEWROOT).is_err() {
+        eprintln!("smolvm-agent: failed to chdir to new root");
+        return;
+    }
+
+    // pivot_root — switch to overlayed root.
+    // Old root stays at /oldroot (needed as overlay lower layer, ~44MB RAM).
+    let dot = cstr(".");
+    let oldroot = cstr("oldroot");
+    // SAFETY: pivot_root syscall with valid path arguments
+    let result = unsafe { libc::syscall(libc::SYS_pivot_root, dot.as_ptr(), oldroot.as_ptr()) };
+    if result != 0 {
+        let err = std::io::Error::last_os_error();
+        eprintln!("smolvm-agent: pivot_root failed: {}", err);
+        return;
+    }
+    eprintln!("smolvm-agent: pivot_root done");
+
+    // Set working directory to new root
+    let _ = std::env::set_current_dir("/");
+}
+
+/// Stub for non-Linux platforms.
+#[cfg(not(target_os = "linux"))]
+fn setup_persistent_rootfs() {
     // No-op on non-Linux platforms
 }
 

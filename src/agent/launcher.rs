@@ -5,13 +5,21 @@
 //! DYLD_LIBRARY_PATH is still available for dlopen.
 
 use crate::error::{Error, Result};
-use crate::storage::StorageDisk;
+use crate::storage::{OverlayDisk, StorageDisk};
 use crate::vm::config::HostMount;
 use smolvm_protocol::ports;
 use std::ffi::CString;
 use std::path::Path;
 
 use super::{PortMapping, VmResources};
+
+/// Disks to attach to the agent VM.
+pub struct VmDisks<'a> {
+    /// Storage disk for OCI layers (/dev/vda in guest).
+    pub storage: &'a StorageDisk,
+    /// Optional overlay disk for persistent rootfs (/dev/vdb in guest).
+    pub overlay: Option<&'a OverlayDisk>,
+}
 
 // FFI bindings to libkrun
 extern "C" {
@@ -60,7 +68,7 @@ const KRUN_TSI_HIJACK_INET: u32 = 1 << 0;
 /// This function never returns on success.
 pub fn launch_agent_vm(
     rootfs_path: &Path,
-    storage_disk: &StorageDisk,
+    disks: &VmDisks<'_>,
     vsock_socket: &Path,
     console_log: Option<&Path>,
     mounts: &[HostMount],
@@ -164,14 +172,29 @@ pub fn launch_agent_vm(
         }
 
         // Add storage disk (critical - VM needs storage to function)
+        // This is the first disk → /dev/vda in guest
         let block_id = CString::new("storage").expect("static string");
-        let disk_path = path_to_cstring(storage_disk.path())?;
+        let disk_path = path_to_cstring(disks.storage.path())?;
         if krun_add_disk2(ctx, block_id.as_ptr(), disk_path.as_ptr(), 0, false) < 0 {
             krun_free_ctx(ctx);
             return Err(Error::agent(
                 "add storage disk",
                 "krun_add_disk2 failed - VM cannot function without storage",
             ));
+        }
+
+        // Add overlay disk for persistent rootfs changes (optional)
+        // This is the second disk → /dev/vdb in guest
+        if let Some(overlay) = disks.overlay {
+            let overlay_id = CString::new("overlay").expect("static string");
+            let overlay_path = path_to_cstring(overlay.path())?;
+            if krun_add_disk2(ctx, overlay_id.as_ptr(), overlay_path.as_ptr(), 0, false) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::agent(
+                    "add overlay disk",
+                    "krun_add_disk2 failed for rootfs overlay",
+                ));
+            }
         }
 
         // Add vsock port for control channel (critical - host-guest communication)

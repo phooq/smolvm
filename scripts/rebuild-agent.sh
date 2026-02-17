@@ -44,8 +44,11 @@ fi
 
 echo "Installing agent binary..."
 cp target/release/smolvm-agent "$ROOTFS_DIR/usr/local/bin/"
-# Also update /sbin/init which is the actual entry point
-cp target/release/smolvm-agent "$ROOTFS_DIR/sbin/init"
+
+# /sbin/init is the kernel's entry point — symlink to the agent binary.
+# The agent handles overlayfs setup + pivot_root internally before
+# starting the vsock listener.
+ln -sf /usr/local/bin/smolvm-agent "$ROOTFS_DIR/sbin/init"
 
 echo "Stopping running agent (if any)..."
 export DYLD_LIBRARY_PATH="$PROJECT_DIR/lib"
@@ -54,5 +57,5 @@ export DYLD_LIBRARY_PATH="$PROJECT_DIR/lib"
 echo ""
 echo "Agent rebuilt and installed successfully!"
 echo "Binary: $ROOTFS_DIR/usr/local/bin/smolvm-agent"
-echo "Init:   $ROOTFS_DIR/sbin/init"
+echo "Init:   $ROOTFS_DIR/sbin/init (symlink to agent)"
 ls -la "$ROOTFS_DIR/usr/local/bin/smolvm-agent" "$ROOTFS_DIR/sbin/init"
