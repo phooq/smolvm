@@ -333,6 +333,81 @@ test_microvm_network_multiple_dns_lookups() {
 }
 
 # =============================================================================
+# Persistent Rootfs (Overlay)
+# Tests verify that the overlayfs root is active and persists across reboots.
+# =============================================================================
+
+test_microvm_overlay_root_active() {
+    local vm_name="overlay-active-test-$$"
+
+    # Clean up any existing
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create and start VM
+    $SMOLVM microvm create "$vm_name" 2>&1 || return 1
+    $SMOLVM microvm start "$vm_name" 2>&1 || { $SMOLVM microvm delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Check that root is an overlay mount
+    local output exit_code=0
+    output=$($SMOLVM microvm exec --name "$vm_name" -- mount 2>&1) || exit_code=$?
+
+    # Clean up
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"overlay on / type overlay"* ]]
+}
+
+test_microvm_rootfs_persists_across_reboot() {
+    local vm_name="overlay-persist-test-$$"
+
+    # Clean up any existing
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    # Create and start VM
+    $SMOLVM microvm create "$vm_name" 2>&1 || return 1
+    $SMOLVM microvm start "$vm_name" 2>&1 || { $SMOLVM microvm delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Write a marker file to the rootfs
+    local exit_code=0
+    $SMOLVM microvm exec --name "$vm_name" -- sh -c "echo persistence-test-ok > /tmp/overlay-test-marker" 2>&1 || exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Verify file exists before reboot
+    local output
+    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/overlay-test-marker 2>&1) || {
+        $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    }
+    if [[ "$output" != *"persistence-test-ok"* ]]; then
+        $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+        $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+        return 1
+    fi
+
+    # Stop and restart the VM
+    $SMOLVM microvm stop "$vm_name" 2>&1 || { $SMOLVM microvm delete "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM microvm start "$vm_name" 2>&1 || { $SMOLVM microvm delete "$vm_name" -f 2>/dev/null; return 1; }
+
+    # Verify the file survived the reboot
+    exit_code=0
+    output=$($SMOLVM microvm exec --name "$vm_name" -- cat /tmp/overlay-test-marker 2>&1) || exit_code=$?
+
+    # Clean up
+    $SMOLVM microvm stop "$vm_name" 2>/dev/null || true
+    $SMOLVM microvm delete "$vm_name" -f 2>/dev/null || true
+
+    [[ $exit_code -eq 0 ]] && [[ "$output" == *"persistence-test-ok"* ]]
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -352,5 +427,7 @@ run_test "DB delete removes from database" test_db_delete_removes_from_db || tru
 run_test "Network: disabled by default" test_microvm_network_disabled_by_default || true
 run_test "Network: DNS resolution" test_microvm_network_dns_resolution || true
 run_test "Network: multiple DNS lookups" test_microvm_network_multiple_dns_lookups || true
+run_test "Overlay: root is overlayfs" test_microvm_overlay_root_active || true
+run_test "Overlay: rootfs persists across reboot" test_microvm_rootfs_persists_across_reboot || true
 
 print_summary "MicroVM Tests"
