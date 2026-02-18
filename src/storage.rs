@@ -7,7 +7,7 @@
 //! # Storage Locations
 //!
 //! - Default VM: `~/Library/Application Support/smolvm/storage.raw` (macOS)
-//! - Named VMs: `~/Library/Caches/smolvm/vms/{name}/storage.img` (macOS)
+//! - Named VMs: `~/Library/Caches/smolvm/vms/{name}/storage.raw` (macOS)
 //!
 //! # Architecture
 //!

@@ -257,7 +257,7 @@ impl AgentManager {
             .join(&name);
         std::fs::create_dir_all(&storage_dir)?;
 
-        let storage_path = storage_dir.join("storage.img");
+        let storage_path = storage_dir.join(crate::storage::STORAGE_DISK_FILENAME);
         let storage_disk =
             StorageDisk::open_or_create_at(&storage_path, crate::storage::DEFAULT_STORAGE_SIZE_GB)?;
 
