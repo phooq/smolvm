@@ -1220,17 +1220,20 @@ impl AgentClient {
         Ok(())
     }
 
-    /// Read exactly `buf.len()` bytes, retrying on EAGAIN/WouldBlock only
-    /// when partial data has already been read (to avoid losing bytes).
+    /// Read exactly `buf.len()` bytes, retrying on EAGAIN/WouldBlock.
     ///
     /// Unlike `read_exact`, this never loses partially-read data on EAGAIN.
     /// On macOS, vsock sockets can spuriously return WouldBlock even in
     /// blocking mode, so we must handle it without corrupting the stream.
     ///
-    /// If WouldBlock occurs before any bytes are read (pos == 0), the error
-    /// is propagated — this preserves read timeout behavior for callers that
-    /// set one (non-interactive exec paths).
-    fn read_exact_retry(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+    /// If `propagate_initial_wouldblock` is true and WouldBlock occurs before
+    /// any bytes are read, the error is propagated (preserves read timeout
+    /// behavior). Once any bytes are consumed, EAGAIN is always retried.
+    fn read_exact_retry(
+        &mut self,
+        buf: &mut [u8],
+        propagate_initial_wouldblock: bool,
+    ) -> std::io::Result<()> {
         let mut pos = 0;
         while pos < buf.len() {
             match self.stream.read(&mut buf[pos..]) {
@@ -1242,11 +1245,11 @@ impl AgentClient {
                 }
                 Ok(n) => pos += n,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if pos == 0 {
-                        // No partial data consumed — safe to propagate (e.g. timeout)
+                    if pos == 0 && propagate_initial_wouldblock {
+                        // No data consumed yet and caller wants timeout errors — propagate
                         return Err(e);
                     }
-                    // Mid-frame EAGAIN — must retry to avoid losing partial data
+                    // Either mid-read or caller wants full retry — must retry
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
@@ -1259,8 +1262,13 @@ impl AgentClient {
 
     /// Low-level receive a single response.
     fn receive(&mut self) -> Result<AgentResponse> {
+        // Check if a read timeout is set — if so, WouldBlock before any data
+        // means a real timeout and should be propagated. If no timeout (interactive
+        // sessions), WouldBlock is always a spurious macOS vsock EAGAIN.
+        let has_timeout = self.stream.read_timeout().ok().flatten().is_some();
+
         let mut header = [0u8; 4];
-        self.read_exact_retry(&mut header)?;
+        self.read_exact_retry(&mut header, has_timeout)?;
         let len = u32::from_be_bytes(header) as usize;
 
         // Validate frame size to prevent OOM from malicious/buggy responses
@@ -1275,7 +1283,9 @@ impl AgentClient {
         }
 
         let mut buf = vec![0u8; len];
-        self.read_exact_retry(&mut buf)?;
+        // Always retry body reads — header is already consumed so we can't
+        // propagate an error without corrupting the stream.
+        self.read_exact_retry(&mut buf, false)?;
 
         let resp: AgentResponse = serde_json::from_slice(&buf)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;
