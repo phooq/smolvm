@@ -234,6 +234,10 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     });
     config.save()?;
 
+    // Release the database lock so other smolvm commands can run concurrently
+    // (e.g. `smolvm microvm exec` while init commands are still running).
+    config.close_db();
+
     // Run init commands if configured
     if !record.init.is_empty() {
         println!("Running {} init command(s)...", record.init.len());
