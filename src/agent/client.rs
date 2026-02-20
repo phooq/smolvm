@@ -727,10 +727,10 @@ impl AgentClient {
     /// streaming stdout/stderr and forwarding stdin until `Exited`.
     fn interactive_session(&mut self, request: AgentRequest, tty: bool, op: &str) -> Result<i32> {
         use crate::agent::terminal::{
-            check_sigwinch, get_terminal_size, install_sigwinch_handler, poll_io, stdin_is_tty,
-            NonBlockingStdin, RawModeGuard,
+            check_sigwinch, flush_retry, get_terminal_size, install_sigwinch_handler, poll_io,
+            stdin_is_tty, write_all_retry, NonBlockingStdin, RawModeGuard,
         };
-        use std::io::{stderr, stdin, stdout, Read, Write};
+        use std::io::{stderr, stdin, stdout, Read};
         use std::os::unix::io::AsRawFd;
 
         // Disable socket read timeout for interactive sessions — the poll loop
@@ -799,12 +799,12 @@ impl AgentClient {
             if poll_result.socket_ready {
                 match self.receive() {
                     Ok(AgentResponse::Stdout { data }) => {
-                        stdout().write_all(&data)?;
-                        stdout().flush()?;
+                        write_all_retry(&mut stdout(), &data)?;
+                        flush_retry(&mut stdout())?;
                     }
                     Ok(AgentResponse::Stderr { data }) => {
-                        stderr().write_all(&data)?;
-                        stderr().flush()?;
+                        write_all_retry(&mut stderr(), &data)?;
+                        flush_retry(&mut stderr())?;
                     }
                     Ok(AgentResponse::Exited { exit_code }) => {
                         break exit_code;
@@ -1220,10 +1220,55 @@ impl AgentClient {
         Ok(())
     }
 
+    /// Read exactly `buf.len()` bytes, retrying on EAGAIN/WouldBlock.
+    ///
+    /// Unlike `read_exact`, this never loses partially-read data on EAGAIN.
+    /// On macOS, vsock sockets can spuriously return WouldBlock even in
+    /// blocking mode, so we must handle it without corrupting the stream.
+    ///
+    /// If `propagate_initial_wouldblock` is true and WouldBlock occurs before
+    /// any bytes are read, the error is propagated (preserves read timeout
+    /// behavior). Once any bytes are consumed, EAGAIN is always retried.
+    fn read_exact_retry(
+        &mut self,
+        buf: &mut [u8],
+        propagate_initial_wouldblock: bool,
+    ) -> std::io::Result<()> {
+        let mut pos = 0;
+        while pos < buf.len() {
+            match self.stream.read(&mut buf[pos..]) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed",
+                    ));
+                }
+                Ok(n) => pos += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if pos == 0 && propagate_initial_wouldblock {
+                        // No data consumed yet and caller wants timeout errors — propagate
+                        return Err(e);
+                    }
+                    // Either mid-read or caller wants full retry — must retry
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Low-level receive a single response.
     fn receive(&mut self) -> Result<AgentResponse> {
+        // Check if a read timeout is set — if so, WouldBlock before any data
+        // means a real timeout and should be propagated. If no timeout (interactive
+        // sessions), WouldBlock is always a spurious macOS vsock EAGAIN.
+        let has_timeout = self.stream.read_timeout().ok().flatten().is_some();
+
         let mut header = [0u8; 4];
-        self.stream.read_exact(&mut header)?;
+        self.read_exact_retry(&mut header, has_timeout)?;
         let len = u32::from_be_bytes(header) as usize;
 
         // Validate frame size to prevent OOM from malicious/buggy responses
@@ -1238,7 +1283,9 @@ impl AgentClient {
         }
 
         let mut buf = vec![0u8; len];
-        self.stream.read_exact(&mut buf)?;
+        // Always retry body reads — header is already consumed so we can't
+        // propagate an error without corrupting the stream.
+        self.read_exact_retry(&mut buf, false)?;
 
         let resp: AgentResponse = serde_json::from_slice(&buf)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;

@@ -189,6 +189,15 @@ impl SmolvmConfig {
         })
     }
 
+    /// Close the database, releasing the file lock.
+    ///
+    /// The in-memory VM cache remains valid but no further DB operations
+    /// are possible. Call this before long-running operations so other
+    /// smolvm processes can access the database.
+    pub fn close_db(&self) {
+        self.db.close();
+    }
+
     /// Save configuration to the database.
     ///
     /// This is now a no-op for VM records since writes are immediate.

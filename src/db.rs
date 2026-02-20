@@ -73,6 +73,16 @@ impl SmolvmDb {
         Ok(data_dir.join("smolvm").join("server").join("smolvm.redb"))
     }
 
+    /// Close the database, releasing the file lock.
+    ///
+    /// After closing, the database cannot be used for further operations.
+    /// This should be called before long-running operations (like starting
+    /// a VM) so other smolvm processes can access the database.
+    pub fn close(&self) {
+        let mut guard = self.db.write();
+        *guard = None;
+    }
+
     /// Initialize database tables.
     fn init_tables(&self) -> Result<()> {
         let db_guard = self.db.read();
