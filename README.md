@@ -50,6 +50,23 @@ smolVM makes microVMs easy: <250ms boot, works on macOS and Linux, single binary
 - run containers within microvm for improved isolation
 - distribute self-contained sandboxed applications
 
+## demo: run OpenAI Codex in a sandbox
+
+```bash
+# create a persistent microVM with networking
+smolvm microvm create codex-sandbox --net --cpus 2 --mem 1024
+smolvm microvm start codex-sandbox
+
+# install Node.js + Codex CLI
+smolvm microvm exec --name codex-sandbox -- sh -c "apk add nodejs npm && npm i -g @openai/codex"
+
+# login (pipe your API key)
+smolvm microvm exec --name codex-sandbox -- sh -c "echo $OPENAI_API_KEY | codex login --with-api-key"
+
+# run Codex interactively — fully isolated in a microVM
+smolvm microvm exec --name codex-sandbox -it -- codex
+```
+
 ## comparison
 
 |                     | Containers | QEMU | Firecracker | Kata | smolvm |
@@ -93,7 +110,6 @@ smolVM makes microVMs easy: <250ms boot, works on macOS and Linux, single binary
 
 ## known limitations
 
-- **Sandbox rootfs writes**: Writes to the sandbox container filesystem (`/tmp`, `/home`, etc.) fail due to a libkrun TSI bug with overlayfs. **Writes to mounted volumes work**. MicroVM rootfs writes work and persist across reboots.
 - **Network is opt-in**: Use `--net` to enable outbound network access (required for image pulls from registries). TCP/UDP only — ICMP (`ping`) and raw sockets do not work.
 - **Volume mounts**: Directories only (no single files)
 - **macOS**: Binary must be signed with Hypervisor.framework entitlements
