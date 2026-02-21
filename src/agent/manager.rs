@@ -1099,8 +1099,9 @@ impl Drop for AgentManager {
         let detached = self.inner.lock().detached;
 
         if !detached {
-            // Best-effort cleanup
-            let _ = self.stop();
+            if let Err(e) = self.stop() {
+                tracing::debug!(error = %e, "failed to stop agent in drop");
+            }
         }
     }
 }

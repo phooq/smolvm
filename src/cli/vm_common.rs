@@ -658,10 +658,9 @@ pub fn list_vms(kind: VmKind, verbose: bool, json: bool) -> smolvm::Result<()> {
                 obj
             })
             .collect();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json_vms).expect("JSON serialization failed")
-        );
+        let json = serde_json::to_string_pretty(&json_vms)
+            .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
+        println!("{}", json);
     } else {
         println!(
             "{:<20} {:<10} {:<5} {:<8} {:<6} {:<6}",

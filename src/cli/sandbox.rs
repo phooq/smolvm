@@ -19,6 +19,7 @@ use clap::{Args, Subcommand};
 use smolvm::agent::{
     docker_config_mount, AgentClient, AgentManager, PortMapping, RunConfig, VmResources,
 };
+use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -379,9 +380,9 @@ impl RunCmd {
         // Build command - for detached mode, default to sleep infinity
         let command = if self.command.is_empty() {
             if self.detach {
-                vec!["sleep".to_string(), "infinity".to_string()]
+                DEFAULT_IDLE_CMD.iter().map(|s| s.to_string()).collect()
             } else {
-                vec!["/bin/sh".to_string()]
+                vec![DEFAULT_SHELL_CMD.to_string()]
             }
         } else {
             self.command.clone()
@@ -683,10 +684,9 @@ impl ImagesCmd {
                 },
                 "images": images,
             });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).expect("JSON serialization failed")
-            );
+            let json = serde_json::to_string_pretty(&output)
+                .map_err(|e| smolvm::Error::config("serialize json", e.to_string()))?;
+            println!("{}", json);
         } else {
             // Print storage summary
             println!("Storage Usage:");
