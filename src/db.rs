@@ -32,6 +32,12 @@ impl std::fmt::Debug for SmolvmDb {
 }
 
 impl SmolvmDb {
+    /// Get a reference to the open database, or error if closed.
+    fn require_open(&self) -> Result<parking_lot::MappedRwLockReadGuard<'_, Database>> {
+        parking_lot::RwLockReadGuard::try_map(self.db.read(), |opt| opt.as_ref())
+            .map_err(|_| Error::database_unavailable("database is closed"))
+    }
+
     /// Open the database at the default location.
     ///
     /// Default path: `~/Library/Application Support/smolvm/server/smolvm.redb` (macOS)
@@ -85,10 +91,7 @@ impl SmolvmDb {
 
     /// Initialize database tables.
     fn init_tables(&self) -> Result<()> {
-        let db_guard = self.db.read();
-        let db = db_guard
-            .as_ref()
-            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
+        let db = self.require_open()?;
 
         let write_txn = db
             .begin_write()
@@ -118,10 +121,7 @@ impl SmolvmDb {
         let json = serde_json::to_vec(record)
             .map_err(|e| Error::database("serialize vm record", e.to_string()))?;
 
-        let db_guard = self.db.read();
-        let db = db_guard
-            .as_ref()
-            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
+        let db = self.require_open()?;
 
         let write_txn = db
             .begin_write()
@@ -151,10 +151,7 @@ impl SmolvmDb {
         let json = serde_json::to_vec(record)
             .map_err(|e| Error::database("serialize vm record", e.to_string()))?;
 
-        let db_guard = self.db.read();
-        let db = db_guard
-            .as_ref()
-            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
+        let db = self.require_open()?;
 
         let write_txn = db
             .begin_write()
@@ -190,10 +187,7 @@ impl SmolvmDb {
 
     /// Get a VM record by name.
     pub fn get_vm(&self, name: &str) -> Result<Option<VmRecord>> {
-        let db_guard = self.db.read();
-        let db = db_guard
-            .as_ref()
-            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
+        let db = self.require_open()?;
 
         let read_txn = db
             .begin_read()
@@ -220,10 +214,7 @@ impl SmolvmDb {
     /// Uses a single write transaction to atomically read and delete the record,
     /// preventing TOCTOU races with concurrent writers.
     pub fn remove_vm(&self, name: &str) -> Result<Option<VmRecord>> {
-        let db_guard = self.db.read();
-        let db = db_guard
-            .as_ref()
-            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
+        let db = self.require_open()?;
 
         let write_txn = db
             .begin_write()
@@ -271,10 +262,7 @@ impl SmolvmDb {
 
     /// List all VM records.
     pub fn list_vms(&self) -> Result<Vec<(String, VmRecord)>> {
-        let db_guard = self.db.read();
-        let db = db_guard
-            .as_ref()
-            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
+        let db = self.require_open()?;
 
         let read_txn = db
             .begin_read()
@@ -311,10 +299,7 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
-        let db_guard = self.db.read();
-        let db = db_guard
-            .as_ref()
-            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
+        let db = self.require_open()?;
 
         let write_txn = db
             .begin_write()
@@ -378,10 +363,7 @@ impl SmolvmDb {
 
     /// Get a global configuration value.
     pub fn get_config(&self, key: &str) -> Result<Option<String>> {
-        let db_guard = self.db.read();
-        let db = db_guard
-            .as_ref()
-            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
+        let db = self.require_open()?;
 
         let read_txn = db
             .begin_read()
@@ -403,10 +385,7 @@ impl SmolvmDb {
 
     /// Set a global configuration value.
     pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
-        let db_guard = self.db.read();
-        let db = db_guard
-            .as_ref()
-            .ok_or_else(|| Error::database_unavailable("database is closed"))?;
+        let db = self.require_open()?;
 
         let write_txn = db
             .begin_write()

@@ -8,13 +8,14 @@
 //!
 //! Both paths converge on the same VM launch infrastructure.
 
-use crate::cli::parsers::{parse_env_spec, parse_mounts, parse_port};
+use crate::cli::parsers::{mounts_to_virtiofs_bindings, parse_env_spec, parse_mounts, parse_port};
 use clap::{Args, Parser, Subcommand};
 use smolvm::agent::launcher_dynamic::{
     launch_agent_vm_dynamic, KrunFunctions, PackedLaunchConfig, PackedMount,
 };
 use smolvm::agent::{mount_tag, AgentClient, PortMapping, RunConfig, VmResources};
 use smolvm::Error;
+use smolvm::DEFAULT_SHELL_CMD;
 use smolvm_pack::detect::PackedMode;
 use smolvm_pack::extract;
 use smolvm_pack::packer::{
@@ -25,6 +26,20 @@ use std::time::Duration;
 
 /// Timeout waiting for the agent to become ready.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Convert parsed mounts to PackedMount format for the VM launcher.
+fn mounts_to_packed(mounts: &[smolvm::vm::config::HostMount]) -> Vec<PackedMount> {
+    mounts
+        .iter()
+        .enumerate()
+        .map(|(i, m)| PackedMount {
+            tag: mount_tag(i),
+            host_path: m.source.to_string_lossy().to_string(),
+            guest_path: m.target.to_string_lossy().to_string(),
+            read_only: m.read_only,
+        })
+        .collect()
+}
 
 /// Run a VM from a packed `.smolmachine` sidecar file.
 ///
@@ -250,16 +265,7 @@ impl RunpackCmd {
         };
 
         // Build packed mounts for the launcher
-        let packed_mounts: Vec<PackedMount> = mounts
-            .iter()
-            .enumerate()
-            .map(|(i, m)| PackedMount {
-                tag: mount_tag(i),
-                host_path: m.source.to_string_lossy().to_string(),
-                guest_path: m.target.to_string_lossy().to_string(),
-                read_only: m.read_only,
-            })
-            .collect();
+        let packed_mounts = mounts_to_packed(&mounts);
 
         if self.debug {
             eprintln!("debug: rootfs={}", rootfs_path.display());
@@ -328,7 +334,9 @@ impl RunpackCmd {
                 let _ = smolvm::process::stop_process_fast(child_pid, Duration::from_secs(5), true);
                 // Clean up runtime dir ourselves since the guard won't
                 // be created.
-                let _ = std::fs::remove_dir_all(runtime_dir.path());
+                if let Err(e) = std::fs::remove_dir_all(runtime_dir.path()) {
+                    tracing::debug!(error = %e, "cleanup: remove runtime dir after failed child start");
+                }
                 return Err(Error::agent(
                     "verify child process",
                     "unable to capture child start time for safe lifecycle management",
@@ -383,7 +391,9 @@ impl Drop for ChildGuard {
         }
         // TempDir removes itself on drop, but we also do an explicit
         // remove to handle partially-cleaned states.
-        let _ = std::fs::remove_dir_all(self.runtime_dir.path());
+        if let Err(e) = std::fs::remove_dir_all(self.runtime_dir.path()) {
+            tracing::debug!(error = %e, "cleanup: remove runtime dir on drop");
+        }
     }
 }
 
@@ -498,7 +508,7 @@ fn build_command(manifest: &smolvm_pack::PackManifest, cli_command: &[String]) -
     cmd.extend(manifest.cmd.clone());
 
     if cmd.is_empty() {
-        vec!["/bin/sh".to_string()]
+        vec![DEFAULT_SHELL_CMD.to_string()]
     } else {
         cmd
     }
@@ -534,18 +544,7 @@ fn execute_command(
     let command = build_command(manifest, &args.command);
     let env = build_env(manifest, &args.env);
 
-    // Convert mounts to virtiofs binding format
-    let mount_bindings: Vec<(String, String, bool)> = mounts
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            (
-                mount_tag(i),
-                m.target.to_string_lossy().to_string(),
-                m.read_only,
-            )
-        })
-        .collect();
+    let mount_bindings = mounts_to_virtiofs_bindings(mounts);
 
     let workdir = args.workdir.clone().or_else(|| manifest.workdir.clone());
 
@@ -874,16 +873,7 @@ fn run_from_cache(
         overlay_gb: cli.overlay,
     };
 
-    let packed_mounts: Vec<PackedMount> = mounts
-        .iter()
-        .enumerate()
-        .map(|(i, m)| PackedMount {
-            tag: mount_tag(i),
-            host_path: m.source.to_string_lossy().to_string(),
-            guest_path: m.target.to_string_lossy().to_string(),
-            read_only: m.read_only,
-        })
-        .collect();
+    let packed_mounts = mounts_to_packed(&mounts);
 
     smolvm::process::install_sigchld_handler();
 
@@ -929,7 +919,9 @@ fn run_from_cache(
         }
         if st.is_none() && smolvm::process::is_alive(child_pid) {
             let _ = smolvm::process::stop_process_fast(child_pid, Duration::from_secs(5), true);
-            let _ = std::fs::remove_dir_all(runtime_dir.path());
+            if let Err(e) = std::fs::remove_dir_all(runtime_dir.path()) {
+                tracing::debug!(error = %e, "cleanup: remove runtime dir after failed daemon child start");
+            }
             return Err(Error::agent(
                 "verify child process",
                 "unable to capture child start time for safe lifecycle management",
@@ -1152,8 +1144,12 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
     }
 
     // Clean up stale PID/socket files from previous runs
-    let _ = std::fs::remove_file(daemon.join("agent.pid"));
-    let _ = std::fs::remove_file(daemon.join("agent.sock"));
+    if let Err(e) = std::fs::remove_file(daemon.join("agent.pid")) {
+        tracing::debug!(error = %e, "cleanup: remove stale daemon PID file");
+    }
+    if let Err(e) = std::fs::remove_file(daemon.join("agent.sock")) {
+        tracing::debug!(error = %e, "cleanup: remove stale daemon socket");
+    }
 
     // Create storage disk if not exists (preserves existing disk on restart)
     let storage_path = daemon.join("storage.ext4");
@@ -1181,16 +1177,7 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
         overlay_gb: cli.overlay,
     };
 
-    let packed_mounts: Vec<PackedMount> = mounts
-        .iter()
-        .enumerate()
-        .map(|(i, m)| PackedMount {
-            tag: mount_tag(i),
-            host_path: m.source.to_string_lossy().to_string(),
-            guest_path: m.target.to_string_lossy().to_string(),
-            read_only: m.read_only,
-        })
-        .collect();
+    let packed_mounts = mounts_to_packed(&mounts);
 
     let rootfs_path = cache_dir.join("agent-rootfs");
     let lib_dir = cache_dir.join("lib");
@@ -1308,17 +1295,7 @@ fn daemon_exec(
 
     // Parse mounts
     let mounts = parse_mounts(&cli.volume)?;
-    let mount_bindings: Vec<(String, String, bool)> = mounts
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            (
-                mount_tag(i),
-                m.target.to_string_lossy().to_string(),
-                m.read_only,
-            )
-        })
-        .collect();
+    let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
 
     let workdir = cli.workdir.clone().or_else(|| manifest.workdir.clone());
 
@@ -1385,8 +1362,12 @@ fn daemon_stop(checksum: u32, debug: bool) -> smolvm::Result<()> {
     }
 
     // Clean up PID and socket files (keep storage.ext4 for persistence)
-    let _ = std::fs::remove_file(dir.join("agent.pid"));
-    let _ = std::fs::remove_file(dir.join("agent.sock"));
+    if let Err(e) = std::fs::remove_file(dir.join("agent.pid")) {
+        tracing::debug!(error = %e, "cleanup: remove daemon PID file");
+    }
+    if let Err(e) = std::fs::remove_file(dir.join("agent.sock")) {
+        tracing::debug!(error = %e, "cleanup: remove daemon socket");
+    }
 
     println!("Daemon stopped");
     Ok(())
@@ -1404,8 +1385,12 @@ fn daemon_status(checksum: u32) -> smolvm::Result<()> {
         println!("Status: not running (stale PID file)");
         // Clean up stale files
         if let Ok(dir) = daemon_dir(checksum) {
-            let _ = std::fs::remove_file(dir.join("agent.pid"));
-            let _ = std::fs::remove_file(dir.join("agent.sock"));
+            if let Err(e) = std::fs::remove_file(dir.join("agent.pid")) {
+                tracing::debug!(error = %e, "cleanup: remove stale status PID file");
+            }
+            if let Err(e) = std::fs::remove_file(dir.join("agent.sock")) {
+                tracing::debug!(error = %e, "cleanup: remove stale status socket");
+            }
         }
         return Ok(());
     }
