@@ -190,6 +190,12 @@ else
     "$MKFS_BIN" -F -q -m 0 -L smolvm "$TEMPLATE_PATH"
 
     echo "Storage template created: $(du -h "$TEMPLATE_PATH" | cut -f1) (sparse)"
+
+    # Create overlay template (same format, different label)
+    OVERLAY_TEMPLATE_PATH="$DIST_DIR/overlay-template.ext4"
+    dd if=/dev/zero of="$OVERLAY_TEMPLATE_PATH" bs=1 count=0 seek=$TEMPLATE_SIZE 2>/dev/null
+    "$MKFS_BIN" -F -q -m 0 -L smolvm-overlay "$OVERLAY_TEMPLATE_PATH"
+    echo "Overlay template created: $(du -h "$OVERLAY_TEMPLATE_PATH" | cut -f1) (sparse)"
 fi
 
 # Copy README

@@ -318,6 +318,9 @@ install_smolvm() {
     if [[ -f "$prefix/storage-template.ext4" ]]; then
         rm -f "$prefix/storage-template.ext4"
     fi
+    if [[ -f "$prefix/overlay-template.ext4" ]]; then
+        rm -f "$prefix/overlay-template.ext4"
+    fi
 
     # Copy files
     cp -r "$extracted_dir/lib" "$prefix/"
@@ -326,9 +329,12 @@ install_smolvm() {
     chmod +x "$prefix/smolvm"
     chmod +x "$prefix/smolvm-bin"
 
-    # Copy storage template if present
+    # Copy disk templates if present
     if [[ -f "$extracted_dir/storage-template.ext4" ]]; then
         cp "$extracted_dir/storage-template.ext4" "$prefix/"
+    fi
+    if [[ -f "$extracted_dir/overlay-template.ext4" ]]; then
+        cp "$extracted_dir/overlay-template.ext4" "$prefix/"
     fi
 
     # Install agent-rootfs to data directory
