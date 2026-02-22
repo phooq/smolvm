@@ -40,8 +40,13 @@ pub struct CrunCommand {
 
 impl CrunCommand {
     /// Create a new crun command with standard configuration.
+    ///
+    /// Uses `--root` to store container state on the persistent storage disk
+    /// instead of the default `/run/crun`, which may not be writable when the
+    /// rootfs is an overlayfs with an initramfs lower layer.
     fn new() -> Self {
         let mut cmd = Command::new(paths::CRUN_PATH);
+        cmd.args(["--root", paths::CRUN_ROOT_DIR]);
         cmd.args(["--cgroup-manager", paths::CRUN_CGROUP_MANAGER]);
         Self { cmd }
     }
