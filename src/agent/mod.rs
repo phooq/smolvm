@@ -11,7 +11,7 @@ pub mod terminal;
 
 pub use crate::vm::config::HostMount;
 pub use client::{AgentClient, PullOptions, RunConfig};
-pub use manager::{docker_config_dir, docker_config_mount, AgentManager, AgentState};
+pub use manager::{docker_config_dir, docker_config_mount, vm_data_dir, AgentManager, AgentState};
 
 /// Default agent VM memory in MiB.
 pub const DEFAULT_MEMORY_MIB: u32 = 512;

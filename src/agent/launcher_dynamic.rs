@@ -176,6 +176,8 @@ pub struct PackedLaunchConfig<'a> {
     pub resources: VmResources,
     /// Debug logging.
     pub debug: bool,
+    /// Path to overlay disk (VM mode only, mounted as /dev/vdb).
+    pub overlay_path: Option<&'a Path>,
     /// Path to redirect VM console output (prevents libkrun from putting
     /// the inherited terminal into raw mode).
     pub console_log: PathBuf,
@@ -311,6 +313,19 @@ pub fn launch_agent_vm_dynamic(
     // SAFETY: ctx is valid, block_id and disk_path are valid C strings
     if unsafe { (krun.add_disk2)(ctx, block_id.as_ptr(), disk_path.as_ptr(), 0, false) } < 0 {
         free_ctx_on_err!("krun_add_disk2 failed");
+    }
+
+    // Add overlay disk as 2nd disk (/dev/vdb) for VM mode
+    if let Some(overlay) = config.overlay_path {
+        let overlay_id = cstr("overlay");
+        let overlay_disk =
+            try_or_free_ctx!(path_to_cstring(overlay), "overlay path contains null byte");
+        // SAFETY: ctx is valid, overlay_id and overlay_disk are valid C strings
+        if unsafe { (krun.add_disk2)(ctx, overlay_id.as_ptr(), overlay_disk.as_ptr(), 0, false) }
+            < 0
+        {
+            free_ctx_on_err!("krun_add_disk2 failed for overlay disk");
+        }
     }
 
     // Add vsock port for control channel

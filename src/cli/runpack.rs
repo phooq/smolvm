@@ -18,6 +18,7 @@ use smolvm::Error;
 use smolvm::DEFAULT_SHELL_CMD;
 use smolvm_pack::detect::PackedMode;
 use smolvm_pack::extract;
+use smolvm_pack::format::PackMode;
 use smolvm_pack::packer::{
     read_footer_from_sidecar, read_manifest_from_sidecar, verify_sidecar_checksum,
 };
@@ -190,6 +191,11 @@ impl RunpackCmd {
 
         // 4. Handle --info: show manifest and exit
         if self.info {
+            let mode_str = match manifest.mode {
+                PackMode::Container => "container",
+                PackMode::Vm => "vm",
+            };
+            println!("Mode:       {}", mode_str);
             println!("Image:      {}", manifest.image);
             println!("Digest:     {}", manifest.digest);
             println!("Platform:   {}", manifest.platform);
@@ -252,6 +258,13 @@ impl RunpackCmd {
         extract::create_or_copy_storage_disk(&cache_dir, template, &storage_path, self.storage)
             .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
+        let overlay_runtime_path = setup_vm_overlay(
+            &manifest,
+            &cache_dir,
+            &runtime_dir.path().join("overlay.raw"),
+            self.overlay,
+        )?;
+
         // 7. Parse CLI args
         let mounts = parse_mounts(&self.volume)?;
         let port_mappings: Vec<(u16, u16)> = self.port.iter().map(|p| (p.host, p.guest)).collect();
@@ -301,6 +314,7 @@ impl RunpackCmd {
                 mounts: &packed_mounts,
                 port_mappings: &port_mappings,
                 resources,
+                overlay_path: overlay_runtime_path.as_deref(),
                 debug: self.debug,
                 console_log: console_log_path,
             };
@@ -451,6 +465,43 @@ fn resolve_sidecar_path(explicit: Option<&Path>) -> smolvm::Result<PathBuf> {
     ))
 }
 
+/// Set up the overlay disk for VM mode.
+///
+/// If the manifest specifies VM mode, copies the overlay template from
+/// `cache_dir` to `dest`. Returns the overlay path (for `PackedLaunchConfig`)
+/// or `None` for container mode.
+///
+/// Fails hard if the manifest is VM mode but the overlay template is missing.
+fn setup_vm_overlay(
+    manifest: &smolvm_pack::PackManifest,
+    cache_dir: &Path,
+    dest: &Path,
+    overlay_gb: Option<u64>,
+) -> smolvm::Result<Option<PathBuf>> {
+    if manifest.mode != PackMode::Vm {
+        return Ok(None);
+    }
+
+    let overlay_template = manifest
+        .assets
+        .overlay_template
+        .as_ref()
+        .map(|t| t.path.as_str());
+
+    extract::copy_overlay_template(cache_dir, overlay_template, dest, overlay_gb).map_err(|e| {
+        Error::agent(
+            "setup overlay",
+            format!(
+                "VM mode overlay template is missing or corrupt: {}. \
+                 Try re-packing with `smolvm pack --from-vm`.",
+                e
+            ),
+        )
+    })?;
+
+    Ok(Some(dest.to_path_buf()))
+}
+
 /// Wait for the agent to become ready on the vsock socket.
 fn wait_for_agent(vsock_path: &Path, debug: bool) -> smolvm::Result<AgentClient> {
     use std::thread;
@@ -537,6 +588,9 @@ fn build_env(manifest: &smolvm_pack::PackManifest, cli_env: &[String]) -> Vec<(S
 }
 
 /// Execute the command in the VM using the existing AgentClient.
+///
+/// In Container mode, runs via `client.run()` / `client.run_interactive()` (crun container).
+/// In VM mode, runs via `client.vm_exec()` / `client.vm_exec_interactive()` (direct in rootfs).
 fn execute_command(
     client: &mut AgentClient,
     manifest: &smolvm_pack::PackManifest,
@@ -545,37 +599,59 @@ fn execute_command(
 ) -> smolvm::Result<i32> {
     let command = build_command(manifest, &args.command);
     let env = build_env(manifest, &args.env);
-
-    let mount_bindings = mounts_to_virtiofs_bindings(mounts);
-
     let workdir = args.workdir.clone().or_else(|| manifest.workdir.clone());
 
-    if args.interactive || args.tty {
-        let config = RunConfig::new(&manifest.image, command)
-            .with_env(env)
-            .with_workdir(workdir)
-            .with_mounts(mount_bindings)
-            .with_timeout(args.timeout)
-            .with_tty(args.tty);
-        client.run_interactive(config)
-    } else {
-        let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
-            &manifest.image,
-            command,
-            env,
-            workdir,
-            mount_bindings,
-            args.timeout,
-        )?;
+    match manifest.mode {
+        PackMode::Vm => {
+            // VM mode: execute directly in the VM rootfs
+            if args.interactive || args.tty {
+                client.vm_exec_interactive(command, env, workdir, args.timeout, args.tty)
+            } else {
+                let (exit_code, stdout, stderr) =
+                    client.vm_exec(command, env, workdir, args.timeout)?;
 
-        if !stdout.is_empty() {
-            print!("{}", stdout);
+                if !stdout.is_empty() {
+                    print!("{}", stdout);
+                }
+                if !stderr.is_empty() {
+                    eprint!("{}", stderr);
+                }
+                crate::cli::flush_output();
+                Ok(exit_code)
+            }
         }
-        if !stderr.is_empty() {
-            eprint!("{}", stderr);
+        PackMode::Container => {
+            // Container mode: run inside crun container
+            let mount_bindings = mounts_to_virtiofs_bindings(mounts);
+
+            if args.interactive || args.tty {
+                let config = RunConfig::new(&manifest.image, command)
+                    .with_env(env)
+                    .with_workdir(workdir)
+                    .with_mounts(mount_bindings)
+                    .with_timeout(args.timeout)
+                    .with_tty(args.tty);
+                client.run_interactive(config)
+            } else {
+                let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
+                    &manifest.image,
+                    command,
+                    env,
+                    workdir,
+                    mount_bindings,
+                    args.timeout,
+                )?;
+
+                if !stdout.is_empty() {
+                    print!("{}", stdout);
+                }
+                if !stderr.is_empty() {
+                    eprint!("{}", stderr);
+                }
+                crate::cli::flush_output();
+                Ok(exit_code)
+            }
         }
-        crate::cli::flush_output();
-        Ok(exit_code)
     }
 }
 
@@ -864,6 +940,13 @@ fn run_from_cache(
     extract::create_or_copy_storage_disk(cache_dir, template, &storage_path, cli.storage)
         .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
 
+    let overlay_runtime_path = setup_vm_overlay(
+        manifest,
+        cache_dir,
+        &runtime_dir.path().join("overlay.raw"),
+        cli.overlay,
+    )?;
+
     let mounts = parse_mounts(&cli.volume)?;
     let port_mappings: Vec<(u16, u16)> = cli.port.iter().map(|p| (p.host, p.guest)).collect();
 
@@ -899,6 +982,7 @@ fn run_from_cache(
             mounts: &packed_mounts,
             port_mappings: &port_mappings,
             resources,
+            overlay_path: overlay_runtime_path.as_deref(),
             debug,
             console_log: console_log_path,
         };
@@ -970,6 +1054,11 @@ fn run_from_cache(
 }
 
 fn print_manifest_info(manifest: &smolvm_pack::PackManifest, checksum: u32) {
+    let mode_str = match manifest.mode {
+        PackMode::Container => "container",
+        PackMode::Vm => "vm",
+    };
+    println!("Mode:       {}", mode_str);
     println!("Image:      {}", manifest.image);
     println!("Digest:     {}", manifest.digest);
     println!("Platform:   {}", manifest.platform);
@@ -1167,6 +1256,17 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
             .map_err(|e| Error::agent("create storage disk", e.to_string()))?;
     }
 
+    // Copy overlay template for VM mode (preserves existing disk on restart)
+    let overlay_daemon_path = if manifest.mode == PackMode::Vm {
+        let overlay_path = daemon.join("overlay.raw");
+        if !overlay_path.exists() {
+            setup_vm_overlay(&manifest, &cache_dir, &overlay_path, cli.overlay)?;
+        }
+        Some(overlay_path)
+    } else {
+        None
+    };
+
     let vsock_path = daemon.join("agent.sock");
 
     // Parse CLI args
@@ -1222,6 +1322,7 @@ fn daemon_start(mode: &PackedMode, cli: &PackedCli) -> smolvm::Result<()> {
             mounts: &packed_mounts,
             port_mappings: &port_mappings,
             resources,
+            overlay_path: overlay_daemon_path.as_deref(),
             debug,
             console_log: console_log_path,
         };
@@ -1298,39 +1399,59 @@ fn daemon_exec(
     // Build command from args or manifest defaults
     let command = build_command(manifest, &command);
     let env = build_env(manifest, &cli.env);
-
-    // Parse mounts
-    let mounts = parse_mounts(&cli.volume)?;
-    let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
-
     let workdir = cli.workdir.clone().or_else(|| manifest.workdir.clone());
 
-    let exit_code = if interactive || tty {
-        let config = RunConfig::new(&manifest.image, command)
-            .with_env(env)
-            .with_workdir(workdir)
-            .with_mounts(mount_bindings)
-            .with_timeout(timeout)
-            .with_tty(tty);
-        client.run_interactive(config)?
-    } else {
-        let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
-            &manifest.image,
-            command,
-            env,
-            workdir,
-            mount_bindings,
-            timeout,
-        )?;
+    let exit_code = match manifest.mode {
+        PackMode::Vm => {
+            // VM mode: execute directly in the VM rootfs
+            if interactive || tty {
+                client.vm_exec_interactive(command, env, workdir, timeout, tty)?
+            } else {
+                let (exit_code, stdout, stderr) = client.vm_exec(command, env, workdir, timeout)?;
 
-        if !stdout.is_empty() {
-            print!("{}", stdout);
+                if !stdout.is_empty() {
+                    print!("{}", stdout);
+                }
+                if !stderr.is_empty() {
+                    eprint!("{}", stderr);
+                }
+                crate::cli::flush_output();
+                exit_code
+            }
         }
-        if !stderr.is_empty() {
-            eprint!("{}", stderr);
+        PackMode::Container => {
+            // Parse mounts
+            let mounts = parse_mounts(&cli.volume)?;
+            let mount_bindings = mounts_to_virtiofs_bindings(&mounts);
+
+            if interactive || tty {
+                let config = RunConfig::new(&manifest.image, command)
+                    .with_env(env)
+                    .with_workdir(workdir)
+                    .with_mounts(mount_bindings)
+                    .with_timeout(timeout)
+                    .with_tty(tty);
+                client.run_interactive(config)?
+            } else {
+                let (exit_code, stdout, stderr) = client.run_with_mounts_and_timeout(
+                    &manifest.image,
+                    command,
+                    env,
+                    workdir,
+                    mount_bindings,
+                    timeout,
+                )?;
+
+                if !stdout.is_empty() {
+                    print!("{}", stdout);
+                }
+                if !stderr.is_empty() {
+                    eprint!("{}", stderr);
+                }
+                crate::cli::flush_output();
+                exit_code
+            }
         }
-        crate::cli::flush_output();
-        exit_code
     };
 
     std::process::exit(exit_code);

@@ -119,6 +119,19 @@ struct AgentInner {
     detached: bool,
 }
 
+/// Get the data directory for a named VM.
+///
+/// Returns `~/.cache/smolvm/vms/{name}/` (macOS) or equivalent on other platforms.
+/// This is the canonical location for a VM's storage disk, overlay disk, and socket.
+pub fn vm_data_dir(name: &str) -> PathBuf {
+    dirs::cache_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("smolvm")
+        .join("vms")
+        .join(name)
+}
+
 /// Agent VM manager.
 ///
 /// Manages the lifecycle of the agent VM which handles OCI image operations
@@ -267,12 +280,7 @@ impl AgentManager {
         let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
 
         // Named VMs get their own storage disk
-        let storage_dir = dirs::cache_dir()
-            .or_else(dirs::data_local_dir)
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("smolvm")
-            .join("vms")
-            .join(&name);
+        let storage_dir = vm_data_dir(&name);
         std::fs::create_dir_all(&storage_dir)?;
 
         let storage_path = storage_dir.join(crate::storage::STORAGE_DISK_FILENAME);

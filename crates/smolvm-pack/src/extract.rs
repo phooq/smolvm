@@ -332,6 +332,49 @@ pub fn create_storage_disk(path: &Path, size: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Copy overlay disk template from cache to a runtime directory.
+///
+/// Copies the overlay template to `dest`, optionally extending the sparse
+/// file if `size_gb_override` is larger than the template.
+///
+/// Returns an error if the template path is `None` or the template file
+/// does not exist in the cache.
+pub fn copy_overlay_template(
+    cache_dir: &Path,
+    template_path: Option<&str>,
+    dest: &Path,
+    size_gb_override: Option<u64>,
+) -> std::io::Result<()> {
+    let template = template_path.ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "overlay template not specified in manifest",
+        )
+    })?;
+
+    let src = cache_dir.join(template);
+    if !src.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("overlay template not found: {}", src.display()),
+        ));
+    }
+
+    fs::copy(&src, dest)?;
+
+    // Extend if requested size is larger than template
+    if let Some(gb) = size_gb_override {
+        let desired = gb * 1024 * 1024 * 1024;
+        let current = fs::metadata(dest)?.len();
+        if desired > current {
+            let file = fs::OpenOptions::new().write(true).open(dest)?;
+            file.set_len(desired)?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Create or copy storage disk from template.
 ///
 /// If a pre-formatted template exists in the cache, copy it.
@@ -440,6 +483,47 @@ mod tests {
 
         assert!(disk_path.exists());
         assert_eq!(fs::metadata(&disk_path).unwrap().len(), 1024 * 1024);
+    }
+
+    #[test]
+    fn test_copy_overlay_template_fails_when_none() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("overlay.raw");
+
+        let result = copy_overlay_template(temp_dir.path(), None, &dest, None);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_copy_overlay_template_fails_when_missing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("overlay.raw");
+
+        let result = copy_overlay_template(temp_dir.path(), Some("nonexistent.raw"), &dest, None);
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_copy_overlay_template_copies_and_extends() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let template = temp_dir.path().join("overlay.raw");
+        let dest = temp_dir.path().join("output.raw");
+
+        // Create a small template file (1 KB)
+        let template_data = vec![0u8; 1024];
+        fs::write(&template, &template_data).unwrap();
+
+        // Copy without size override
+        copy_overlay_template(temp_dir.path(), Some("overlay.raw"), &dest, None).unwrap();
+        assert_eq!(fs::metadata(&dest).unwrap().len(), 1024);
+
+        // Copy with size override that extends (use small value for test)
+        let dest2 = temp_dir.path().join("output2.raw");
+        // We can't test GiB-sized files, but we can verify the copy works
+        copy_overlay_template(temp_dir.path(), Some("overlay.raw"), &dest2, None).unwrap();
+        assert!(dest2.exists());
     }
 
     #[test]

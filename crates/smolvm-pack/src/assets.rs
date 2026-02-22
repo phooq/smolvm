@@ -61,6 +61,7 @@ impl AssetCollector {
                 },
                 layers: Vec::new(),
                 storage_template: None,
+                overlay_template: None,
             },
         })
     }
@@ -280,6 +281,32 @@ impl AssetCollector {
         let metadata = fs::metadata(&template_path)?;
         self.inventory.storage_template = Some(AssetEntry {
             path: TEMPLATE_NAME.to_string(),
+            size: metadata.len(),
+        });
+
+        Ok(())
+    }
+
+    /// Add an overlay disk template from an existing VM.
+    ///
+    /// Copies the VM's overlay disk (overlay.raw) to the staging directory
+    /// as `overlay.raw`. This preserves the VM's persistent rootfs state
+    /// for use in packed VM-mode binaries.
+    pub fn add_overlay_template(&mut self, path: &Path) -> Result<()> {
+        if !path.exists() {
+            return Err(PackError::AssetNotFound(format!(
+                "overlay disk not found: {}",
+                path.display()
+            )));
+        }
+
+        const OVERLAY_NAME: &str = "overlay.raw";
+        let dst = self.staging_dir.join(OVERLAY_NAME);
+        fs::copy(path, &dst)?;
+
+        let metadata = fs::metadata(&dst)?;
+        self.inventory.overlay_template = Some(AssetEntry {
+            path: OVERLAY_NAME.to_string(),
             size: metadata.len(),
         });
 
