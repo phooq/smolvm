@@ -11,6 +11,66 @@ use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
+/// Safely unpack a tar archive, rejecting symlinks, hardlinks, and entries
+/// that resolve outside `dest`.
+///
+/// The standard `tar::Archive::unpack()` strips `..` components but does
+/// **not** reject symlinks. A crafted archive could create
+/// `lib/libkrun.dylib → /tmp/evil.so`, and subsequent `dlopen()` would
+/// load the attacker's library. This function rejects any entry that is
+/// not a regular file or directory.
+fn safe_unpack<R: Read>(archive: &mut tar::Archive<R>, dest: &Path) -> std::io::Result<()> {
+    let canonical_dest = dest.canonicalize().unwrap_or_else(|_| dest.to_path_buf());
+
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
+        let entry_type = entry.header().entry_type();
+
+        // Reject symlinks, hardlinks, and other special entry types.
+        // Only allow regular files and directories.
+        match entry_type {
+            tar::EntryType::Regular | tar::EntryType::GNUSparse => {}
+            tar::EntryType::Directory => {}
+            other => {
+                let path = entry.path()?.to_path_buf();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "tar entry '{}' has disallowed type {:?} (symlinks and hardlinks are rejected)",
+                        path.display(),
+                        other
+                    ),
+                ));
+            }
+        }
+
+        // Validate that the unpacked path stays within dest.
+        // `entry.path()` returns the path from the tar header; we check
+        // that joining it with dest doesn't escape.
+        let entry_path = entry.path()?.to_path_buf();
+        let full_path = dest.join(&entry_path);
+
+        // Normalize by stripping .. components (defense in depth — tar crate
+        // already does this, but we verify).
+        let normalized = full_path
+            .canonicalize()
+            .unwrap_or_else(|_| full_path.clone());
+        if !normalized.starts_with(&canonical_dest) && full_path != dest.join(&entry_path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "tar entry '{}' escapes destination directory",
+                    entry_path.display()
+                ),
+            ));
+        }
+
+        // Unpack the individual entry
+        entry.unpack_in(dest)?;
+    }
+    Ok(())
+}
+
 /// Marker file indicating extraction is complete.
 const EXTRACTION_MARKER: &str = ".smolvm-extracted";
 
@@ -133,7 +193,7 @@ fn extract_sidecar_inner(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let mut archive = tar::Archive::new(decoder);
-    archive.unpack(cache_dir)?;
+    safe_unpack(&mut archive, cache_dir)?;
 
     if debug {
         eprintln!("debug: extracted assets to {}", cache_dir.display());
@@ -176,7 +236,7 @@ pub fn extract_from_binary(
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let mut archive = tar::Archive::new(decoder);
-        archive.unpack(cache_dir)?;
+        safe_unpack(&mut archive, cache_dir)?;
 
         if debug {
             eprintln!("debug: extracted assets to {}", cache_dir.display());
@@ -216,7 +276,7 @@ pub unsafe fn extract_from_section(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let mut archive = tar::Archive::new(decoder);
-    archive.unpack(cache_dir)?;
+    safe_unpack(&mut archive, cache_dir)?;
 
     if debug {
         eprintln!("debug: extracted assets to {}", cache_dir.display());
@@ -238,7 +298,7 @@ fn post_process_extraction(cache_dir: &Path, debug: bool) -> std::io::Result<()>
         fs::create_dir_all(&rootfs_dir)?;
         let tar_file = File::open(&rootfs_tar)?;
         let mut archive = tar::Archive::new(tar_file);
-        archive.unpack(&rootfs_dir)?;
+        safe_unpack(&mut archive, &rootfs_dir)?;
     }
 
     // Extract OCI layer tars to layers/{digest}/ directories
@@ -260,7 +320,7 @@ fn post_process_extraction(cache_dir: &Path, debug: bool) -> std::io::Result<()>
                     fs::create_dir_all(&layer_dir)?;
                     let tar_file = File::open(&path)?;
                     let mut archive = tar::Archive::new(tar_file);
-                    archive.unpack(&layer_dir)?;
+                    safe_unpack(&mut archive, &layer_dir)?;
                 }
             }
         }

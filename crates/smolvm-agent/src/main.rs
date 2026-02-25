@@ -2068,15 +2068,16 @@ fn handle_vm_exec(
         // Check if process has exited
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Process exited, collect output
+                // Process exited, collect output (capped at 16 MiB to prevent OOM)
+                const MAX_OUTPUT: usize = 16 * 1024 * 1024;
                 let mut stdout = String::new();
                 let mut stderr = String::new();
 
                 if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_string(&mut stdout);
+                    let _ = out.take(MAX_OUTPUT as u64).read_to_string(&mut stdout);
                 }
                 if let Some(mut err) = child.stderr.take() {
-                    let _ = err.read_to_string(&mut stderr);
+                    let _ = err.take(MAX_OUTPUT as u64).read_to_string(&mut stderr);
                 }
 
                 return AgentResponse::Completed {
