@@ -242,7 +242,7 @@ impl StartCmd {
         let name = vm_common::resolve_vm_name(self.name)?;
         match &name {
             Some(name) => vm_common::start_vm_named(KIND, name),
-            None => vm_common::start_vm_anonymous(KIND),
+            None => vm_common::start_vm_default(KIND),
         }
     }
 }
@@ -266,7 +266,7 @@ impl StopCmd {
         let name = vm_common::resolve_vm_name(self.name)?;
         match &name {
             Some(name) => vm_common::stop_vm_named(KIND, name),
-            None => vm_common::stop_vm_anonymous(KIND),
+            None => vm_common::stop_vm_default(KIND),
         }
     }
 }

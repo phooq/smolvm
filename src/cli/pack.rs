@@ -115,9 +115,13 @@ impl PackCmd {
             .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
         let staging_dir = temp_dir.path().join("staging");
 
-        // Start agent to pull image and export layers
+        // Start a temporary agent VM with a unique identity so concurrent
+        // pack runs and the user's "default" VM don't collide.
+        let pack_vm_name = format!("__pack_{}", std::process::id());
+        // Clean up any leftover data from a prior run with the same PID (reuse).
+        let _ = std::fs::remove_dir_all(smolvm::agent::vm_data_dir(&pack_vm_name));
         println!("Starting agent VM...");
-        let manager = AgentManager::new_default()?;
+        let manager = AgentManager::for_vm(&pack_vm_name)?;
         manager.start_with_config(
             Vec::new(),
             VmResources {
@@ -168,8 +172,9 @@ impl PackCmd {
                 .map_err(|e| Error::agent("collect layers", e.to_string()))?;
         }
 
-        // Stop agent (no longer needed)
+        // Stop agent and clean up temp VM data
         manager.stop()?;
+        let _ = std::fs::remove_dir_all(smolvm::agent::vm_data_dir(&pack_vm_name));
 
         // Build manifest
         let platform = format!("{}/{}", image_info.os, image_info.architecture);

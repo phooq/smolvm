@@ -137,11 +137,10 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
 /// Manages the lifecycle of the agent VM which handles OCI image operations
 /// and command execution.
 ///
-/// Each named VM gets its own agent with isolated paths:
-/// - Anonymous: `~/.cache/smolvm/agent.sock`
-/// - Named "foo": `~/.cache/smolvm/vms/foo/agent.sock`
+/// Each VM gets its own agent with isolated paths under
+/// `~/.cache/smolvm/vms/{name}/` (socket, PID file, storage, overlay).
 pub struct AgentManager {
-    /// Optional VM name (None for anonymous/default agent).
+    /// VM name (None only for low-level `new()` callers; CLI always sets a name).
     name: Option<String>,
     /// Path to the agent rootfs.
     rootfs_path: PathBuf,
@@ -160,7 +159,7 @@ pub struct AgentManager {
 }
 
 impl AgentManager {
-    /// Create a new agent manager for an anonymous (default) agent.
+    /// Create a new agent manager with explicit paths (low-level).
     ///
     /// # Arguments
     ///
@@ -239,30 +238,22 @@ impl AgentManager {
     ///
     /// Uses default paths for rootfs and storage.
     /// `storage_gb` and `overlay_gb` override the default disk sizes (20 GiB / 2 GiB).
+    ///
+    /// Canonicalized to `for_vm_with_sizes("default", ...)` so that all
+    /// lifecycle commands (start/stop/exec/status) use consistent paths.
     pub fn new_default_with_sizes(
         storage_gb: Option<u64>,
         overlay_gb: Option<u64>,
     ) -> Result<Self> {
-        let rootfs_path = Self::default_rootfs_path()?;
-        let sg = storage_gb.unwrap_or(crate::storage::DEFAULT_STORAGE_SIZE_GB);
-        let og = overlay_gb.unwrap_or(crate::storage::DEFAULT_OVERLAY_SIZE_GB);
-
-        let storage_disk = StorageDisk::open_or_create_with_size(sg)?;
-
-        // Overlay disk lives next to the storage disk
-        let overlay_path = storage_disk
-            .path()
-            .parent()
-            .unwrap_or_else(|| Path::new("/tmp"))
-            .join(crate::storage::OVERLAY_DISK_FILENAME);
-        let overlay_disk = OverlayDisk::open_or_create_at(&overlay_path, og)?;
-
-        Self::new(rootfs_path, storage_disk, overlay_disk)
+        Self::for_vm_with_sizes("default", storage_gb, overlay_gb)
     }
 
-    /// Get the default (anonymous) agent manager with default sizes.
+    /// Get the default agent manager with default sizes.
+    ///
+    /// Canonicalized to `for_vm("default")` so that all lifecycle commands
+    /// use consistent socket/PID/storage paths.
     pub fn new_default() -> Result<Self> {
-        Self::new_default_with_sizes(None, None)
+        Self::for_vm("default")
     }
 
     /// Get an agent manager for a named VM.

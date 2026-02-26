@@ -408,6 +408,80 @@ test_microvm_rootfs_persists_across_reboot() {
 }
 
 # =============================================================================
+# Default VM DB Persistence
+# Tests verify that the anonymous/default VM lifecycle is reflected in the DB.
+# =============================================================================
+
+test_db_default_vm_appears_in_list_on_start() {
+    cleanup_microvm
+
+    # Start the default VM (no name)
+    $SMOLVM microvm start 2>&1 || return 1
+
+    # Verify "default" appears in microvm ls --json as running
+    local list_output
+    list_output=$($SMOLVM microvm ls --json 2>&1)
+
+    # Clean up
+    $SMOLVM microvm stop 2>/dev/null || true
+
+    [[ "$list_output" == *'"name": "default"'* ]] && \
+    [[ "$list_output" == *'"state": "running"'* ]]
+}
+
+test_db_default_vm_shows_stopped_after_stop() {
+    cleanup_microvm
+
+    # Start then stop the default VM
+    $SMOLVM microvm start 2>&1 || return 1
+    $SMOLVM microvm stop 2>&1 || return 1
+
+    # Verify "default" shows as stopped
+    local list_output
+    list_output=$($SMOLVM microvm ls --json 2>&1)
+
+    [[ "$list_output" == *'"name": "default"'* ]] && \
+    [[ "$list_output" == *'"state": "stopped"'* ]]
+}
+
+test_db_default_vm_state_transitions() {
+    cleanup_microvm
+
+    # Start default VM
+    $SMOLVM microvm start 2>&1 || return 1
+
+    # Check running state
+    local running_state
+    running_state=$($SMOLVM microvm ls --json 2>&1)
+    if [[ "$running_state" != *'"state": "running"'* ]]; then
+        echo "State should be 'running' after start"
+        $SMOLVM microvm stop 2>/dev/null || true
+        return 1
+    fi
+
+    # Stop default VM
+    $SMOLVM microvm stop 2>&1 || return 1
+
+    # Check stopped state
+    local stopped_state
+    stopped_state=$($SMOLVM microvm ls --json 2>&1)
+    if [[ "$stopped_state" != *'"state": "stopped"'* ]]; then
+        echo "State should be 'stopped' after stop"
+        return 1
+    fi
+
+    # Restart and check running again
+    $SMOLVM microvm start 2>&1 || return 1
+    local restarted_state
+    restarted_state=$($SMOLVM microvm ls --json 2>&1)
+
+    # Clean up
+    $SMOLVM microvm stop 2>/dev/null || true
+
+    [[ "$restarted_state" == *'"state": "running"'* ]]
+}
+
+# =============================================================================
 # Run Tests
 # =============================================================================
 
@@ -424,6 +498,9 @@ run_test "Exec when stopped fails" test_microvm_exec_when_stopped || true
 run_test "DB persistence across restart" test_db_persistence_across_restart || true
 run_test "DB VM state update" test_db_vm_state_update || true
 run_test "DB delete removes from database" test_db_delete_removes_from_db || true
+run_test "DB default VM appears in list on start" test_db_default_vm_appears_in_list_on_start || true
+run_test "DB default VM shows stopped after stop" test_db_default_vm_shows_stopped_after_stop || true
+run_test "DB default VM state transitions" test_db_default_vm_state_transitions || true
 run_test "Network: disabled by default" test_microvm_network_disabled_by_default || true
 run_test "Network: DNS resolution" test_microvm_network_dns_resolution || true
 run_test "Network: multiple DNS lookups" test_microvm_network_multiple_dns_lookups || true

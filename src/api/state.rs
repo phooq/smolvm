@@ -616,6 +616,29 @@ pub async fn ensure_sandbox_running(
     .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?
 }
 
+/// Ensure a sandbox is running and persist the Running state to the database.
+///
+/// Used by handlers that implicitly start VMs (containers, exec, images).
+/// State persistence is best-effort — a DB write failure is logged but does
+/// not fail the request, matching the supervisor's error-handling pattern.
+pub async fn ensure_running_and_persist(
+    state: &ApiState,
+    name: &str,
+    entry: &Arc<parking_lot::Mutex<SandboxEntry>>,
+) -> crate::Result<()> {
+    ensure_sandbox_running(entry).await?;
+
+    let pid = {
+        let entry = entry.lock();
+        entry.manager.child_pid()
+    };
+    if let Err(e) = state.update_sandbox_state(name, RecordState::Running, pid) {
+        tracing::warn!(sandbox = %name, error = %e, "failed to persist Running state after implicit start");
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 // Type Conversions
 // ============================================================================

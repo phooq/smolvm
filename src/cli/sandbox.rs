@@ -167,7 +167,7 @@ impl StopCmd {
         let name = vm_common::resolve_vm_name(self.name)?;
         match &name {
             Some(name) => vm_common::stop_vm_named(KIND, name),
-            None => vm_common::stop_vm_anonymous(KIND),
+            None => vm_common::stop_vm_default(KIND),
         }
     }
 }
@@ -404,6 +404,40 @@ impl RunCmd {
                 mount_bindings,
             )?;
 
+            // Persist "default" record so `sandbox ls` shows this VM
+            {
+                use smolvm::config::SmolvmConfig;
+                use vm_common::DefaultVmOverrides;
+                let mount_tuples: Vec<(String, String, bool)> = mounts
+                    .iter()
+                    .map(|m| {
+                        (
+                            m.source.to_string_lossy().to_string(),
+                            m.target.to_string_lossy().to_string(),
+                            m.read_only,
+                        )
+                    })
+                    .collect();
+                let port_tuples: Vec<(u16, u16)> =
+                    self.port.iter().map(|p| (p.host, p.guest)).collect();
+                if let Ok(mut config) = SmolvmConfig::load() {
+                    vm_common::persist_default_running(
+                        &mut config,
+                        manager.child_pid(),
+                        Some(DefaultVmOverrides {
+                            cpus: self.cpus,
+                            mem: self.mem,
+                            mounts: mount_tuples,
+                            ports: port_tuples,
+                            network: self.net,
+                            storage_gb: self.storage,
+                            overlay_gb: self.overlay,
+                        }),
+                    );
+                    config.close_db();
+                }
+            }
+
             println!("Sandbox running (container: {})", &info.id[..12]);
             println!("\nTo interact with the sandbox:");
             println!(
@@ -567,7 +601,7 @@ impl StartCmd {
         let name = vm_common::resolve_vm_name(self.name)?;
         match &name {
             Some(name) => vm_common::start_vm_named(KIND, name),
-            None => vm_common::start_vm_anonymous(KIND),
+            None => vm_common::start_vm_default(KIND),
         }
     }
 }

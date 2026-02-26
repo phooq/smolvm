@@ -60,7 +60,7 @@ impl VmKind {
 /// Resolve an optional VM name: if no name is given and a VM named "default"
 /// exists in the config database, return `Some("default")` so callers route
 /// through the named-VM code path (which loads config, init commands, network
-/// settings, etc.).  Otherwise returns the input unchanged.
+/// settings, etc.). Otherwise returns the input unchanged.
 pub fn resolve_vm_name(name: Option<String>) -> smolvm::Result<Option<String>> {
     if name.is_some() {
         return Ok(name);
@@ -75,21 +75,14 @@ pub fn resolve_vm_name(name: Option<String>) -> smolvm::Result<Option<String>> {
 
 /// Get the agent manager for an optional name (default if `None`).
 ///
-/// When no name is given but a named VM "default" exists in the config
-/// database, uses the named path so socket/PID locations are consistent
-/// with `start_vm_named`.
+/// When no name is given, uses `AgentManager::new_default()` which is
+/// canonicalized to `for_vm("default")` — same socket/PID/storage paths
+/// regardless of whether the caller specifies a name or not.
 pub fn get_vm_manager(name: &Option<String>) -> smolvm::Result<AgentManager> {
     if let Some(name) = name {
         AgentManager::for_vm(name)
     } else {
-        // Check if a named "default" VM exists in config — if so, use its
-        // named paths so exec/status find the same socket that start created.
-        let config = SmolvmConfig::load()?;
-        if config.get_vm("default").is_some() {
-            AgentManager::for_vm("default")
-        } else {
-            AgentManager::new_default()
-        }
+        AgentManager::new_default()
     }
 }
 
@@ -427,8 +420,65 @@ pub fn start_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
     Ok(())
 }
 
-/// Start the default anonymous VM/sandbox.
-pub fn start_vm_anonymous(kind: VmKind) -> smolvm::Result<()> {
+/// Persist the "default" VM as running in the database.
+///
+/// Creates the record if it doesn't exist, then updates state to Running
+/// with the current PID and optional config overrides (cpus, mem, etc.).
+/// Call `config.close_db()` after this to release the lock.
+pub fn persist_default_running(
+    config: &mut SmolvmConfig,
+    pid: Option<i32>,
+    overrides: Option<DefaultVmOverrides>,
+) {
+    if config.get_vm("default").is_none() {
+        let record = VmRecord::new(
+            "default".to_string(),
+            smolvm::config::DEFAULT_VM_CPUS,
+            smolvm::config::DEFAULT_VM_MEMORY_MIB,
+            vec![],
+            vec![],
+            false,
+        );
+        if let Err(e) = config.insert_vm("default".to_string(), record) {
+            tracing::warn!(error = %e, "failed to insert default VM record");
+            return;
+        }
+    }
+    let pid_start_time = pid.and_then(smolvm::process::process_start_time);
+    if config
+        .update_vm("default", |r| {
+            r.state = RecordState::Running;
+            r.pid = pid;
+            r.pid_start_time = pid_start_time;
+            if let Some(ref o) = overrides {
+                r.cpus = o.cpus;
+                r.mem = o.mem;
+                r.mounts = o.mounts.clone();
+                r.ports = o.ports.clone();
+                r.network = o.network;
+                r.storage_gb = o.storage_gb;
+                r.overlay_gb = o.overlay_gb;
+            }
+        })
+        .is_none()
+    {
+        tracing::warn!("failed to update default VM record (record missing after insert)");
+    }
+}
+
+/// Config overrides for the default VM record.
+pub struct DefaultVmOverrides {
+    pub cpus: u8,
+    pub mem: u32,
+    pub mounts: Vec<(String, String, bool)>,
+    pub ports: Vec<(u16, u16)>,
+    pub network: bool,
+    pub storage_gb: Option<u64>,
+    pub overlay_gb: Option<u64>,
+}
+
+/// Start the default VM/sandbox.
+pub fn start_vm_default(kind: VmKind) -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
     if manager.try_connect_existing().is_some() {
@@ -445,8 +495,15 @@ pub fn start_vm_anonymous(kind: VmKind) -> smolvm::Result<()> {
     println!("Starting {} 'default'...", kind.label());
     manager.ensure_running()?;
 
-    let pid = manager.child_pid().unwrap_or(0);
-    println!("{} 'default' running (PID: {})", kind.display_name(), pid);
+    let mut config = SmolvmConfig::load()?;
+    persist_default_running(&mut config, manager.child_pid(), None);
+    config.close_db();
+
+    println!(
+        "{} 'default' running (PID: {})",
+        kind.display_name(),
+        manager.child_pid().unwrap_or(0)
+    );
 
     manager.detach();
     Ok(())
@@ -495,25 +552,22 @@ pub fn stop_vm_named(kind: VmKind, name: &str) -> smolvm::Result<()> {
 
     println!("Stopping {} '{}'...", kind.label(), name);
 
-    if let Ok(manager) = AgentManager::for_vm(name) {
-        if let Err(e) = manager.stop() {
-            tracing::warn!(error = %e, "failed to stop {}", kind.label());
-        }
-    }
+    let manager = AgentManager::for_vm(name)
+        .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
+    manager.stop()?;
 
     config.update_vm(name, |r| {
         r.state = RecordState::Stopped;
         r.pid = None;
         r.pid_start_time = None;
     });
-    config.save()?;
 
     println!("Stopped {}: {}", kind.label(), name);
     Ok(())
 }
 
-/// Stop the default anonymous VM/sandbox.
-pub fn stop_vm_anonymous(kind: VmKind) -> smolvm::Result<()> {
+/// Stop the default VM/sandbox.
+pub fn stop_vm_default(kind: VmKind) -> smolvm::Result<()> {
     let manager = AgentManager::new_default()?;
 
     // try_connect_existing sets internal state if agent is reachable;
@@ -521,6 +575,16 @@ pub fn stop_vm_anonymous(kind: VmKind) -> smolvm::Result<()> {
     manager.try_connect_existing();
     println!("Stopping {} 'default'...", kind.label());
     manager.stop()?;
+
+    // Update database record if it exists
+    if let Ok(mut config) = SmolvmConfig::load() {
+        config.update_vm("default", |r| {
+            r.state = RecordState::Stopped;
+            r.pid = None;
+            r.pid_start_time = None;
+        });
+    }
+
     println!("{} 'default' stopped", kind.display_name());
 
     Ok(())
