@@ -1293,6 +1293,10 @@ impl AgentClient {
 
         // Validate frame size to prevent OOM from malicious/buggy responses
         if len > MAX_FRAME_SIZE as usize {
+            // Header consumed but body not read — stream is desynchronized.
+            // Shut down the read half so all future reads fail immediately
+            // rather than interpreting body bytes as a frame header.
+            let _ = self.stream.shutdown(std::net::Shutdown::Read);
             return Err(Error::agent(
                 "validate frame",
                 format!(
@@ -1305,7 +1309,12 @@ impl AgentClient {
         let mut buf = vec![0u8; len];
         // Always retry body reads — header is already consumed so we can't
         // propagate an error without corrupting the stream.
-        self.read_exact_retry(&mut buf, false)?;
+        if let Err(e) = self.read_exact_retry(&mut buf, false) {
+            // Body read failed — stream is desynchronized. Shut down the
+            // read half so future reads fail cleanly.
+            let _ = self.stream.shutdown(std::net::Shutdown::Read);
+            return Err(e.into());
+        }
 
         let resp: AgentResponse = serde_json::from_slice(&buf)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;
