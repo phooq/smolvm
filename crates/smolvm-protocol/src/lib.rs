@@ -85,8 +85,8 @@ pub enum AgentRequest {
     Pull {
         /// Image reference (e.g., "alpine:latest", "docker.io/library/ubuntu:22.04").
         image: String,
-        /// Platform to pull (e.g., "linux/arm64", "linux/amd64").
-        platform: Option<String>,
+        /// OCI platform to pull (e.g., "linux/arm64", "linux/amd64").
+        oci_platform: Option<String>,
         /// Optional registry authentication credentials.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         auth: Option<RegistryAuth>,
@@ -789,7 +789,7 @@ mod tests {
     fn test_encode_decode_roundtrip() {
         let req = AgentRequest::Pull {
             image: "alpine:latest".to_string(),
-            platform: Some("linux/arm64".to_string()),
+            oci_platform: Some("linux/arm64".to_string()),
             auth: None,
         };
 
@@ -798,14 +798,14 @@ mod tests {
 
         let AgentRequest::Pull {
             image,
-            platform,
+            oci_platform,
             auth,
         } = decoded
         else {
             panic!("expected Pull variant, got {:?}", decoded);
         };
         assert_eq!(image, "alpine:latest");
-        assert_eq!(platform, Some("linux/arm64".to_string()));
+        assert_eq!(oci_platform, Some("linux/arm64".to_string()));
         assert!(auth.is_none());
     }
 
@@ -813,7 +813,7 @@ mod tests {
     fn test_encode_decode_with_auth() {
         let req = AgentRequest::Pull {
             image: "ghcr.io/owner/repo:latest".to_string(),
-            platform: None,
+            oci_platform: None,
             auth: Some(RegistryAuth {
                 username: "testuser".to_string(),
                 password: "testpass".to_string(),
@@ -825,14 +825,14 @@ mod tests {
 
         let AgentRequest::Pull {
             image,
-            platform,
+            oci_platform,
             auth,
         } = decoded
         else {
             panic!("expected Pull variant, got {:?}", decoded);
         };
         assert_eq!(image, "ghcr.io/owner/repo:latest");
-        assert!(platform.is_none());
+        assert!(oci_platform.is_none());
         let auth = auth.expect("auth should be Some");
         assert_eq!(auth.username, "testuser");
         assert_eq!(auth.password, "testpass");

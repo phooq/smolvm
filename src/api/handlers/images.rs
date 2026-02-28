@@ -92,11 +92,11 @@ pub async fn pull_image(
         .map_err(classify_ensure_running_error)?;
 
     let image = req.image.clone();
-    let platform = req.platform.clone();
+    let oci_platform = req.oci_platform.clone();
     let image_info = with_sandbox_client(&entry, move |c| {
         let mut opts = PullOptions::new().use_registry_config(true);
-        if let Some(p) = platform {
-            opts = opts.platform(p);
+        if let Some(p) = oci_platform {
+            opts = opts.oci_platform(p);
         }
         c.pull(&image, opts)
     })

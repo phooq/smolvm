@@ -358,10 +358,10 @@ pub struct PullImageRequest {
     /// Image reference.
     #[schema(example = "python:3.12-alpine")]
     pub image: String,
-    /// Platform (e.g., "linux/arm64").
+    /// OCI platform for multi-arch images (e.g., "linux/arm64").
     #[serde(default)]
     #[schema(example = "linux/arm64")]
-    pub platform: Option<String>,
+    pub oci_platform: Option<String>,
 }
 
 /// Pull image response.

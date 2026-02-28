@@ -88,7 +88,7 @@ test_pack_with_platform() {
         host_arch="linux/amd64"
     fi
 
-    $SMOLVM pack alpine:latest -o "$output" --platform "$host_arch" 2>&1
+    $SMOLVM pack alpine:latest -o "$output" --oci-platform "$host_arch" 2>&1
 
     # Binary should exist
     [[ -f "$output" ]]
@@ -560,7 +560,7 @@ run_test "Pack help" test_pack_help || true
 run_test "Pack requires output" test_pack_requires_output || true
 run_test "Pack alpine" test_pack_alpine || true
 run_test "Pack with custom resources" test_pack_with_custom_resources || true
-run_test "Pack with --platform" test_pack_with_platform || true
+run_test "Pack with --oci-platform" test_pack_with_platform || true
 
 echo ""
 echo "Running Packed Binary Info Tests..."

@@ -42,19 +42,19 @@ test_sandbox_help() {
 }
 
 test_sandbox_run_platform_flag() {
-    # Verify --platform flag exists in sandbox run help
+    # Verify --oci-platform flag exists in sandbox run help
     local output
     output=$($SMOLVM sandbox run --help 2>&1)
-    [[ "$output" == *"--platform"* ]] && \
+    [[ "$output" == *"--oci-platform"* ]] && \
     [[ "$output" == *"linux/arm64"* ]] && \
     [[ "$output" == *"linux/amd64"* ]]
 }
 
 test_pack_platform_flag() {
-    # Verify --platform flag exists in pack help
+    # Verify --oci-platform flag exists in pack help
     local output
     output=$($SMOLVM pack --help 2>&1)
-    [[ "$output" == *"--platform"* ]] && \
+    [[ "$output" == *"--oci-platform"* ]] && \
     [[ "$output" == *"linux/arm64"* ]] && \
     [[ "$output" == *"linux/amd64"* ]]
 }
@@ -98,8 +98,8 @@ test_sandbox_run_missing_image() {
 run_test "Version command" test_version || true
 run_test "Help command" test_help || true
 run_test "Sandbox help" test_sandbox_help || true
-run_test "Sandbox run --platform flag" test_sandbox_run_platform_flag || true
-run_test "Pack --platform flag" test_pack_platform_flag || true
+run_test "Sandbox run --oci-platform flag" test_sandbox_run_platform_flag || true
+run_test "Pack --oci-platform flag" test_pack_platform_flag || true
 run_test "Microvm help" test_microvm_help || true
 run_test "Container help" test_container_help || true
 run_test "Invalid subcommand fails" test_invalid_subcommand || true

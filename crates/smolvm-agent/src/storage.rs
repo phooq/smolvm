@@ -646,7 +646,7 @@ fn json_string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
 /// The callback is called for each layer being pulled with (current, total, layer_id).
 pub fn pull_image_with_progress_and_auth<F>(
     image: &str,
-    platform: Option<&str>,
+    oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
     mut progress: F,
 ) -> Result<ImageInfo>
@@ -667,9 +667,9 @@ where
         return create_packed_image_info(image, packed_dir);
     }
 
-    // Determine platform - default to current architecture
+    // Determine OCI platform - default to current architecture
     // This must happen BEFORE the cache check so we can verify architecture
-    let platform = platform.or({
+    let oci_platform = oci_platform.or({
         #[cfg(target_arch = "aarch64")]
         {
             Some("linux/arm64")
@@ -686,10 +686,10 @@ where
 
     // Check if already cached with correct architecture
     if let Ok(Some(info)) = query_image(image) {
-        // Verify cached image architecture matches requested platform
+        // Verify cached image architecture matches requested OCI platform
         let cached_arch = &info.architecture;
-        let requested_arch = platform
-            .map(|p| platform_to_arch(p))
+        let requested_arch = oci_platform
+            .map(|p| oci_platform_to_arch(p))
             .unwrap_or_else(|| cached_arch.clone());
 
         if cached_arch == &requested_arch {
@@ -718,10 +718,10 @@ where
 
     let root = Path::new(STORAGE_ROOT);
 
-    // Get manifest with platform specified
+    // Get manifest with OCI platform specified
     progress(0, 0, "fetching manifest");
-    info!(image = %image, platform = ?platform, "fetching manifest");
-    let manifest = crane_manifest(image, platform, auth)?;
+    info!(image = %image, oci_platform = ?oci_platform, "fetching manifest");
+    let manifest = crane_manifest(image, oci_platform, auth)?;
 
     // Parse manifest to get config and layers
     let manifest_json: serde_json::Value =
@@ -769,7 +769,7 @@ where
     std::fs::write(&manifest_path, &manifest)?;
 
     // Fetch and save config
-    let config = crane_config(image, platform, auth)?;
+    let config = crane_config(image, oci_platform, auth)?;
     let config_id = config_digest
         .strip_prefix("sha256:")
         .unwrap_or(config_digest);
@@ -820,7 +820,7 @@ where
         let mut crane_cmd = Command::new("crane");
         crane_cmd.arg("blob");
         crane_cmd.arg(format!("{}@{}", image, layer_digest));
-        if let Some(p) = platform {
+        if let Some(p) = oci_platform {
             crane_cmd.arg("--platform").arg(p);
         }
         crane_cmd.stdout(Stdio::piped());
@@ -2051,7 +2051,7 @@ fn setup_docker_auth(
 fn run_crane(
     operation: &str,
     image: &str,
-    platform: Option<&str>,
+    oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
 ) -> Result<String> {
     use crate::retry::{
@@ -2063,7 +2063,7 @@ fn run_crane(
     retry_with_backoff(
         RetryConfig::for_network(),
         &op_name,
-        || run_crane_once(operation, image, platform, auth),
+        || run_crane_once(operation, image, oci_platform, auth),
         |e| {
             let error_msg = e.to_string();
             // Don't retry permanent errors
@@ -2080,13 +2080,13 @@ fn run_crane(
 fn run_crane_once(
     operation: &str,
     image: &str,
-    platform: Option<&str>,
+    oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
 ) -> Result<String> {
     let mut cmd = Command::new("crane");
     cmd.arg(operation).arg(image);
 
-    if let Some(p) = platform {
+    if let Some(p) = oci_platform {
         cmd.arg("--platform").arg(p);
     }
 
@@ -2112,19 +2112,19 @@ fn run_crane_once(
 /// Run crane manifest command.
 fn crane_manifest(
     image: &str,
-    platform: Option<&str>,
+    oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
 ) -> Result<String> {
-    run_crane("manifest", image, platform, auth)
+    run_crane("manifest", image, oci_platform, auth)
 }
 
 /// Run crane config command.
 fn crane_config(
     image: &str,
-    platform: Option<&str>,
+    oci_platform: Option<&str>,
     auth: Option<&RegistryAuth>,
 ) -> Result<String> {
-    run_crane("config", image, platform, auth)
+    run_crane("config", image, oci_platform, auth)
 }
 
 /// Sanitize image name for use as filename.
@@ -2183,21 +2183,21 @@ fn count_entries(path: &Path) -> Result<usize> {
     Ok(std::fs::read_dir(path)?.count())
 }
 
-/// Convert a platform string to its architecture component.
+/// Convert an OCI platform string to its architecture component.
 ///
 /// # Examples
 /// - "linux/arm64" -> "arm64"
 /// - "linux/amd64" -> "amd64"
 /// - "linux/arm64/v8" -> "arm64"
-fn platform_to_arch(platform: &str) -> String {
-    // Platform format is "os/arch" or "os/arch/variant"
+fn oci_platform_to_arch(oci_platform: &str) -> String {
+    // OCI platform format is "os/arch" or "os/arch/variant"
     // We want just the arch part
-    let parts: Vec<&str> = platform.split('/').collect();
+    let parts: Vec<&str> = oci_platform.split('/').collect();
     if parts.len() >= 2 {
         parts[1].to_string()
     } else {
         // Fallback: return as-is if not in expected format
-        platform.to_string()
+        oci_platform.to_string()
     }
 }
 
@@ -2228,26 +2228,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_platform_to_arch_linux_arm64() {
-        assert_eq!(platform_to_arch("linux/arm64"), "arm64");
+    fn test_oci_platform_to_arch_linux_arm64() {
+        assert_eq!(oci_platform_to_arch("linux/arm64"), "arm64");
     }
 
     #[test]
-    fn test_platform_to_arch_linux_amd64() {
-        assert_eq!(platform_to_arch("linux/amd64"), "amd64");
+    fn test_oci_platform_to_arch_linux_amd64() {
+        assert_eq!(oci_platform_to_arch("linux/amd64"), "amd64");
     }
 
     #[test]
-    fn test_platform_to_arch_with_variant() {
-        assert_eq!(platform_to_arch("linux/arm64/v8"), "arm64");
-        assert_eq!(platform_to_arch("linux/arm/v7"), "arm");
+    fn test_oci_platform_to_arch_with_variant() {
+        assert_eq!(oci_platform_to_arch("linux/arm64/v8"), "arm64");
+        assert_eq!(oci_platform_to_arch("linux/arm/v7"), "arm");
     }
 
     #[test]
-    fn test_platform_to_arch_fallback() {
+    fn test_oci_platform_to_arch_fallback() {
         // If not in expected format, return as-is
-        assert_eq!(platform_to_arch("arm64"), "arm64");
-        assert_eq!(platform_to_arch("unknown"), "unknown");
+        assert_eq!(oci_platform_to_arch("arm64"), "arm64");
+        assert_eq!(oci_platform_to_arch("unknown"), "unknown");
     }
 
     #[test]

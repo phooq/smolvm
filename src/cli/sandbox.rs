@@ -259,12 +259,16 @@ pub struct RunCmd {
     )]
     pub env: Vec<String>,
 
-    /// Target platform for multi-arch images (e.g., linux/arm64, linux/amd64)
+    /// Target OCI platform for multi-arch images (e.g., linux/arm64, linux/amd64)
     ///
     /// By default, uses the host architecture. Use this to override, for example
     /// to run x86_64 images via Rosetta on Apple Silicon.
-    #[arg(long, value_name = "OS/ARCH", help_heading = "Container")]
-    pub platform: Option<String>,
+    #[arg(
+        long = "oci-platform",
+        value_name = "OS/ARCH",
+        help_heading = "Container"
+    )]
+    pub oci_platform: Option<String>,
 
     /// Mount host directory into container (can be used multiple times)
     #[arg(
@@ -400,7 +404,7 @@ impl RunCmd {
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
 
         // Pull image with progress display
-        crate::cli::pull_with_progress(&mut client, &self.image, self.platform.as_deref())?;
+        crate::cli::pull_with_progress(&mut client, &self.image, self.oci_platform.as_deref())?;
 
         // Run init commands from Smolfile only on fresh VM start (not when reusing)
         if freshly_started && !params.init.is_empty() {

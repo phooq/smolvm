@@ -161,7 +161,7 @@ impl RunConfig {
 ///
 /// ```ignore
 /// let options = PullOptions::new()
-///     .platform("linux/arm64")
+///     .oci_platform("linux/arm64")
 ///     .use_registry_config(true)
 ///     .progress(|cur, total, layer| println!("{}/{}: {}", cur, total, layer));
 ///
@@ -172,8 +172,8 @@ pub struct PullOptions<F = fn(usize, usize, &str)>
 where
     F: FnMut(usize, usize, &str),
 {
-    /// Platform to pull (e.g., "linux/arm64").
-    pub platform: Option<String>,
+    /// OCI platform to pull (e.g., "linux/arm64").
+    pub oci_platform: Option<String>,
     /// Explicit authentication credentials.
     pub auth: Option<RegistryAuth>,
     /// Whether to load credentials from registry config file.
@@ -186,7 +186,7 @@ impl PullOptions<fn(usize, usize, &str)> {
     /// Create new pull options with defaults.
     pub fn new() -> Self {
         Self {
-            platform: None,
+            oci_platform: None,
             auth: None,
             use_registry_config: false,
             progress: None,
@@ -195,9 +195,9 @@ impl PullOptions<fn(usize, usize, &str)> {
 }
 
 impl<F: FnMut(usize, usize, &str)> PullOptions<F> {
-    /// Set the target platform (e.g., "linux/arm64").
-    pub fn platform(mut self, platform: impl Into<String>) -> Self {
-        self.platform = Some(platform.into());
+    /// Set the target OCI platform (e.g., "linux/arm64").
+    pub fn oci_platform(mut self, oci_platform: impl Into<String>) -> Self {
+        self.oci_platform = Some(oci_platform.into());
         self
     }
 
@@ -222,7 +222,7 @@ impl<F: FnMut(usize, usize, &str)> PullOptions<F> {
     /// The callback receives (current_percent, total=100, layer_id) for each layer.
     pub fn progress<G: FnMut(usize, usize, &str)>(self, callback: G) -> PullOptions<G> {
         PullOptions {
-            platform: self.platform,
+            oci_platform: self.oci_platform,
             auth: self.auth,
             use_registry_config: self.use_registry_config,
             progress: Some(callback),
@@ -458,7 +458,7 @@ impl AgentClient {
 
         self.pull_image_internal(
             &effective_image,
-            options.platform.as_deref(),
+            options.oci_platform.as_deref(),
             effective_auth.as_ref(),
             options.progress,
         )
@@ -468,7 +468,7 @@ impl AgentClient {
     fn pull_image_internal<F: FnMut(usize, usize, &str)>(
         &mut self,
         image: &str,
-        platform: Option<&str>,
+        oci_platform: Option<&str>,
         auth: Option<&RegistryAuth>,
         mut progress: Option<F>,
     ) -> Result<ImageInfo> {
@@ -480,7 +480,7 @@ impl AgentClient {
         // Send the pull request
         let data = encode_message(&AgentRequest::Pull {
             image: image.to_string(),
-            platform: platform.map(String::from),
+            oci_platform: oci_platform.map(String::from),
             auth: auth.cloned(),
         })
         .map_err(|e| Error::agent("encode message", e.to_string()))?;
@@ -542,14 +542,14 @@ impl AgentClient {
     pub fn pull_with_registry_config_and_progress<F: FnMut(usize, usize, &str)>(
         &mut self,
         image: &str,
-        platform: Option<&str>,
+        oci_platform: Option<&str>,
         progress: F,
     ) -> Result<ImageInfo> {
         let mut opts = PullOptions::new()
             .use_registry_config(true)
             .progress(progress);
-        if let Some(p) = platform {
-            opts = opts.platform(p);
+        if let Some(p) = oci_platform {
+            opts = opts.oci_platform(p);
         }
         self.pull(image, opts)
     }
