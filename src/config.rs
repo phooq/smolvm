@@ -203,18 +203,18 @@ impl SmolvmConfig {
 
         #[cfg(not(target_os = "macos"))]
         let settings: Vec<(&str, &str)> = vec![
-            ("version", &version_str),
-            ("default_cpus", &cpus_str),
-            ("default_mem", &mem_str),
-            ("default_dns", &self.default_dns),
+            ("version", version_str.as_str()),
+            ("default_cpus", cpus_str.as_str()),
+            ("default_mem", mem_str.as_str()),
+            ("default_dns", self.default_dns.as_str()),
         ];
 
         #[cfg(target_os = "macos")]
         let settings: Vec<(&str, &str)> = {
             let mut s = vec![
-                ("version", &version_str),
-                ("default_cpus", &cpus_str),
-                ("default_mem", &mem_str),
+                ("version", version_str.as_str()),
+                ("default_cpus", cpus_str.as_str()),
+                ("default_mem", mem_str.as_str()),
                 ("default_dns", self.default_dns.as_str()),
             ];
             if !self.storage_volume.is_empty() {
