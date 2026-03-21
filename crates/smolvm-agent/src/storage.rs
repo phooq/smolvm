@@ -1608,8 +1608,29 @@ pub struct RunResult {
     pub stderr: String,
 }
 
+/// Prepared rootfs information for a single ephemeral run.
+pub struct PreparedRunRootfs {
+    pub workload_id: String,
+    pub rootfs_path: String,
+}
+
+fn prepare_ephemeral_run_rootfs(image: &str) -> Result<PreparedRunRootfs> {
+    let workload_id = format!("run-{}", generate_container_id());
+    let overlay = prepare_overlay(image, &workload_id)?;
+    debug!(
+        workload_id = %workload_id,
+        rootfs = %overlay.rootfs_path,
+        "prepared ephemeral overlay for command execution"
+    );
+
+    Ok(PreparedRunRootfs {
+        workload_id,
+        rootfs_path: overlay.rootfs_path,
+    })
+}
+
 /// Run a command in an image's overlay rootfs using crun OCI runtime.
-/// Uses a persistent overlay per image for fast repeated execution.
+/// Uses a fresh overlay per invocation and cleans it up afterward.
 pub fn run_command(
     image: &str,
     command: &[String],
@@ -1622,64 +1643,64 @@ pub fn run_command(
     crate::oci::validate_image_reference(image).map_err(StorageError::new)?;
     crate::oci::validate_env_vars(env).map_err(StorageError::new)?;
 
-    // Use consistent workload ID per image for overlay reuse
-    let workload_id = format!("persistent-{}", sanitize_image_name(image));
+    let prepared = prepare_ephemeral_run_rootfs(image)?;
 
-    // Check if overlay is already mounted
-    let overlay = get_or_create_overlay(image, &workload_id)?;
-    debug!(rootfs = %overlay.rootfs_path, "using overlay for command execution");
+    let result = (|| {
+        // Setup volume mounts (mount virtiofs to staging area)
+        let mounted_paths = setup_volume_mounts(&prepared.rootfs_path, mounts)?;
 
-    // Setup volume mounts (mount virtiofs to staging area)
-    let mounted_paths = setup_volume_mounts(&overlay.rootfs_path, mounts)?;
+        // Get bundle path
+        let overlay_root = Path::new(STORAGE_ROOT)
+            .join(OVERLAYS_DIR)
+            .join(&prepared.workload_id);
+        let bundle_path = overlay_root.join("bundle");
 
-    // Get bundle path
-    let overlay_root = Path::new(STORAGE_ROOT)
-        .join(OVERLAYS_DIR)
-        .join(&workload_id);
-    let bundle_path = overlay_root.join("bundle");
+        // Create OCI spec
+        let workdir_str = workdir.unwrap_or("/");
+        let mut spec = OciSpec::new(command, env, workdir_str, false);
 
-    // Create OCI spec
-    let workdir_str = workdir.unwrap_or("/");
-    let mut spec = OciSpec::new(command, env, workdir_str, false);
+        // Add virtiofs bind mounts to OCI spec
+        for (tag, container_path, read_only) in mounts {
+            let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+            spec.add_bind_mount(
+                &virtiofs_mount.to_string_lossy(),
+                container_path,
+                *read_only,
+            );
+        }
 
-    // Add virtiofs bind mounts to OCI spec
-    for (tag, container_path, read_only) in mounts {
-        let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
-        spec.add_bind_mount(
-            &virtiofs_mount.to_string_lossy(),
-            container_path,
-            *read_only,
+        // Write config.json to bundle
+        spec.write_to(&bundle_path)
+            .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
+
+        // Generate unique container ID for this execution
+        let container_id = generate_container_id();
+
+        // Run with crun
+        let result = run_with_crun(&bundle_path, &container_id, timeout_ms);
+
+        // Suppress unused warning; mounts live under the ephemeral overlay and
+        // are removed as part of cleanup_overlay().
+        let _ = mounted_paths;
+
+        result
+    })();
+
+    if let Err(e) = cleanup_overlay(&prepared.workload_id) {
+        warn!(
+            workload_id = %prepared.workload_id,
+            error = %e,
+            "failed to clean up ephemeral overlay"
         );
     }
-
-    // Write config.json to bundle
-    spec.write_to(&bundle_path)
-        .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
-
-    // Generate unique container ID for this execution
-    let container_id = generate_container_id();
-
-    // Run with crun
-    let result = run_with_crun(&bundle_path, &container_id, timeout_ms);
-
-    // Note: virtiofs mounts are left in place for reuse
-    // They will be cleaned up when the overlay is cleaned up or the VM shuts down
-    let _ = mounted_paths; // Suppress unused warning
 
     result
 }
 
-/// Prepare for running a command - returns the rootfs path.
+/// Prepare for running a command - returns the ephemeral overlay info.
 /// This is used by interactive mode which spawns the command separately.
-pub fn prepare_for_run(image: &str) -> Result<String> {
-    // Use consistent workload ID per image for overlay reuse
-    let workload_id = format!("persistent-{}", sanitize_image_name(image));
-
-    // Check if overlay is already mounted
-    let overlay = get_or_create_overlay(image, &workload_id)?;
-    debug!(rootfs = %overlay.rootfs_path, "prepared overlay for interactive run");
-
-    Ok(overlay.rootfs_path)
+pub fn prepare_for_run(image: &str) -> Result<PreparedRunRootfs> {
+    prepare_ephemeral_run_rootfs(image)
 }
 
 /// Setup volume mounts for a rootfs (public wrapper).
@@ -1791,26 +1812,6 @@ fn setup_volume_mounts(rootfs: &str, mounts: &[(String, String, bool)]) -> Resul
     }
 
     Ok(mounted_paths)
-}
-
-/// Get existing overlay or create new one.
-fn get_or_create_overlay(image: &str, workload_id: &str) -> Result<OverlayInfo> {
-    let root = Path::new(STORAGE_ROOT);
-    let overlay_root = root.join(OVERLAYS_DIR).join(workload_id);
-    let merged_path = overlay_root.join("merged");
-
-    // Check if already mounted
-    if merged_path.exists() && is_mountpoint(&merged_path) {
-        debug!(workload_id = %workload_id, "reusing existing overlay");
-        return Ok(OverlayInfo {
-            rootfs_path: merged_path.display().to_string(),
-            upper_path: overlay_root.join("upper").display().to_string(),
-            work_path: overlay_root.join("work").display().to_string(),
-        });
-    }
-
-    // Create new overlay
-    prepare_overlay(image, workload_id)
 }
 
 /// Check if a path is a mountpoint.
