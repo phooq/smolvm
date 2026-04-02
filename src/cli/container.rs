@@ -8,7 +8,7 @@ use crate::cli::vm_common;
 use crate::cli::{flush_output, truncate, truncate_id, COMMAND_WIDTH, IMAGE_NAME_WIDTH};
 use clap::{Args, Subcommand};
 use smolvm::agent::{AgentClient, AgentManager};
-use smolvm::data::storage::HostMount;
+use smolvm::data::mount::HostMount;
 use smolvm::db::SmolvmDb;
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::time::Duration;
