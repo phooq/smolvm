@@ -12,13 +12,12 @@ pub const NET_FEATURE_GUEST_UFO: u32 = 1 << 10;
 pub const NET_FEATURE_HOST_TSO4: u32 = 1 << 11;
 /// virtio-net host UDP fragmentation offload.
 pub const NET_FEATURE_HOST_UFO: u32 = 1 << 14;
-/// libkrun's compatibility feature set for unixstream-backed virtio-net.
-pub const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
-    | NET_FEATURE_GUEST_CSUM
-    | NET_FEATURE_GUEST_TSO4
-    | NET_FEATURE_GUEST_UFO
-    | NET_FEATURE_HOST_TSO4
-    | NET_FEATURE_HOST_UFO;
+/// Feature set advertised to libkrun for unixstream-backed virtio-net.
+///
+/// The current smoltcp-backed MVP expects ordinary packets from the guest.
+/// Leave checksum and segmentation offloads disabled until the host path
+/// explicitly handles those packet shapes.
+pub const COMPAT_NET_FEATURES: u32 = 0;
 
 /// Network backend override for machine launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ValueEnum)]
