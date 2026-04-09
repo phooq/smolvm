@@ -62,6 +62,7 @@ fn boot_log(level: &str, msg: &str) {
     eprintln!("{}", format_boot_log(level, msg));
 }
 mod dns_proxy;
+mod network;
 mod oci;
 mod paths;
 mod process;
@@ -163,6 +164,21 @@ fn main() {
         uptime_ms = start_uptime,
         "smolvm-agent started, vsock listener already ready"
     );
+
+    let t0 = uptime_ms();
+    match network::configure_from_env() {
+        Ok(true) => {
+            info!(
+                duration_ms = uptime_ms() - t0,
+                "guest virtio network configured"
+            );
+        }
+        Ok(false) => {}
+        Err(err) => {
+            error!(error = %err, "failed to configure guest network");
+            std::process::exit(1);
+        }
+    }
 
     // Mount storage disk eagerly during deferred init. If a request arrives
     // before this point, ensure_storage_mounted() handles the mount on demand.
