@@ -61,6 +61,15 @@ utoipa-swagger-ui = { version = "8", features = ["axum"] }
 ipnet = "2.12.0"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false }
+crossbeam-queue = "0.3"
+smoltcp = { version = "0.13", default-features = false, features = [
+    "std",
+    "log",
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-tcp",
+    "socket-udp",
+] }
 
 [dev-dependencies]
 tempfile = "3"
