@@ -4,7 +4,7 @@
 //! All setup is done in the child process after fork, where
 //! DYLD_LIBRARY_PATH is still available for dlopen.
 
-use crate::data::consts::{ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR};
+use crate::data::consts::{ENV_SMOLVM_AGENT_LOG, ENV_SMOLVM_KRUN_LOG_LEVEL, ENV_SMOLVM_LIB_DIR};
 use crate::data::storage::HostMount;
 use crate::error::{Error, Result};
 use crate::storage::{OverlayDisk, StorageDisk};
@@ -501,6 +501,15 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             cstr("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
             cstr("TERM=xterm-256color"),
         ];
+
+        if let Ok(agent_log) = std::env::var(ENV_SMOLVM_AGENT_LOG) {
+            if let Ok(cstr) = CString::new(format!("RUST_LOG={agent_log}")) {
+                env_strings.push(cstr);
+            }
+            if let Ok(cstr) = CString::new(format!("SMOLVM_AGENT_BOOT_LOG={agent_log}")) {
+                env_strings.push(cstr);
+            }
+        }
 
         // Pass mount info to the agent via environment
         // Format: SMOLVM_MOUNT_0=tag:guest_path:ro

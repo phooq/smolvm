@@ -16,3 +16,9 @@ pub const ENV_SMOLVM_LIB_DIR: &str = "SMOLVM_LIB_DIR";
 /// Accepted values are integer levels understood by libkrun
 /// (`0 = off`, `1 = error`, `2 = warn`, `3 = info`, `4 = debug`).
 pub const ENV_SMOLVM_KRUN_LOG_LEVEL: &str = "SMOLVM_KRUN_LOG_LEVEL";
+
+/// Name of the environment variable that controls guest agent logging.
+///
+/// The host launcher maps this value to the guest's `RUST_LOG` and
+/// `SMOLVM_AGENT_BOOT_LOG` environment variables.
+pub const ENV_SMOLVM_AGENT_LOG: &str = "SMOLVM_AGENT_LOG";

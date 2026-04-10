@@ -6,6 +6,7 @@
 //!
 //! The static FFI path in `launcher.rs` remains untouched for normal operations.
 
+use crate::data::consts::ENV_SMOLVM_AGENT_LOG;
 use crate::util::{libkrun_filename, libkrunfw_filename};
 use smolvm_protocol::ports;
 use std::ffi::{CStr, CString};
@@ -406,6 +407,15 @@ pub fn launch_agent_vm_dynamic(
         cstr("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
         cstr("TERM=xterm-256color"),
     ];
+
+    if let Ok(agent_log) = std::env::var(ENV_SMOLVM_AGENT_LOG) {
+        if let Ok(cstr) = CString::new(format!("RUST_LOG={agent_log}")) {
+            env_strings.push(cstr);
+        }
+        if let Ok(cstr) = CString::new(format!("SMOLVM_AGENT_BOOT_LOG={agent_log}")) {
+            env_strings.push(cstr);
+        }
+    }
 
     // Tell agent about packed layers mount
     if config.layers_dir.exists() {

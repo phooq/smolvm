@@ -12,6 +12,7 @@ use crate::paths;
 ///
 /// This is passed explicitly when using `crun exec --env` because crun doesn't
 /// preserve the container's PATH for command lookup when custom env vars are set.
+#[allow(dead_code)]
 pub const DEFAULT_CONTAINER_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
@@ -19,6 +20,7 @@ pub const DEFAULT_CONTAINER_PATH: &str =
 ///
 /// When crun exec is called with `--env`, it doesn't search PATH for executables
 /// unless PATH is explicitly set. This function ensures PATH is always present.
+#[allow(dead_code)]
 fn ensure_path_in_env(env: &[(String, String)]) -> Vec<(String, String)> {
     let has_path = env.iter().any(|(k, _)| k == "PATH");
     if has_path {
@@ -56,6 +58,7 @@ impl CrunCommand {
     /// This puts the container in "created" state, ready for `crun start`.
     /// Stdio defaults to null because capturing pipes can block when child
     /// processes inherit file descriptors.
+    #[allow(dead_code)]
     pub fn create(bundle_dir: &Path, container_id: &str) -> Self {
         let mut c = Self::new();
         c.cmd.args([
@@ -85,6 +88,7 @@ impl CrunCommand {
     }
 
     /// Start a container: `crun start <id>`
+    #[allow(dead_code)]
     pub fn start(container_id: &str) -> Self {
         let mut c = Self::new();
         c.cmd.args(["start", container_id]);
@@ -96,6 +100,7 @@ impl CrunCommand {
     /// Supports optional working directory and TTY allocation.
     /// Automatically ensures PATH is set if not provided, because crun doesn't
     /// search PATH for executables when `--env` is used.
+    #[allow(dead_code)]
     pub fn exec(
         container_id: &str,
         env: &[(String, String)],
@@ -139,6 +144,7 @@ impl CrunCommand {
     }
 
     /// Get container state: `crun state <id>`
+    #[allow(dead_code)]
     pub fn state(container_id: &str) -> Self {
         let mut c = Self::new();
         c.cmd.args(["state", container_id]);
@@ -149,6 +155,7 @@ impl CrunCommand {
     ///
     /// Returns all containers in a single invocation, much faster than
     /// calling `crun state` per container during reconciliation.
+    #[allow(dead_code)]
     pub fn list() -> Self {
         let mut c = Self::new();
         c.cmd.args(["list", "-f", "json"]);
@@ -218,6 +225,7 @@ impl CrunCommand {
     }
 
     /// Discard both stdout and stderr.
+    #[allow(dead_code)]
     pub fn discard_output(mut self) -> Self {
         self.cmd.stdout(Stdio::null());
         self.cmd.stderr(Stdio::null());
@@ -230,6 +238,7 @@ impl CrunCommand {
     }
 
     /// Run and wait for output.
+    #[allow(dead_code)]
     pub fn output(mut self) -> std::io::Result<std::process::Output> {
         self.cmd.output()
     }
