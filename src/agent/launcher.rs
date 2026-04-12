@@ -12,7 +12,10 @@ use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::libkrunfw_filename;
 
-use smolvm_network::{guest_env, start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
+use smolvm_network::{
+    guest_env, start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
+    VirtioNetworkRuntime,
+};
 use smolvm_protocol::ports;
 use std::ffi::{CStr, CString};
 use std::os::fd::RawFd;
@@ -380,7 +383,16 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     Error::agent("configure virtio-net", format!("socketpair failed: {e}"))
                 })?;
 
-                let runtime = match start_virtio_network(host_fd, guest_network) {
+                let virtio_port_mappings: Vec<VirtioPortMapping> = port_mappings
+                    .iter()
+                    .map(|mapping| VirtioPortMapping::new(mapping.host, mapping.guest))
+                    .collect();
+
+                let runtime = match start_virtio_network(
+                    host_fd,
+                    guest_network,
+                    &virtio_port_mappings,
+                ) {
                     Ok(runtime) => runtime,
                     Err(err) => {
                         libc::close(guest_fd);

@@ -54,6 +54,7 @@
 pub mod device;
 pub mod frame_stream;
 pub mod guest_env;
+pub mod publisher;
 pub mod queues;
 pub mod stack;
 pub mod tcp_relay;
@@ -66,11 +67,28 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 
 use frame_stream::{start_frame_stream_bridge, FrameStreamBridge};
+use publisher::{accepted_connection_channel, PublishedPortListeners};
 use queues::{NetworkFrameQueues, DEFAULT_FRAME_QUEUE_CAPACITY};
 use stack::{start_network_stack, VirtioPollConfig};
 
 /// Default upstream DNS resolver used by the gateway runtime.
 pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
+
+/// Host->guest published TCP port mapping serviced by the virtio runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortMapping {
+    /// Port bound on the host loopback interface.
+    pub host: u16,
+    /// Port exposed inside the guest.
+    pub guest: u16,
+}
+
+impl PortMapping {
+    /// Create a new published port mapping.
+    pub const fn new(host: u16, guest: u16) -> Self {
+        Self { host, guest }
+    }
+}
 
 /// Static guest network configuration for the virtio-net MVP.
 ///
@@ -143,6 +161,7 @@ pub(crate) use virtio_net_log;
 pub struct VirtioNetworkRuntime {
     queues: std::sync::Arc<NetworkFrameQueues>,
     _frame_bridge: FrameStreamBridge,
+    published_ports: Option<PublishedPortListeners>,
     poll_handle: Option<JoinHandle<()>>,
 }
 
@@ -166,6 +185,7 @@ pub struct VirtioNetworkRuntime {
 pub fn start_virtio_network(
     host_fd: RawFd,
     guest_network: GuestNetworkConfig,
+    published_ports: &[PortMapping],
 ) -> io::Result<VirtioNetworkRuntime> {
     virtio_net_log!(
         "virtio-net: starting runtime host_fd={} guest_ip={} gateway_ip={} dns_server={}",
@@ -176,6 +196,16 @@ pub fn start_virtio_network(
     );
     let queues = NetworkFrameQueues::shared(DEFAULT_FRAME_QUEUE_CAPACITY);
     let frame_bridge = start_frame_stream_bridge(host_fd, queues.clone())?;
+    let (accepted_tx, accepted_rx) = accepted_connection_channel();
+    let published_ports = if published_ports.is_empty() {
+        None
+    } else {
+        Some(PublishedPortListeners::start(
+            published_ports,
+            accepted_tx,
+            queues.relay_wake.clone(),
+        )?)
+    };
     let poll_handle = start_network_stack(
         queues.clone(),
         VirtioPollConfig {
@@ -185,11 +215,13 @@ pub fn start_virtio_network(
             guest_ipv4: guest_network.guest_ip,
             mtu: 1500,
         },
+        published_ports.as_ref().map(|_| accepted_rx),
     )?;
 
     Ok(VirtioNetworkRuntime {
         queues,
         _frame_bridge: frame_bridge,
+        published_ports,
         poll_handle: Some(poll_handle),
     })
 }
@@ -202,6 +234,7 @@ impl Drop for VirtioNetworkRuntime {
     /// here because the frame bridge joins its own threads in its own `Drop`.
     fn drop(&mut self) {
         self.queues.begin_shutdown();
+        self.published_ports = None;
         if let Some(handle) = self.poll_handle.take() {
             let _ = handle.join();
         }
