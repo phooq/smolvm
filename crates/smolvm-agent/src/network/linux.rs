@@ -1,7 +1,73 @@
 //! Linux network configuration helpers for `eth0`.
+//!
+//! Why this module exists:
+//! - the agent runs in a very small guest image
+//! - we cannot assume tools like `ip`, `ifconfig`, or NetworkManager exist
+//! - the guest boots early, before any userspace networking stack would help
+//!
+//! So this module talks to the Linux kernel directly through the C ABI exposed
+//! by `libc`:
+//! - `ioctl` on an `AF_INET` datagram socket for link-level interface settings
+//! - `NETLINK_ROUTE` messages for address and route creation
+//! - a direct file write for `/etc/resolv.conf`
+//!
+//! The code looks lower-level than most Rust in the tree because it is
+//! effectively a small replacement for the subset of `ip link`, `ip addr`, and
+//! `ip route` that the virtio-net MVP needs.
 
 use std::net::Ipv4Addr;
 
+/// Configure a guest interface for the virtio-net MVP.
+///
+/// High-level flow:
+///
+/// ```text
+/// 1. find eth0's ifindex                 (SIOCGIFINDEX)
+/// 2. set link-layer MAC address          (SIOCSIFHWADDR)
+/// 3. set MTU                             (SIOCSIFMTU)
+/// 4. add IPv4 address/prefix             (RTM_NEWADDR via NETLINK_ROUTE)
+/// 5. mark the interface UP               (SIOCGIFFLAGS + SIOCSIFFLAGS)
+/// 6. add the default route               (RTM_NEWROUTE via NETLINK_ROUTE)
+/// 7. write /etc/resolv.conf              (plain file write)
+/// ```
+///
+/// Outcome:
+/// - the guest ends up with a configured `eth0`
+/// - traffic to non-local destinations is sent to `gateway`
+/// - libc DNS resolution uses `dns_server`
+///
+/// Why this order:
+/// - MAC and MTU are link attributes, so we set them before bringing the
+///   interface fully up
+/// - the IPv4 address and route are programmed explicitly instead of relying on
+///   DHCP or helper tools
+/// - the function is fail-fast: any kernel call failure aborts boot for the
+///   requested virtio-net path
+///
+/// The Linux kernel interfaces used here are all C ABI calls:
+///
+/// - `SIOCGIFINDEX`: asks the kernel for the numeric interface index for
+///   `ifname`. Netlink messages use that numeric id, not the human-readable
+///   string.
+/// - `SIOCSIFHWADDR`: updates the NIC MAC address.
+/// - `SIOCSIFMTU`: updates the NIC MTU.
+/// - `SIOCGIFFLAGS` / `SIOCSIFFLAGS`: read-modify-write the interface flags so
+///   we can set `IFF_UP`.
+/// - `RTM_NEWADDR`: asks the kernel routing stack to add an IPv4 address.
+/// - `RTM_NEWROUTE`: asks the kernel routing stack to install the default route.
+///
+/// Diagram:
+///
+/// ```text
+/// configure_interface()
+///   ├─ get_ifindex("eth0")
+///   ├─ set_mac_address("eth0", mac)
+///   ├─ set_mtu("eth0", mtu)
+///   ├─ add_address_v4(ifindex, address/prefix)
+///   ├─ bring_interface_up("eth0")
+///   ├─ add_default_route_v4(gateway)
+///   └─ write_resolv_conf(dns_server)
+/// ```
 pub fn configure_interface(
     ifname: &str,
     mac: [u8; 6],
@@ -21,6 +87,19 @@ pub fn configure_interface(
     Ok(())
 }
 
+/// Resolve the Linux interface index used by rtnetlink messages.
+///
+/// C ABI context:
+/// - opens an `AF_INET` datagram socket only as an ioctl handle
+/// - fills an `ifreq`
+/// - calls `ioctl(..., SIOCGIFINDEX, ...)`
+///
+/// Usage:
+/// - `ifname` is the human-readable name, such as `eth0`
+///
+/// Outcome:
+/// - returns the kernel's numeric interface id, which is later embedded into
+///   `RTM_NEWADDR`
 fn get_ifindex(ifname: &str) -> Result<u32, String> {
     // SAFETY: `ifreq` is plain old data; zeroed initialization is valid.
     unsafe {
@@ -39,6 +118,15 @@ fn get_ifindex(ifname: &str) -> Result<u32, String> {
     }
 }
 
+/// Program the NIC MAC address with `SIOCSIFHWADDR`.
+///
+/// C ABI context:
+/// - `ifreq.ifru_hwaddr` carries a `sockaddr`-shaped payload
+/// - `sa_family = ARPHRD_ETHER` tells the kernel the address is Ethernet
+/// - the first 6 bytes of `sa_data` hold the MAC octets
+///
+/// Outcome:
+/// - future packets emitted by this guest NIC use the requested source MAC
 fn set_mac_address(ifname: &str, mac: &[u8; 6]) -> Result<(), String> {
     // SAFETY: `ifreq` is plain old data; zeroed initialization is valid.
     unsafe {
@@ -60,6 +148,13 @@ fn set_mac_address(ifname: &str, mac: &[u8; 6]) -> Result<(), String> {
     Ok(())
 }
 
+/// Program the link MTU with `SIOCSIFMTU`.
+///
+/// C ABI context:
+/// - `ifreq.ifru_mtu` is interpreted by the kernel as the requested MTU value
+///
+/// Outcome:
+/// - the kernel enforces this frame size for the interface
 fn set_mtu(ifname: &str, mtu: u16) -> Result<(), String> {
     // SAFETY: `ifreq` is plain old data; zeroed initialization is valid.
     unsafe {
@@ -78,6 +173,16 @@ fn set_mtu(ifname: &str, mtu: u16) -> Result<(), String> {
     Ok(())
 }
 
+/// Mark the interface `IFF_UP`.
+///
+/// C ABI context:
+/// - `SIOCGIFFLAGS` reads the current flag word
+/// - we OR in `IFF_UP`
+/// - `SIOCSIFFLAGS` writes the updated flag word back
+///
+/// Outcome:
+/// - the kernel considers the interface administratively up and will start
+///   using the configured address and route
 fn bring_interface_up(ifname: &str) -> Result<(), String> {
     // SAFETY: `ifreq` is plain old data; zeroed initialization is valid.
     unsafe {
@@ -102,6 +207,17 @@ fn bring_interface_up(ifname: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Add the guest IPv4 address through rtnetlink.
+///
+/// This is the programmatic equivalent of:
+///
+/// ```text
+/// ip addr add <address>/<prefix_len> dev <ifname>
+/// ```
+///
+/// Outcome:
+/// - the kernel records the IPv4 address on the interface identified by
+///   `ifindex`
 fn add_address_v4(ifindex: u32, address: Ipv4Addr, prefix_len: u8) -> Result<(), String> {
     let address_bytes = address.octets();
     netlink_newaddr(ifindex, prefix_len, &address_bytes).map_err(|err| {
@@ -112,17 +228,42 @@ fn add_address_v4(ifindex: u32, address: Ipv4Addr, prefix_len: u8) -> Result<(),
     })
 }
 
+/// Install the default IPv4 route through the provided gateway.
+///
+/// This is the programmatic equivalent of:
+///
+/// ```text
+/// ip route add default via <gateway>
+/// ```
+///
+/// Outcome:
+/// - traffic for non-local destinations is sent to `gateway`
 fn add_default_route_v4(gateway: Ipv4Addr) -> Result<(), String> {
     let gateway_bytes = gateway.octets();
     netlink_newroute(&gateway_bytes)
         .map_err(|err| format!("failed to add default route via {}: {}", gateway, err))
 }
 
+/// Replace `/etc/resolv.conf` with the gateway-side resolver.
+///
+/// Outcome:
+/// - standard guest libc resolution (`getaddrinfo`, `nslookup`, etc.) sends DNS
+///   traffic to the host-provided resolver path
 fn write_resolv_conf(dns_server: Ipv4Addr) -> Result<(), String> {
     std::fs::write("/etc/resolv.conf", format!("nameserver {}\n", dns_server))
         .map_err(|err| format!("failed to write /etc/resolv.conf: {}", err))
 }
 
+/// Create a datagram socket used only as an ioctl control handle.
+///
+/// C ABI context:
+/// - many legacy interface ioctls operate on any socket fd from the right
+///   address family
+/// - this socket is not used for packet I/O
+///
+/// Outcome:
+/// - returns an fd suitable for `SIOCGIFINDEX`, `SIOCSIFHWADDR`,
+///   `SIOCSIFMTU`, and `SIOCSIFFLAGS`
 fn socket_fd() -> Result<libc::c_int, String> {
     // SAFETY: `socket` is a standard libc call with valid arguments.
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
@@ -135,6 +276,12 @@ fn socket_fd() -> Result<libc::c_int, String> {
     Ok(fd)
 }
 
+/// Copy an interface name into `ifreq.ifr_name`.
+///
+/// C ABI context:
+/// - most interface ioctls use `ifreq`
+/// - the kernel matches the request to an interface through the fixed-width
+///   `ifr_name` buffer
 fn copy_ifname(ifr: &mut libc::ifreq, ifname: &str) -> Result<(), String> {
     let bytes = ifname.as_bytes();
     if bytes.len() >= libc::IFNAMSIZ {
@@ -153,6 +300,10 @@ fn copy_ifname(ifr: &mut libc::ifreq, ifname: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Minimal Linux `ifaddrmsg` layout used by `RTM_NEWADDR`.
+///
+/// We define the struct locally instead of relying on higher-level helpers so
+/// the agent stays self-contained in the guest environment.
 #[repr(C)]
 struct IfAddrMsg {
     ifa_family: u8,
@@ -162,6 +313,7 @@ struct IfAddrMsg {
     ifa_index: u32,
 }
 
+/// Minimal Linux `rtmsg` layout used by `RTM_NEWROUTE`.
 #[repr(C)]
 struct RtMsg {
     rtm_family: u8,
@@ -184,6 +336,15 @@ const _: () = assert!(std::mem::size_of::<libc::nlmsghdr>() == NLMSG_HDRLEN);
 const _: () = assert!(std::mem::size_of::<IfAddrMsg>() == IFADDRMSG_LEN);
 const _: () = assert!(std::mem::size_of::<RtMsg>() == RTMSG_LEN);
 
+/// Build and send an `RTM_NEWADDR` netlink message.
+///
+/// C ABI context:
+/// - `nlmsghdr` is the outer netlink envelope
+/// - `IfAddrMsg` is the `RTM_NEWADDR` body
+/// - `IFA_ADDRESS` and `IFA_LOCAL` are route attributes appended after the body
+///
+/// Outcome:
+/// - asks the kernel to attach an IPv4 address/prefix to `ifindex`
 fn netlink_newaddr(ifindex: u32, prefix_len: u8, address: &[u8]) -> std::io::Result<()> {
     let rta_len = rta_space(address.len());
     let msg_len = NLMSG_HDRLEN + IFADDRMSG_LEN + (rta_len * 2);
@@ -217,6 +378,14 @@ fn netlink_newaddr(ifindex: u32, prefix_len: u8, address: &[u8]) -> std::io::Res
     netlink_send(&buf)
 }
 
+/// Build and send an `RTM_NEWROUTE` netlink message for the default route.
+///
+/// C ABI context:
+/// - `rtm_dst_len = 0` means "default route"
+/// - `RTA_GATEWAY` carries the next-hop IPv4 address
+///
+/// Outcome:
+/// - asks the kernel to install a unicast route in the main table
 fn netlink_newroute(gateway: &[u8]) -> std::io::Result<()> {
     let rta_len = rta_space(gateway.len());
     let msg_len = NLMSG_HDRLEN + RTMSG_LEN + rta_len;
@@ -251,6 +420,33 @@ fn netlink_newroute(gateway: &[u8]) -> std::io::Result<()> {
     netlink_send(&buf)
 }
 
+/// Send one netlink request and wait for the kernel ack.
+///
+/// Walkthrough:
+///
+/// ```text
+/// userspace buffer
+///   -> socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)
+///   -> bind(local netlink sockaddr)
+///   -> send(message)
+///   -> recv(ack)
+///   -> inspect NLMSG_ERROR
+/// ```
+///
+/// C ABI context:
+/// - `socket(AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)` opens a routing netlink
+///   endpoint to the kernel
+/// - `bind` attaches a local netlink address so the kernel can reply
+/// - `send` transmits the prepared `nlmsghdr + payload`
+/// - `recv` collects the kernel ack
+/// - the ack payload for `NLMSG_ERROR` contains a signed errno:
+///   - `0` means success
+///   - a negative errno means failure
+///
+/// Outcome:
+/// - returns `Ok(())` once the kernel accepts the request
+/// - returns an `io::Error` if socket creation, send/recv, or the kernel ack
+///   reports a failure
 fn netlink_send(msg: &[u8]) -> std::io::Result<()> {
     // SAFETY: all libc calls use valid buffers and checked lengths.
     unsafe {
@@ -300,14 +496,17 @@ fn netlink_send(msg: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// Netlink/rtnetlink attributes are 4-byte aligned.
 fn nlmsg_align(len: usize) -> usize {
     (len + 3) & !3
 }
 
+/// Space consumed by one route attribute including alignment padding.
 fn rta_space(data_len: usize) -> usize {
     nlmsg_align(RTA_HDRLEN + data_len)
 }
 
+/// Encode one `rtattr` header plus its payload bytes into `buf`.
 fn write_rta(buf: &mut [u8], rta_type: u16, data: &[u8]) {
     let rta_len = (RTA_HDRLEN + data.len()) as u16;
     buf[0..2].copy_from_slice(&rta_len.to_ne_bytes());

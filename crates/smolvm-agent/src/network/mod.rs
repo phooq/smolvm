@@ -1,10 +1,45 @@
 //! Guest-side virtio-net configuration from `SMOLVM_NETWORK_*`.
+//!
+//! Context:
+//! - the host launcher decides whether a VM should boot with the legacy TSI path
+//!   or with a real virtio-net device
+//! - when virtio-net is selected, the launcher passes a small set of
+//!   `SMOLVM_NETWORK_*` environment variables into the guest
+//! - the agent consumes those values during boot and configures `eth0`
+//!   directly inside the guest
+//!
+//! This keeps the contract between host and guest simple:
+//!
+//! ```text
+//! host launcher
+//!   -> exports SMOLVM_NETWORK_* env
+//!   -> boots agent
+//! guest agent
+//!   -> parses env
+//!   -> configures eth0
+//!   -> continues boot
+//! ```
+//!
+//! The Linux-specific implementation lives in `linux.rs`. Non-Linux guests
+//! currently return an explicit error instead of attempting a partial setup.
 
 use std::net::Ipv4Addr;
 
 /// Configure the guest network interface from host-provided environment.
 ///
 /// Returns `Ok(false)` when virtio-net is not enabled for this boot.
+///
+/// Expected contract:
+/// - `SMOLVM_NETWORK_BACKEND=virtio`
+/// - `SMOLVM_NETWORK_GUEST_IP`
+/// - `SMOLVM_NETWORK_GATEWAY`
+/// - `SMOLVM_NETWORK_PREFIX_LEN`
+/// - `SMOLVM_NETWORK_GUEST_MAC`
+/// - `SMOLVM_NETWORK_DNS`
+///
+/// If the backend is requested but any value is missing or malformed, this
+/// returns an error so boot fails fast instead of leaving the guest in a
+/// half-configured state.
 pub fn configure_from_env() -> Result<bool, String> {
     let backend = match std::env::var("SMOLVM_NETWORK_BACKEND") {
         Ok(value) if !value.is_empty() => value,
@@ -49,6 +84,10 @@ fn env_mac(name: &str) -> Result<[u8; 6], String> {
     parse_mac(&value)
 }
 
+/// Parse a colon-separated MAC address into six raw octets.
+///
+/// Example:
+/// `02:53:4d:00:00:02` -> `[0x02, 0x53, 0x4d, 0x00, 0x00, 0x02]`
 fn parse_mac(value: &str) -> Result<[u8; 6], String> {
     let mut mac = [0u8; 6];
     let mut count = 0usize;
