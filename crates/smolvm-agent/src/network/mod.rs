@@ -1,24 +1,48 @@
 //! Guest-side virtio-net configuration from `SMOLVM_NETWORK_*`.
 //!
-//! Context:
-//! - the host launcher decides whether a VM should boot with the legacy TSI path
-//!   or with a real virtio-net device
-//! - when virtio-net is selected, the launcher passes a small set of
-//!   `SMOLVM_NETWORK_*` environment variables into the guest
-//! - the agent consumes those values during boot and configures `eth0`
-//!   directly inside the guest
+//! Context
+//! =======
 //!
-//! This keeps the contract between host and guest simple:
+//! The host side of the virtio-net design decides whether a VM should use:
+//! - the legacy TSI networking path, or
+//! - a real virtio-net device exposed to the guest
+//!
+//! When virtio-net is selected, the launcher does not run guest shell
+//! commands like `ip link`, `ip addr`, or `ip route`. Instead it passes a
+//! small, explicit configuration contract into the guest as environment
+//! variables. The agent reads those values very early in boot and programs
+//! the kernel network state directly.
+//!
+//! That gives us a narrow host/guest boundary:
 //!
 //! ```text
 //! host launcher
+//!   -> decides backend = virtio
+//!   -> chooses guest IP / gateway / DNS / MAC
 //!   -> exports SMOLVM_NETWORK_* env
-//!   -> boots agent
+//!   -> starts guest agent
+//!
 //! guest agent
-//!   -> parses env
-//!   -> configures eth0
-//!   -> continues boot
+//!   -> parses SMOLVM_NETWORK_* env
+//!   -> configures eth0 inside the guest kernel
+//!   -> continues normal boot
 //! ```
+//!
+//! In shell terms, the Linux implementation in `linux.rs` is effectively a
+//! built-in replacement for this class of commands:
+//!
+//! ```text
+//! ip link set dev eth0 address <mac>
+//! ip link set dev eth0 mtu <mtu>
+//! ip addr add <guest_ip>/<prefix> dev eth0
+//! ip link set dev eth0 up
+//! ip route add default via <gateway>
+//! printf 'nameserver <dns>\n' > /etc/resolv.conf
+//! ```
+//!
+//! We do it inside the agent rather than by spawning external tools because the
+//! guest image is intentionally small and boots before we can assume userspace
+//! helpers are present.
 //!
 //! The Linux-specific implementation lives in `linux.rs`. Non-Linux guests
 //! currently return an explicit error instead of attempting a partial setup.
@@ -29,7 +53,10 @@ use std::net::Ipv4Addr;
 ///
 /// Returns `Ok(false)` when virtio-net is not enabled for this boot.
 ///
-/// Expected contract:
+/// Environment contract
+/// --------------------
+///
+/// The host launcher currently provides:
 /// - `SMOLVM_NETWORK_BACKEND=virtio`
 /// - `SMOLVM_NETWORK_GUEST_IP`
 /// - `SMOLVM_NETWORK_GATEWAY`
@@ -37,9 +64,33 @@ use std::net::Ipv4Addr;
 /// - `SMOLVM_NETWORK_GUEST_MAC`
 /// - `SMOLVM_NETWORK_DNS`
 ///
-/// If the backend is requested but any value is missing or malformed, this
-/// returns an error so boot fails fast instead of leaving the guest in a
-/// half-configured state.
+/// Example:
+///
+/// ```text
+/// SMOLVM_NETWORK_BACKEND=virtio
+/// SMOLVM_NETWORK_GUEST_IP=10.0.2.15
+/// SMOLVM_NETWORK_GATEWAY=10.0.2.2
+/// SMOLVM_NETWORK_PREFIX_LEN=24
+/// SMOLVM_NETWORK_GUEST_MAC=02:53:4d:00:00:02
+/// SMOLVM_NETWORK_DNS=10.0.2.2
+/// ```
+///
+/// What this function does
+/// -----------------------
+///
+/// 1. Decide whether the current boot even wants guest virtio networking.
+/// 2. Parse the environment strings into typed values.
+/// 3. Call the Linux backend to program `eth0`.
+///
+/// Outcome
+/// -------
+///
+/// - `Ok(false)`: no virtio-net request was present, so the agent leaves the
+///   guest network untouched.
+/// - `Ok(true)`: `eth0` was configured successfully.
+/// - `Err(...)`: virtio-net was requested but the configuration was incomplete
+///   or malformed, so boot should fail instead of continuing with a
+///   half-configured NIC.
 pub fn configure_from_env() -> Result<bool, String> {
     let backend = match std::env::var("SMOLVM_NETWORK_BACKEND") {
         Ok(value) if !value.is_empty() => value,
@@ -86,8 +137,16 @@ fn env_mac(name: &str) -> Result<[u8; 6], String> {
 
 /// Parse a colon-separated MAC address into six raw octets.
 ///
-/// Example:
-/// `02:53:4d:00:00:02` -> `[0x02, 0x53, 0x4d, 0x00, 0x00, 0x02]`
+/// The guest kernel APIs do not consume the string form directly. They expect
+/// the six raw Ethernet octets, so we translate:
+///
+/// ```text
+/// 02:53:4d:00:00:02
+///   -> [0x02, 0x53, 0x4d, 0x00, 0x00, 0x02]
+/// ```
+///
+/// This parser is intentionally strict: exactly six hex octets separated by
+/// `:` and nothing else.
 fn parse_mac(value: &str) -> Result<[u8; 6], String> {
     let mut mac = [0u8; 6];
     let mut count = 0usize;
