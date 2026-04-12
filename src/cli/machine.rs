@@ -20,26 +20,10 @@ use smolvm::agent::{docker_config_mount, AgentClient, AgentManager, RunConfig, V
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use smolvm::data::storage::HostMount;
-use smolvm::network::{plan_launch_network, NetworkBackend};
+use smolvm::network::NetworkBackend;
 use smolvm::{DEFAULT_IDLE_CMD, DEFAULT_SHELL_CMD};
 use std::path::PathBuf;
 use std::time::Duration;
-
-fn warn_backend_fallback(
-    requested_backend: Option<NetworkBackend>,
-    resources: &VmResources,
-    dns_filter_hosts: Option<&[String]>,
-    port_count: usize,
-) {
-    if requested_backend != Some(NetworkBackend::VirtioNet) {
-        return;
-    }
-
-    let plan = plan_launch_network(resources, dns_filter_hosts, port_count);
-    if let Some(reason) = plan.fallback_reason {
-        eprintln!("warning: {}", reason.user_message());
-    }
-}
 
 fn validate_network_backend_request(
     requested_backend: Option<NetworkBackend>,
@@ -383,13 +367,6 @@ impl RunCmd {
             overlay_gib: params.overlay_gb,
             allowed_cidrs: params.allowed_cidrs.clone(),
         };
-        warn_backend_fallback(
-            params.network_backend,
-            &resources,
-            params.dns_filter_hosts.as_deref(),
-            params.port.len(),
-        );
-
         let manager = AgentManager::new_default_with_sizes(params.storage_gb, params.overlay_gb)
             .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
@@ -982,21 +959,6 @@ impl CreateCmd {
             (None, some) => some,
         };
         validate_network_backend_request(params.network_backend, params.net, params.port.len())?;
-        let resources = VmResources {
-            cpus: params.cpus,
-            memory_mib: params.mem,
-            network: params.net,
-            network_backend: params.network_backend,
-            storage_gib: params.storage_gb,
-            overlay_gib: params.overlay_gb,
-            allowed_cidrs: params.allowed_cidrs.clone(),
-        };
-        warn_backend_fallback(
-            params.network_backend,
-            &resources,
-            params.dns_filter_hosts.as_deref(),
-            params.port.len(),
-        );
         if self.ssh_agent {
             params.ssh_agent = true;
         }

@@ -427,8 +427,8 @@ pub struct VmRecord {
     #[serde(default)]
     pub ssh_agent: bool,
 
-    /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
-    /// queries against this allowlist.
+    /// Hostnames for DNS filtering. TSI launches use the guest DNS proxy;
+    /// virtio launches enforce the same allowlist in the host runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,
 

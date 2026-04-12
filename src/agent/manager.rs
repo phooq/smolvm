@@ -947,10 +947,19 @@ impl AgentManager {
         let mounts_for_finalize = mounts.clone();
         let ports_for_finalize = ports.clone();
 
-        // Start DNS filter listener if hostnames are configured.
-        // This must happen BEFORE the VM boots so the Unix socket is ready
-        // when the guest agent tries to connect.
-        let dns_filter_socket_path: Option<std::path::PathBuf> =
+        let network_plan = crate::network::plan_launch_network(
+            &resources_for_fork,
+            features.dns_filter_hosts.as_deref(),
+            ports.len(),
+        );
+
+        // Start the TSI-only DNS filter listener when hostname policy is configured.
+        // The virtio backend enforces DNS policy in-process and does not use the
+        // guest-side DNS proxy socket.
+        let dns_filter_socket_path: Option<std::path::PathBuf> = if matches!(
+            network_plan.backend,
+            crate::network::EffectiveNetworkBackend::Tsi
+        ) {
             if let Some(ref hosts) = features.dns_filter_hosts {
                 if !hosts.is_empty() {
                     let socket_path = self.dns_filter_socket.clone();
@@ -965,7 +974,10 @@ impl AgentManager {
                 }
             } else {
                 None
-            };
+            }
+        } else {
+            None
+        };
 
         // Clone paths for the child process (originals are borrowed from self)
         let rootfs_path = self.rootfs_path.clone();
@@ -1048,10 +1060,7 @@ impl AgentManager {
                 resources: resources_for_fork,
                 ssh_agent_socket: features.ssh_agent_socket.as_deref(),
                 dns_filter_socket: dns_filter_socket_path.as_deref(),
-                dns_filter_enabled: features
-                    .dns_filter_hosts
-                    .as_ref()
-                    .is_some_and(|hosts| !hosts.is_empty()),
+                dns_filter_hosts: features.dns_filter_hosts.as_deref(),
             });
 
             // If we get here, something went wrong (stderr is /dev/null,

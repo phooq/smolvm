@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 use crate::network::addressing::GuestNetworkConfig;
 use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::virtio::{start_virtio_network, VirtioNetworkRuntime};
-use crate::network::{plan_launch_network, EffectiveNetworkBackend};
+use crate::network::{plan_launch_network, EffectiveNetworkBackend, LaunchEgressPolicy};
 use crate::storage::{OverlayDisk, StorageDisk};
 use crate::util::libkrunfw_filename;
 
@@ -158,8 +158,8 @@ fn preload_libkrunfw() {
 pub struct LaunchFeatures {
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<std::path::PathBuf>,
-    /// Hostnames for DNS filtering. When set, the host starts a DNS filter
-    /// listener and the guest agent proxies DNS queries through it.
+    /// Hostnames for DNS filtering. TSI uses a host-side DNS proxy listener;
+    /// virtio-net enforces the same allowlist inside the host runtime.
     pub dns_filter_hosts: Option<Vec<String>>,
 }
 
@@ -181,12 +181,10 @@ pub struct LaunchConfig<'a> {
     pub resources: VmResources,
     /// Host SSH agent socket path for forwarding into the guest.
     pub ssh_agent_socket: Option<&'a Path>,
-    /// Host DNS filter socket path. When set, the guest DNS proxy forwards
-    /// queries over vsock to this socket for filtering.
+    /// Host DNS filter socket path used by the TSI DNS proxy path.
     pub dns_filter_socket: Option<&'a Path>,
-    /// Whether DNS filtering was configured for this launch, even if the
-    /// host-side proxy socket could not be created.
-    pub dns_filter_enabled: bool,
+    /// Hostnames for DNS filtering.
+    pub dns_filter_hosts: Option<&'a [String]>,
 }
 
 /// Launch the agent VM using libkrun.
@@ -203,7 +201,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         resources,
         ssh_agent_socket,
         dns_filter_socket,
-        dns_filter_enabled,
+        dns_filter_hosts,
     } = config;
     // Raise file descriptor limits
     raise_fd_limits();
@@ -258,10 +256,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             return Err(Error::agent("set rootfs", "krun_set_root failed"));
         }
 
-        let network_plan = select_network_plan(resources, *dns_filter_enabled, port_mappings.len());
-        if let Some(reason) = network_plan.fallback_reason {
-            tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
-        }
+        let network_plan = select_network_plan(resources, *dns_filter_hosts, port_mappings.len());
 
         let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
         let guest_network = match network_plan.backend {
@@ -384,19 +379,23 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     let (host_fd, guest_fd) = create_unix_stream_pair().map_err(|e| {
                         Error::agent("configure virtio-net", format!("socketpair failed: {e}"))
                     })?;
-
-                    let runtime = match start_virtio_network(host_fd, guest_network, port_mappings)
-                    {
-                        Ok(runtime) => runtime,
-                        Err(err) => {
-                            libc::close(guest_fd);
-                            krun_free_ctx(ctx);
-                            return Err(Error::agent(
-                                "configure virtio-net",
-                                format!("failed to start virtio network runtime: {err}"),
-                            ));
-                        }
+                    let policy = LaunchEgressPolicy {
+                        allowed_cidrs: resources.allowed_cidrs.clone(),
+                        dns_filter_hosts: dns_filter_hosts.map(<[String]>::to_vec),
                     };
+
+                    let runtime =
+                        match start_virtio_network(host_fd, guest_network, port_mappings, policy) {
+                            Ok(runtime) => runtime,
+                            Err(err) => {
+                                libc::close(guest_fd);
+                                krun_free_ctx(ctx);
+                                return Err(Error::agent(
+                                    "configure virtio-net",
+                                    format!("failed to start virtio network runtime: {err}"),
+                                ));
+                            }
+                        };
 
                     if add_net_unixstream(
                         ctx,
@@ -683,11 +682,9 @@ fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
 
 fn select_network_plan(
     resources: &VmResources,
-    dns_filter_enabled: bool,
+    dns_filter_hosts: Option<&[String]>,
     port_count: usize,
 ) -> crate::network::LaunchNetworkPlan {
-    let dns_filter_placeholder = [String::from("configured")];
-    let dns_filter_hosts = dns_filter_enabled.then_some(dns_filter_placeholder.as_slice());
     plan_launch_network(resources, dns_filter_hosts, port_count)
 }
 

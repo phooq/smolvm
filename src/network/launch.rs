@@ -12,31 +12,11 @@ pub enum EffectiveNetworkBackend {
     VirtioNet,
 }
 
-/// Reason a requested backend was downgraded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NetworkFallbackReason {
-    /// Current egress policies and DNS filtering are only implemented on TSI.
-    PolicyRequiresTsi,
-}
-
-impl NetworkFallbackReason {
-    /// User-facing explanation for the fallback.
-    pub const fn user_message(self) -> &'static str {
-        match self {
-            Self::PolicyRequiresTsi => {
-                "allow-cidr/allow-host policies still use the TSI backend; falling back from virtio"
-            }
-        }
-    }
-}
-
 /// Network launch decision for a VM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LaunchNetworkPlan {
     /// Selected backend.
     pub backend: EffectiveNetworkBackend,
-    /// Downgrade reason when a requested backend cannot be honored.
-    pub fallback_reason: Option<NetworkFallbackReason>,
 }
 
 impl LaunchNetworkPlan {
@@ -64,22 +44,15 @@ pub fn plan_launch_network(
     if !wants_network {
         return LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::None,
-            fallback_reason: None,
         };
     }
 
     match resources.network_backend.unwrap_or(NetworkBackend::Tsi) {
         NetworkBackend::Tsi => LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::Tsi,
-            fallback_reason: None,
-        },
-        NetworkBackend::VirtioNet if has_policy => LaunchNetworkPlan {
-            backend: EffectiveNetworkBackend::Tsi,
-            fallback_reason: Some(NetworkFallbackReason::PolicyRequiresTsi),
         },
         NetworkBackend::VirtioNet => LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::VirtioNet,
-            fallback_reason: None,
         },
     }
 }
@@ -122,20 +95,15 @@ mod tests {
         resources.network_backend = Some(NetworkBackend::VirtioNet);
         let plan = plan_launch_network(&resources, None, 1);
         assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
-        assert_eq!(plan.fallback_reason, None);
     }
 
     #[test]
-    fn test_policy_forces_tsi() {
+    fn test_policy_works_with_virtio() {
         let mut resources = resources();
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
         resources.allowed_cidrs = Some(vec!["1.1.1.1/32".into()]);
         let plan = plan_launch_network(&resources, None, 0);
-        assert_eq!(plan.backend, EffectiveNetworkBackend::Tsi);
-        assert_eq!(
-            plan.fallback_reason,
-            Some(NetworkFallbackReason::PolicyRequiresTsi)
-        );
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
     }
 }

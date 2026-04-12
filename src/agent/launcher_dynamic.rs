@@ -9,7 +9,7 @@
 use crate::network::addressing::GuestNetworkConfig;
 use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::virtio::{start_virtio_network, VirtioNetworkRuntime};
-use crate::network::{plan_launch_network, EffectiveNetworkBackend};
+use crate::network::{plan_launch_network, EffectiveNetworkBackend, LaunchEgressPolicy};
 use crate::util::{libkrun_filename, libkrunfw_filename};
 use smolvm_protocol::ports;
 use std::ffi::{CStr, CString};
@@ -299,9 +299,6 @@ pub fn launch_agent_vm_dynamic(
     }
 
     let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
-    if let Some(reason) = network_plan.fallback_reason {
-        tracing::warn!(reason = %reason.user_message(), "network backend fell back to TSI");
-    }
 
     let mut virtio_network_runtime: Option<VirtioNetworkRuntime> = None;
     let guest_network = match network_plan.backend {
@@ -402,7 +399,12 @@ pub fn launch_agent_vm_dynamic(
                     })
                     .collect();
 
-                let runtime = match start_virtio_network(host_fd, guest_network, &port_mappings) {
+                let runtime = match start_virtio_network(
+                    host_fd,
+                    guest_network,
+                    &port_mappings,
+                    LaunchEgressPolicy::default(),
+                ) {
                     Ok(runtime) => runtime,
                     Err(err) => {
                         // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.

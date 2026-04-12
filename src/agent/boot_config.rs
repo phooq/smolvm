@@ -45,8 +45,9 @@ pub struct BootConfig {
     /// When set, a vsock port is registered so the guest can reach the host's SSH agent.
     #[serde(default)]
     pub ssh_agent_socket: Option<PathBuf>,
-    /// Hostnames for DNS filtering. When set, the host starts a DNS filter
-    /// listener and the guest agent proxies DNS queries through it.
+    /// Hostnames for DNS filtering. TSI launches use a host DNS proxy
+    /// listener; virtio launches enforce the allowlist inside the host
+    /// network runtime.
     #[serde(default)]
     pub dns_filter_hosts: Option<Vec<String>>,
 }
