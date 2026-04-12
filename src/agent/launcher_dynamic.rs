@@ -9,7 +9,10 @@
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use crate::util::{libkrun_filename, libkrunfw_filename};
-use smolvm_network::{guest_env, start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
+use smolvm_network::{
+    guest_env, start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
+    VirtioNetworkRuntime,
+};
 use smolvm_protocol::ports;
 use std::ffi::{CStr, CString};
 use std::os::fd::RawFd;
@@ -380,7 +383,13 @@ pub fn launch_agent_vm_dynamic(
             let (host_fd, guest_fd) =
                 create_unix_stream_pair().map_err(|e| format!("socketpair failed: {e}"))?;
 
-            let runtime = match start_virtio_network(host_fd, guest_network) {
+            let port_mappings: Vec<VirtioPortMapping> = config
+                .port_mappings
+                .iter()
+                .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
+                .collect();
+
+            let runtime = match start_virtio_network(host_fd, guest_network, &port_mappings) {
                 Ok(runtime) => runtime,
                 Err(err) => {
                     // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.

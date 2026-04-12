@@ -50,6 +50,7 @@
 //! ```
 
 use crate::device::VirtioNetworkDevice;
+use crate::publisher::AcceptedPublishedConnection;
 use crate::queues::NetworkFrameQueues;
 use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
 use crate::{virtio_net_log, DEFAULT_DNS_ADDR};
@@ -64,6 +65,7 @@ use smoltcp::wire::{
 };
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as HostUdpSocket};
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
@@ -115,6 +117,7 @@ enum FrameAction {
 pub fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
+    published_connections: Option<Receiver<AcceptedPublishedConnection>>,
 ) -> std::io::Result<JoinHandle<()>> {
     virtio_net_log!(
         "virtio-net: spawning poll thread guest_ip={} gateway_ip={} mtu={}",
@@ -124,10 +127,14 @@ pub fn start_network_stack(
     );
     thread::Builder::new()
         .name("smolvm-net-poll".into())
-        .spawn(move || run_network_stack(queues, config))
+        .spawn(move || run_network_stack(queues, config, published_connections))
 }
 
-fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) {
+fn run_network_stack(
+    queues: Arc<NetworkFrameQueues>,
+    config: VirtioPollConfig,
+    mut published_connections: Option<Receiver<AcceptedPublishedConnection>>,
+) {
     // Poll loop overview:
     //
     // 1. Drain staged guest Ethernet frames from the guest_to_host queue.
@@ -219,6 +226,15 @@ fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) 
             }
         }
 
+        drain_published_connections(
+            &mut published_connections,
+            &mut relays,
+            &mut interface,
+            &mut sockets,
+            config.gateway_ipv4,
+            config.guest_ipv4,
+        );
+
         // First egress pass: let smoltcp emit any packets caused by the most
         // recent ingress work before we service higher-level relays.
         flush_interface_egress(&mut interface, &mut device, &mut sockets, now);
@@ -235,6 +251,7 @@ fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) 
         for connection in relays.take_new_connections(&mut sockets) {
             spawn_tcp_relay(
                 connection.destination,
+                connection.relay_target,
                 connection.from_smoltcp,
                 connection.to_smoltcp,
                 relay_wake.clone(),
@@ -321,6 +338,57 @@ fn add_dns_socket(sockets: &mut SocketSet<'_>, gateway_ipv4: Ipv4Addr) -> Socket
         })
         .expect("failed to bind gateway DNS socket");
     sockets.add(socket)
+}
+
+fn drain_published_connections(
+    published_connections: &mut Option<Receiver<AcceptedPublishedConnection>>,
+    relays: &mut TcpRelayTable,
+    interface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    gateway_ipv4: Ipv4Addr,
+    guest_ipv4: Ipv4Addr,
+) {
+    let mut disconnected = false;
+
+    if let Some(receiver) = published_connections.as_mut() {
+        loop {
+            match receiver.try_recv() {
+                Ok(connection) => {
+                    let guest_destination =
+                        SocketAddr::new(std::net::IpAddr::V4(guest_ipv4), connection.guest_port);
+                    eprintln!(
+                        "virtio-net: accepted published TCP connection peer={} host_port={} guest_destination={}",
+                        connection.peer_addr,
+                        connection.host_port,
+                        guest_destination
+                    );
+                    if !relays.create_published_socket(
+                        interface,
+                        gateway_ipv4,
+                        guest_destination,
+                        connection.stream,
+                        sockets,
+                    ) {
+                        tracing::warn!(
+                            host_port = connection.host_port,
+                            guest_port = connection.guest_port,
+                            peer_addr = %connection.peer_addr,
+                            "dropping published TCP connection because the guest relay path could not be created"
+                        );
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if disconnected {
+        *published_connections = None;
+    }
 }
 
 fn process_dns_queries(dns_socket_handle: SocketHandle, sockets: &mut SocketSet<'_>) {
@@ -424,7 +492,7 @@ fn wake_guest_if_needed(queues: &NetworkFrameQueues, device: &VirtioNetworkDevic
 }
 
 fn smoltcp_now(start: StdInstant) -> Instant {
-    Instant::from_micros(start.elapsed().as_micros() as i64)
+    Instant::from_millis(start.elapsed().as_millis() as i64)
 }
 
 fn classify_guest_frame(frame: &[u8]) -> FrameAction {
