@@ -393,8 +393,16 @@ pub fn launch_agent_vm_dynamic(
             } else {
                 let (host_fd, guest_fd) =
                     create_unix_stream_pair().map_err(|e| format!("socketpair failed: {e}"))?;
+                let port_mappings: Vec<crate::data::network::PortMapping> = config
+                    .port_mappings
+                    .iter()
+                    .map(|(host, guest)| crate::data::network::PortMapping {
+                        host: *host,
+                        guest: *guest,
+                    })
+                    .collect();
 
-                let runtime = match start_virtio_network(host_fd, guest_network) {
+                let runtime = match start_virtio_network(host_fd, guest_network, &port_mappings) {
                     Ok(runtime) => runtime,
                     Err(err) => {
                         // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.

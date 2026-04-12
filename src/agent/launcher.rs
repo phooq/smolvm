@@ -385,7 +385,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         Error::agent("configure virtio-net", format!("socketpair failed: {e}"))
                     })?;
 
-                    let runtime = match start_virtio_network(host_fd, guest_network) {
+                    let runtime = match start_virtio_network(host_fd, guest_network, port_mappings)
+                    {
                         Ok(runtime) => runtime,
                         Err(err) => {
                             libc::close(guest_fd);

@@ -15,8 +15,6 @@ pub enum EffectiveNetworkBackend {
 /// Reason a requested backend was downgraded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkFallbackReason {
-    /// Port publishing is only implemented on TSI.
-    PortsRequireTsi,
     /// Current egress policies and DNS filtering are only implemented on TSI.
     PolicyRequiresTsi,
 }
@@ -25,9 +23,6 @@ impl NetworkFallbackReason {
     /// User-facing explanation for the fallback.
     pub const fn user_message(self) -> &'static str {
         match self {
-            Self::PortsRequireTsi => {
-                "port publishing still uses the TSI backend; falling back from virtio"
-            }
             Self::PolicyRequiresTsi => {
                 "allow-cidr/allow-host policies still use the TSI backend; falling back from virtio"
             }
@@ -78,10 +73,6 @@ pub fn plan_launch_network(
             backend: EffectiveNetworkBackend::Tsi,
             fallback_reason: None,
         },
-        NetworkBackend::VirtioNet if has_ports => LaunchNetworkPlan {
-            backend: EffectiveNetworkBackend::Tsi,
-            fallback_reason: Some(NetworkFallbackReason::PortsRequireTsi),
-        },
         NetworkBackend::VirtioNet if has_policy => LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::Tsi,
             fallback_reason: Some(NetworkFallbackReason::PolicyRequiresTsi),
@@ -125,16 +116,13 @@ mod tests {
     }
 
     #[test]
-    fn test_ports_force_tsi() {
+    fn test_ports_work_with_virtio() {
         let mut resources = resources();
         resources.network = true;
         resources.network_backend = Some(NetworkBackend::VirtioNet);
         let plan = plan_launch_network(&resources, None, 1);
-        assert_eq!(plan.backend, EffectiveNetworkBackend::Tsi);
-        assert_eq!(
-            plan.fallback_reason,
-            Some(NetworkFallbackReason::PortsRequireTsi)
-        );
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+        assert_eq!(plan.fallback_reason, None);
     }
 
     #[test]
