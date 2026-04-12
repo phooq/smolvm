@@ -21,6 +21,23 @@
 //! smoltcp transmit() --host_to_guest queue--> frame_stream writer
 //! ```
 //!
+//! More concretely:
+//!
+//! ```text
+//! guest frame arrives in guest_to_host
+//!   -> poll loop calls stage_next_frame()
+//!   -> poll loop may inspect/classify frame first
+//!   -> smoltcp calls receive()
+//!   -> DeviceRxToken hands bytes to smoltcp
+//!
+//! smoltcp wants to emit a frame
+//!   -> calls transmit()
+//!   -> gets DeviceTxToken
+//!   -> fills provided buffer
+//!   -> token pushes frame into host_to_guest
+//!   -> poll loop later wakes frame writer
+//! ```
+//!
 //! There is no shell equivalent for this code. It is a Rust trait adapter, not
 //! a kernel or CLI configuration step.
 
@@ -36,6 +53,12 @@ use std::sync::Arc;
 /// a frame before handing it to smoltcp. In particular, the stack wants to
 /// classify guest TCP SYN and DNS packets before consumption so it can prepare
 /// relay/socket state.
+///
+/// The staging pattern looks like:
+///
+/// ```text
+/// queue -> staged_guest_frame -> RxToken -> smoltcp
+/// ```
 pub struct VirtioNetworkDevice {
     queues: Arc<NetworkFrameQueues>,
     mtu: usize,
@@ -85,6 +108,9 @@ impl VirtioNetworkDevice {
     ///
     /// So staging gives the poll loop a temporary peek at the next frame
     /// without losing the normal smoltcp `Device` flow.
+    ///
+    /// This is the key reason the adapter is not just a direct `queue.pop()`
+    /// inside `receive()`.
     pub fn stage_next_frame(&mut self) -> Option<&[u8]> {
         if self.staged_guest_frame.is_none() {
             self.staged_guest_frame = self.queues.guest_to_host.pop();
@@ -157,6 +183,10 @@ impl<'a> phy::TxToken for DeviceTxToken<'a> {
     ///   -> sets frames_emitted
     ///   -> poll loop later wakes the Unix-stream writer
     /// ```
+    ///
+    /// The queue push is the handoff point. After that, this adapter no longer
+    /// owns the frame bytes; the frame writer thread eventually serializes them
+    /// onto the libkrun Unix stream.
     fn consume<R, F>(self, len: usize, f: F) -> R
     where
         F: FnOnce(&mut [u8]) -> R,

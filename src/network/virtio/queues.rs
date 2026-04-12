@@ -28,6 +28,28 @@
 //! relay_wake: TCP relay threads / shutdown -> smoltcp poll loop
 //! ```
 //!
+//! Thread interaction view:
+//!
+//! ```text
+//! FrameStream reader thread
+//!   -> guest_to_host.push(frame)
+//!   -> guest_wake.wake()
+//!
+//! smolvm-net-poll thread
+//!   -> guest_to_host.pop()
+//!   -> host_to_guest.push(frame)
+//!   -> host_wake.wake()
+//!   -> relay_wake.wait()/drain()
+//!
+//! FrameStream writer thread
+//!   -> host_wake.wait()
+//!   -> host_to_guest.pop()
+//!
+//! TCP relay thread
+//!   -> to_smoltcp.send(payload)
+//!   -> relay_wake.wake()
+//! ```
+//!
 //! There is no direct shell equivalent for the queue side. The `WakePipe`
 //! behaves like a very small eventfd-style signal built from a Unix pipe.
 
@@ -44,6 +66,14 @@ pub const DEFAULT_FRAME_QUEUE_CAPACITY: usize = 1024;
 ///
 /// One `NetworkFrameQueues` is shared across all helper threads for a single
 /// guest NIC.
+///
+/// A useful mental model is:
+///
+/// ```text
+/// queues  = ownership transfer for frame bytes
+/// wakes   = "go look at the queue now"
+/// shutdown= sticky flag + wake all blocked waiters
+/// ```
 pub struct NetworkFrameQueues {
     /// Raw ethernet frames emitted by the guest and waiting for smoltcp.
     pub guest_to_host: ArrayQueue<Vec<u8>>,

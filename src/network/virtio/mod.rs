@@ -17,6 +17,34 @@
 //!   -> external network
 //! ```
 //!
+//! Main runtime components:
+//!
+//! ```text
+//! VirtioNetworkRuntime
+//! ├─ FrameStreamBridge
+//! │  ├─ reader thread
+//! │  └─ writer thread
+//! ├─ Arc<NetworkFrameQueues>
+//! │  ├─ guest_to_host
+//! │  ├─ host_to_guest
+//! │  ├─ guest_wake
+//! │  ├─ host_wake
+//! │  └─ relay_wake
+//! └─ smolvm-net-poll thread
+//!    ├─ VirtioNetworkDevice
+//!    ├─ smoltcp Interface
+//!    ├─ SocketSet
+//!    └─ TcpRelayTable
+//! ```
+//!
+//! Component roles:
+//! - `FrameStreamBridge`: translates libkrun's Unix-stream frame protocol into
+//!   queue operations
+//! - `NetworkFrameQueues`: handoff boundary between threads
+//! - `VirtioNetworkDevice`: adapts those queues to smoltcp's `phy::Device`
+//! - poll thread: acts as the guest-visible gateway and protocol dispatcher
+//! - `TcpRelayTable`: maps guest TCP flows onto host-side relay threads
+//!
 //! In Phase 1 this runtime is responsible for:
 //! - exchanging raw Ethernet frames with libkrun
 //! - presenting a gateway endpoint to the guest
@@ -80,6 +108,19 @@ pub struct VirtioNetworkRuntime {
 ///   -> start frame reader/writer threads on the Unix stream
 ///   -> start the smoltcp poll thread
 ///   -> return a handle that owns the whole runtime
+/// ```
+///
+/// Expanded startup picture:
+///
+/// ```text
+/// host_fd from libkrun
+///   -> FrameStreamBridge(host_fd)
+///      -> reader thread
+///      -> writer thread
+///   -> NetworkFrameQueues
+///   -> start_network_stack(...)
+///      -> poll thread owns smoltcp Interface + sockets
+///   -> VirtioNetworkRuntime returned to launcher
 /// ```
 ///
 /// Outcome:

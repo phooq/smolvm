@@ -25,6 +25,30 @@
 //!   -> outbound network
 //! ```
 //!
+//! Poll-loop-centric view:
+//!
+//! ```text
+//! guest_to_host queue
+//!   -> VirtioNetworkDevice::stage_next_frame()
+//!   -> classify_guest_frame()
+//!   -> smoltcp ingress
+//!   -> protocol-specific side effects
+//!        - TCP SYN  -> create relay/socket state
+//!        - DNS UDP  -> gateway UDP socket
+//!        - other UDP-> drop for now
+//!   -> smoltcp egress
+//!   -> host_to_guest queue
+//!   -> FrameStream writer
+//! ```
+//!
+//! Runtime control flow:
+//!
+//! ```text
+//! new guest frame         -> guest_wake  -> poll loop
+//! host relay has data     -> relay_wake  -> poll loop
+//! smoltcp emitted frames  -> host_wake   -> frame writer
+//! ```
+//!
 //! Important limitation of the current MVP:
 //! - TCP is supported via host relay threads
 //! - DNS is supported via a gateway UDP socket plus host UDP forwarding
@@ -92,6 +116,11 @@ enum FrameAction {
 ///
 /// This creates one long-lived poll loop thread per guest NIC. That thread owns
 /// the smoltcp `Interface`, its socket set, and the TCP relay table.
+///
+/// Ownership boundary:
+/// - this thread owns all smoltcp state
+/// - relay threads never touch smoltcp sockets directly
+/// - frame bridge threads never parse protocols beyond raw Ethernet framing
 pub fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
@@ -115,6 +144,10 @@ fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) 
     // 4. Forward DNS and relay TCP payloads.
     // 5. Sleep in poll(2) on wake pipes until guest frames, relay activity, or
     //    timers require more work.
+    //
+    // A useful mental model is:
+    //
+    //   queue input -> classify -> smoltcp -> protocol handling -> queue output
     eprintln!(
         "virtio-net: poll loop started guest_ip={} gateway_ip={}",
         config.guest_ipv4, config.gateway_ipv4

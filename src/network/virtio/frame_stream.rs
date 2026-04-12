@@ -29,6 +29,15 @@
 //! host  <- libkrun <- UnixStream <- run_writer() <- host_to_guest queue
 //! ```
 //!
+//! In the broader runtime, this module sits here:
+//!
+//! ```text
+//! libkrun unixstream
+//!   <-> FrameStreamBridge
+//!   <-> NetworkFrameQueues
+//!   <-> VirtioNetworkDevice / smoltcp poll loop
+//! ```
+//!
 //! There is no useful shell equivalent for this file. The nearest mental model
 //! is "a daemon speaking a small binary framing protocol over a Unix socket".
 
