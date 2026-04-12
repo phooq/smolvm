@@ -1,4 +1,34 @@
 //! TCP relay support for the virtio-net backend.
+//!
+//! Context
+//! =======
+//!
+//! In the Phase 1 virtio-net design, guest TCP does not flow directly from the
+//! guest to the outside network through the host kernel. Instead, the host-side
+//! smoltcp runtime terminates the guest-visible TCP connection in userspace and
+//! relays payloads to a normal host `TcpStream`.
+//!
+//! Conceptually:
+//!
+//! ```text
+//! guest app
+//!   -> guest kernel TCP
+//!   -> Ethernet frame
+//!   -> smoltcp TCP socket (inside smolvm)
+//!   -> channel
+//!   -> host TcpStream
+//!   -> remote server
+//! ```
+//!
+//! That means:
+//! - the host runtime can observe every guest TCP byte stream on this NIC
+//! - smoltcp owns the guest-facing TCP state machine
+//! - the relay thread owns the host-facing TCP socket
+//! - channels bridge payloads between them
+//!
+//! There is no shell equivalent for most of this file. The closest analogy is
+//! a tiny per-connection TCP proxy implemented partly in a userspace TCP stack
+//! and partly with normal host sockets.
 
 use crate::network::virtio::queues::WakePipe;
 use smoltcp::iface::{SocketHandle, SocketSet};
@@ -22,6 +52,9 @@ const CLOSE_RETRY_LIMIT: u16 = 64;
 const PROXY_IDLE_SLEEP: Duration = Duration::from_millis(10);
 
 /// Track all active guest TCP connections bridged through host sockets.
+///
+/// One entry corresponds to one `(guest source, destination)` tuple. The table
+/// lives in the smoltcp poll thread and owns all guest-facing socket handles.
 pub struct TcpRelayTable {
     connections: HashMap<SocketHandle, TrackedConnection>,
     connection_keys: HashSet<(SocketAddr, SocketAddr)>,
@@ -29,6 +62,10 @@ pub struct TcpRelayTable {
 }
 
 /// Newly established guest connection ready for a host relay thread.
+///
+/// The poll loop emits these once the guest-side smoltcp socket reaches
+/// `Established`. At that point we can safely create the host-side relay
+/// thread and give it channel endpoints for payload exchange.
 pub struct NewTcpConnection {
     /// Destination originally requested by the guest.
     pub destination: SocketAddr,
@@ -42,14 +79,22 @@ pub struct NewTcpConnection {
 
 #[derive(Debug)]
 struct TrackedConnection {
+    // `source` and `destination` identify the guest-side flow.
     source: SocketAddr,
     destination: SocketAddr,
+    // guest -> host relay payloads
     to_proxy: SyncSender<Vec<u8>>,
+    // host -> guest relay payloads
     from_proxy: Receiver<Vec<u8>>,
+    // endpoints are held here until the guest-side handshake completes
     pending_proxy_endpoints: Option<PendingProxyEndpoints>,
+    // once true, a dedicated host relay thread exists
     relay_spawned: bool,
+    // partial host->guest payload not yet fully accepted by smoltcp
     buffered_proxy_data: Option<(Vec<u8>, usize)>,
+    // bounded retry count for closing with unsent buffered data
     close_attempts: u16,
+    // relay thread termination mode observed by the poll loop
     exit_state: RelayExitState,
 }
 
@@ -60,6 +105,12 @@ struct PendingProxyEndpoints {
 }
 
 /// Host relay termination state shared between the poll loop and the relay thread.
+///
+/// The relay thread cannot mutate smoltcp sockets directly because those sockets
+/// are owned by the poll loop thread. Instead it reports how it finished, and
+/// the poll loop interprets that into guest-side socket actions:
+/// - `Graceful` -> close guest socket cleanly
+/// - `Abort`    -> abort/reset guest socket
 #[derive(Clone, Debug)]
 pub struct RelayExitState {
     inner: Arc<AtomicU8>,
@@ -113,6 +164,21 @@ impl TcpRelayTable {
     }
 
     /// Create a smoltcp TCP socket for a guest SYN.
+    ///
+    /// Why this happens before full ingress processing:
+    /// - when the first guest SYN arrives, smoltcp needs a matching socket to
+    ///   receive it
+    /// - the poll loop therefore pre-creates a listening socket keyed to the
+    ///   destination the guest is trying to reach
+    /// - only after the guest-facing connection reaches `Established` do we
+    ///   spawn the host relay thread
+    ///
+    /// Data path after creation:
+    ///
+    /// ```text
+    /// smoltcp socket --to_proxy channel--> host relay thread
+    /// host relay thread --from_proxy channel--> smoltcp socket
+    /// ```
     pub fn create_tcp_socket(
         &mut self,
         source: SocketAddr,
@@ -168,6 +234,13 @@ impl TcpRelayTable {
     }
 
     /// Relay TCP payloads between smoltcp sockets and host relay threads.
+    ///
+    /// This runs in the poll thread. It is responsible for:
+    /// - draining bytes received from the guest-facing smoltcp socket and
+    ///   pushing them toward the host relay thread
+    /// - draining bytes received from the host relay thread and writing them
+    ///   back into the smoltcp socket
+    /// - interpreting relay exit state into guest-side `close()` or `abort()`
     pub fn relay_data(&mut self, sockets: &mut SocketSet<'_>) {
         let mut read_buffer = [0u8; RELAY_BUFFER_BYTES];
 
@@ -215,6 +288,10 @@ impl TcpRelayTable {
     }
 
     /// Collect connections that reached ESTABLISHED and need a host relay thread.
+    ///
+    /// The separation between `create_tcp_socket` and this method is important:
+    /// the guest TCP handshake is accepted first on the smoltcp side, and only
+    /// once that succeeds do we commit to opening the host-side `TcpStream`.
     pub fn take_new_connections(&mut self, sockets: &mut SocketSet<'_>) -> Vec<NewTcpConnection> {
         let mut new_connections = Vec::new();
 
@@ -242,6 +319,8 @@ impl TcpRelayTable {
     }
 
     /// Remove closed sockets and drop their relay endpoints.
+    ///
+    /// This is the final ownership cleanup step for a guest TCP flow.
     pub fn cleanup_closed(&mut self, sockets: &mut SocketSet<'_>) {
         let keys = &mut self.connection_keys;
         self.connections.retain(|&handle, connection| {
@@ -258,6 +337,13 @@ impl TcpRelayTable {
 }
 
 /// Spawn one host TCP relay thread for an established guest connection.
+///
+/// Thread responsibilities:
+/// - connect a host `TcpStream` to the guest-requested destination
+/// - copy bytes guest->host from `from_smoltcp`
+/// - copy bytes host->guest into `to_smoltcp`
+/// - wake the poll loop when host->guest data arrives
+/// - report termination mode through `exit_state`
 pub fn spawn_tcp_relay(
     destination: SocketAddr,
     from_smoltcp: Receiver<Vec<u8>>,
@@ -288,6 +374,8 @@ fn run_tcp_relay(
     relay_wake: Arc<WakePipe>,
     exit_state: RelayExitState,
 ) {
+    // The relay thread is intentionally isolated from smoltcp internals. Its
+    // contract is just channels in, channels out, and an exit code back.
     eprintln!(
         "virtio-net: host TCP relay thread started destination={}",
         destination
@@ -316,6 +404,12 @@ fn tcp_relay_loop(
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_wake: Arc<WakePipe>,
 ) -> io::Result<RelayExitMode> {
+    // Host-side flow:
+    //
+    // 1. Connect a normal host TcpStream to the destination.
+    // 2. Non-blockingly drain guest payloads from the channel into the socket.
+    // 3. Non-blockingly read remote payloads from the socket into the channel.
+    // 4. If neither side made progress, sleep briefly to avoid a hot spin loop.
     eprintln!(
         "virtio-net: connecting host TCP relay socket destination={}",
         destination
@@ -341,6 +435,9 @@ fn tcp_relay_loop(
                 }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
+                    // The guest side closed its write half. Mirror that toward
+                    // the remote peer once, then keep reading until the remote
+                    // side closes too.
                     if !guest_write_closed {
                         let _ = stream.shutdown(Shutdown::Write);
                         guest_write_closed = true;
@@ -370,6 +467,9 @@ fn tcp_relay_loop(
 }
 
 fn flush_proxy_data(socket: &mut tcp::Socket<'_>, connection: &mut TrackedConnection) {
+    // smoltcp send windows may accept only part of an inbound host payload.
+    // `buffered_proxy_data` remembers the unwritten remainder so the next poll
+    // iteration can continue where it left off instead of dropping bytes.
     if let Some((data, offset)) = &mut connection.buffered_proxy_data {
         if socket.can_send() {
             match socket.send_slice(&data[*offset..]) {

@@ -1,4 +1,36 @@
 //! libkrun unix-stream framing for the virtio-net backend.
+//!
+//! Context
+//! =======
+//!
+//! libkrun's `krun_add_net_unixstream()` interface does not hand us raw virtio
+//! rings or a tap device. Instead, it exposes a Unix stream file descriptor
+//! carrying Ethernet frames in a tiny framing protocol:
+//!
+//! ```text
+//! [4-byte big-endian frame length][raw ethernet frame bytes]
+//! ```
+//!
+//! Important details:
+//! - the payload is a raw Ethernet frame
+//! - there is no virtio-net header on this stream
+//! - libkrun adds/removes its internal virtio-net header itself
+//! - partial reads and partial writes are normal stream-socket behavior and
+//!   must be handled explicitly
+//!
+//! So this module is not the TCP/IP stack. It is just the bridge between:
+//! - libkrun's Unix stream transport
+//! - the in-process frame queues consumed by the host smoltcp runtime
+//!
+//! Data flow:
+//!
+//! ```text
+//! guest -> libkrun -> UnixStream -> run_reader() -> guest_to_host queue
+//! host  <- libkrun <- UnixStream <- run_writer() <- host_to_guest queue
+//! ```
+//!
+//! There is no useful shell equivalent for this file. The nearest mental model
+//! is "a daemon speaking a small binary framing protocol over a Unix socket".
 
 use crate::network::virtio::queues::NetworkFrameQueues;
 use std::io::{self, Read, Write};
@@ -13,6 +45,11 @@ const SOCKET_SENDBUF_BYTES: libc::c_int = 16 * 1024 * 1024;
 const MAX_FRAME_LEN: usize = 64 * 1024;
 
 /// Running libkrun unix-stream bridge for one virtio NIC.
+///
+/// The bridge owns:
+/// - a control clone of the Unix stream used to trigger shutdown
+/// - a reader thread for guest->host frames
+/// - a writer thread for host->guest frames
 pub struct FrameStreamBridge {
     control: UnixStream,
     queues: Arc<NetworkFrameQueues>,
@@ -21,6 +58,17 @@ pub struct FrameStreamBridge {
 }
 
 /// Start the libkrun unix-stream reader and writer threads for one virtio NIC.
+///
+/// `fd` is the host-side Unix stream endpoint associated with one libkrun
+/// virtio-net device. Ownership transfers into this function.
+///
+/// Why the stream is cloned:
+/// - one clone stays as a control handle so `Drop` can force shutdown
+/// - one clone is dedicated to the reader thread
+/// - one clone is dedicated to the writer thread
+///
+/// This keeps reads and writes independent while still referring to the same
+/// underlying Unix socket connection.
 pub fn start_frame_stream_bridge(
     fd: RawFd,
     queues: Arc<NetworkFrameQueues>,
@@ -54,6 +102,11 @@ pub fn start_frame_stream_bridge(
 }
 
 impl Drop for FrameStreamBridge {
+    /// Request shutdown and join the reader/writer workers.
+    ///
+    /// `shutdown(Shutdown::Both)` is the important part here: it forces any
+    /// blocking read/write on the other stream clones to wake up and fail,
+    /// which lets the threads notice shutdown and return.
     fn drop(&mut self) {
         self.queues.begin_shutdown();
         let _ = self.control.shutdown(Shutdown::Both);
@@ -68,6 +121,8 @@ impl Drop for FrameStreamBridge {
 }
 
 fn run_reader(mut reader: UnixStream, queues: Arc<NetworkFrameQueues>) {
+    // Reader thread:
+    // libkrun -> Unix stream -> guest_to_host queue -> smoltcp poll loop
     loop {
         match read_frame(&mut reader) {
             Ok(frame) => {
@@ -87,6 +142,8 @@ fn run_reader(mut reader: UnixStream, queues: Arc<NetworkFrameQueues>) {
 }
 
 fn run_writer(mut writer: UnixStream, queues: Arc<NetworkFrameQueues>) {
+    // Writer thread:
+    // smoltcp / host runtime -> host_to_guest queue -> Unix stream -> libkrun
     loop {
         if queues.is_shutting_down() && queues.host_to_guest.is_empty() {
             return;
@@ -111,7 +168,25 @@ fn run_writer(mut writer: UnixStream, queues: Arc<NetworkFrameQueues>) {
     }
 }
 
-/// Read one raw ethernet frame using libkrun's 4-byte big-endian length prefix.
+/// Read one raw Ethernet frame using libkrun's 4-byte big-endian length prefix.
+///
+/// Wire format:
+///
+/// ```text
+/// 0               3 4 ...
+/// +----------------+----------------------+
+/// | frame_len (BE) | ethernet frame bytes |
+/// +----------------+----------------------+
+/// ```
+///
+/// `read_exact` is intentional:
+/// - Unix stream sockets are byte streams, not message sockets
+/// - one `read` may return only part of the header or part of the frame
+/// - the bridge must keep reading until the whole logical frame arrives
+///
+/// Outcome:
+/// - returns the next complete raw Ethernet frame
+/// - rejects zero-length or implausibly large frames as protocol errors
 pub(crate) fn read_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut header = [0u8; FRAME_HEADER_LEN];
     reader.read_exact(&mut header)?;
@@ -129,7 +204,19 @@ pub(crate) fn read_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     Ok(frame)
 }
 
-/// Write one raw ethernet frame using libkrun's 4-byte big-endian length prefix.
+/// Write one raw Ethernet frame using libkrun's 4-byte big-endian length prefix.
+///
+/// This is the inverse of [`read_frame`]:
+///
+/// ```text
+/// write 4-byte BE length
+/// write raw frame bytes
+/// flush stream
+/// ```
+///
+/// `write_all` is used instead of a single `write` because stream sockets may
+/// accept only part of the buffer. The caller should not need to reason about
+/// partial-write state; this helper completes the logical frame write or fails.
 pub(crate) fn write_frame<W: Write>(writer: &mut W, frame: &[u8]) -> io::Result<()> {
     if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
         return Err(io::Error::new(
@@ -145,6 +232,9 @@ pub(crate) fn write_frame<W: Write>(writer: &mut W, frame: &[u8]) -> io::Result<
 }
 
 fn write_all<W: Write>(writer: &mut W, mut buf: &[u8]) -> io::Result<()> {
+    // This is the stream-socket equivalent of "keep sending until the whole
+    // logical message is written". `Write::write` may legally write fewer bytes
+    // than requested even on success.
     while !buf.is_empty() {
         let written = writer.write(buf)?;
         if written == 0 {
@@ -159,8 +249,15 @@ fn write_all<W: Write>(writer: &mut W, mut buf: &[u8]) -> io::Result<()> {
 }
 
 fn set_socket_send_buffer(stream: &UnixStream) -> io::Result<()> {
+    // libkrun's Unix-stream bridge benefits from a large send buffer because we
+    // can burst multiple Ethernet frames before the consumer catches up. The
+    // kernel may clamp the requested size, so failure here is logged but not
+    // treated as fatal.
     let size = SOCKET_SENDBUF_BYTES;
-    // SAFETY: the socket file descriptor is valid and points at a Unix stream.
+    // SAFETY:
+    // - `as_raw_fd()` yields a valid file descriptor owned by `stream`
+    // - `SOL_SOCKET/SO_SNDBUF` expects a pointer to an `int`
+    // - the pointed-to memory lives for the duration of the call
     let result = unsafe {
         libc::setsockopt(
             stream.as_raw_fd(),

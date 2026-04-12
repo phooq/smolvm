@@ -1,4 +1,38 @@
 //! Host-side smoltcp runtime for the virtio-net backend.
+//!
+//! Context
+//! =======
+//!
+//! This file is the in-process "gateway" that sits behind the guest's virtio
+//! NIC. It does not configure the guest interface; that already happened inside
+//! `smolvm-agent`. Instead, this module:
+//! - receives raw Ethernet frames coming out of libkrun
+//! - feeds them into smoltcp as if smolvm were the guest's next-hop gateway
+//! - forwards guest DNS queries to a host UDP socket
+//! - relays guest TCP streams to host `TcpStream`s
+//!
+//! Conceptually, it plays the role of a tiny virtual router/NAT-side gateway:
+//!
+//! ```text
+//! guest eth0
+//!   -> Ethernet frame
+//!   -> Frame queues
+//!   -> smoltcp Interface (gateway MAC/IP)
+//!   -> protocol-specific handling:
+//!        - TCP  -> host relay threads
+//!        - DNS  -> host UDP socket
+//!        - other supported egress -> future phases
+//!   -> outbound network
+//! ```
+//!
+//! Important limitation of the current MVP:
+//! - TCP is supported via host relay threads
+//! - DNS is supported via a gateway UDP socket plus host UDP forwarding
+//! - other UDP is intentionally dropped
+//! - there is no policy engine or port publishing yet
+//!
+//! There is no single shell command equivalent for this module. The closest
+//! operational mental model is "userspace network stack + gateway daemon".
 
 use crate::data::network::DEFAULT_DNS_ADDR;
 use crate::network::virtio::device::VirtioNetworkDevice;
@@ -25,6 +59,10 @@ const DNS_BUFFER_BYTES: usize = 2048;
 const DEFAULT_IDLE_TIMEOUT_MS: i32 = 100;
 
 /// Resolved network parameters for one guest NIC.
+///
+/// These are the host-side parameters for the virtual link. Note that the
+/// smoltcp interface is configured with the *gateway* MAC/IP, because the host
+/// runtime is acting as the guest-visible gateway endpoint.
 #[derive(Debug, Clone, Copy)]
 pub struct VirtioPollConfig {
     /// Host-side gateway MAC visible to the guest.
@@ -51,6 +89,9 @@ enum FrameAction {
 }
 
 /// Start the dedicated smoltcp poll thread for the virtio-net backend.
+///
+/// This creates one long-lived poll loop thread per guest NIC. That thread owns
+/// the smoltcp `Interface`, its socket set, and the TCP relay table.
 pub fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
@@ -65,6 +106,15 @@ pub fn start_network_stack(
 }
 
 fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) {
+    // Poll loop overview:
+    //
+    // 1. Drain staged guest Ethernet frames from the guest_to_host queue.
+    // 2. Pre-classify them so we can create relay/socket state before smoltcp
+    //    consumes the frame.
+    // 3. Poll smoltcp ingress/egress.
+    // 4. Forward DNS and relay TCP payloads.
+    // 5. Sleep in poll(2) on wake pipes until guest frames, relay activity, or
+    //    timers require more work.
     eprintln!(
         "virtio-net: poll loop started guest_ip={} gateway_ip={}",
         config.guest_ipv4, config.gateway_ipv4
@@ -77,6 +127,9 @@ fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) 
     let relay_wake = Arc::new(queues.relay_wake.clone());
     let mut relays = TcpRelayTable::new(None);
 
+    // The smoltcp loop is driven by fd-based wakeups rather than busy spinning.
+    // guest_wake  -> new guest frame or shutdown
+    // relay_wake  -> host TCP relay thread produced data or shutdown
     let mut poll_fds = [
         libc::pollfd {
             fd: queues.guest_wake.as_raw_fd(),
@@ -97,6 +150,11 @@ fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) 
         let now = smoltcp_now(clock);
 
         while let Some(frame) = device.stage_next_frame() {
+            // We inspect the frame before giving it to smoltcp because certain
+            // flows need side effects first:
+            // - TCP SYN: pre-create a matching smoltcp socket + relay entry
+            // - DNS UDP: allow through for gateway-side forwarding
+            // - other UDP: currently unsupported in the MVP
             match classify_guest_frame(frame) {
                 FrameAction::TcpSyn {
                     source,
@@ -125,19 +183,27 @@ fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) 
                     }
                 }
                 FrameAction::UnsupportedUdp => {
+                    // Phase 1 only supports DNS over UDP. Other UDP traffic is
+                    // intentionally dropped until a general UDP relay exists.
                     eprintln!("virtio-net: dropping unsupported guest UDP datagram");
                     device.drop_staged_frame();
                 }
             }
         }
 
+        // First egress pass: let smoltcp emit any packets caused by the most
+        // recent ingress work before we service higher-level relays.
         flush_interface_egress(&mut interface, &mut device, &mut sockets, now);
         interface.poll_maintenance(now);
         wake_guest_if_needed(&queues, &device);
 
+        // Move payloads between established smoltcp TCP sockets and host relay
+        // threads, and service the DNS gateway socket.
         relays.relay_data(&mut sockets);
         process_dns_queries(dns_socket_handle, &mut sockets);
 
+        // Once the guest-side TCP handshake is established inside smoltcp, we
+        // can spawn the corresponding host relay thread.
         for connection in relays.take_new_connections(&mut sockets) {
             spawn_tcp_relay(
                 connection.destination,
@@ -150,6 +216,8 @@ fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) 
 
         relays.cleanup_closed(&mut sockets);
 
+        // Second egress pass: DNS responses or relay data may have queued more
+        // packets for the guest.
         flush_interface_egress(&mut interface, &mut device, &mut sockets, now);
         wake_guest_if_needed(&queues, &device);
 
@@ -177,6 +245,14 @@ fn run_network_stack(queues: Arc<NetworkFrameQueues>, config: VirtioPollConfig) 
 }
 
 fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig) -> Interface {
+    // This interface models the host-side gateway endpoint, not the guest NIC.
+    //
+    // Equivalent conceptual state:
+    //   MAC: config.gateway_mac
+    //   IP : config.gateway_ipv4/30
+    //
+    // The guest IP exists as a peer on the same virtual link; it is not an
+    // address owned by this interface.
     let mut interface = Interface::new(
         Config::new(HardwareAddress::Ethernet(EthernetAddress(
             config.gateway_mac,
@@ -189,6 +265,9 @@ fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig)
             .push(IpCidr::new(IpAddress::Ipv4(config.gateway_ipv4), 30))
             .expect("failed to add gateway IPv4 address");
     });
+    // The interface acts as the gateway and may need to answer packets for
+    // destinations other than its directly assigned IP, so the route table and
+    // "any IP" mode are opened up accordingly.
     interface
         .routes_mut()
         .add_default_ipv4_route(config.gateway_ipv4)
@@ -198,6 +277,8 @@ fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig)
 }
 
 fn add_dns_socket(sockets: &mut SocketSet<'_>, gateway_ipv4: Ipv4Addr) -> SocketHandle {
+    // Bind a UDP socket on gateway:53 inside smoltcp. Guest DNS packets hit
+    // this socket first; we then proxy them to the host resolver path.
     let rx_meta = vec![PacketMetadata::EMPTY; DNS_PACKET_SLOTS];
     let tx_meta = vec![PacketMetadata::EMPTY; DNS_PACKET_SLOTS];
     let rx_buffer = PacketBuffer::new(rx_meta, vec![0u8; DNS_BUFFER_BYTES]);
@@ -213,6 +294,9 @@ fn add_dns_socket(sockets: &mut SocketSet<'_>, gateway_ipv4: Ipv4Addr) -> Socket
 }
 
 fn process_dns_queries(dns_socket_handle: SocketHandle, sockets: &mut SocketSet<'_>) {
+    // Phase 1 DNS model:
+    // guest UDP/53 -> smoltcp gateway socket -> host UDP socket -> upstream DNS
+    //               <-               response bytes               <-
     let upstream_dns = match DEFAULT_DNS_ADDR {
         std::net::IpAddr::V4(ip) => ip,
         std::net::IpAddr::V6(_) => return,
@@ -254,6 +338,13 @@ fn process_dns_queries(dns_socket_handle: SocketHandle, sockets: &mut SocketSet<
 }
 
 fn forward_dns_query(upstream_dns: Ipv4Addr, query: &[u8]) -> std::io::Result<Vec<u8>> {
+    // This is intentionally a plain host UDP exchange rather than a smoltcp
+    // socket-to-socket relay. Once the guest packet reaches the gateway, the
+    // simplest MVP path is to proxy it with the host kernel's UDP stack.
+    //
+    // Rough shell equivalent:
+    //   send raw DNS message to `<upstream_dns>:53`
+    //   wait up to 2 seconds for one reply
     let socket = HostUdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
     socket.set_read_timeout(Some(Duration::from_secs(2)))?;
     let local_addr = socket.local_addr()?;
@@ -282,6 +373,9 @@ fn flush_interface_egress(
     sockets: &mut SocketSet<'_>,
     now: Instant,
 ) {
+    // smoltcp may have multiple pending egress packets after a single ingress
+    // event or timeout. Keep polling until the interface reports there is no
+    // more immediate work.
     loop {
         let result = interface.poll_egress(now, device, sockets);
         if matches!(result, PollResult::None) {
@@ -291,6 +385,9 @@ fn flush_interface_egress(
 }
 
 fn wake_guest_if_needed(queues: &NetworkFrameQueues, device: &VirtioNetworkDevice) {
+    // The device records only that "some frame was emitted". We convert that
+    // sticky bit into one wake for the writer thread and let the writer drain
+    // the entire host_to_guest queue.
     if device.frames_emitted.swap(false, Ordering::Relaxed) {
         queues.host_wake.wake();
     }
@@ -301,6 +398,15 @@ fn smoltcp_now(start: StdInstant) -> Instant {
 }
 
 fn classify_guest_frame(frame: &[u8]) -> FrameAction {
+    // This pre-parser is intentionally shallow. It only looks far enough to
+    // decide whether the poll loop needs special handling before smoltcp sees
+    // the frame.
+    //
+    // Current policy:
+    // - TCP SYN  -> create relay/socket state before ingress
+    // - UDP/53   -> allow as DNS
+    // - other UDP-> drop in Phase 1
+    // - anything else -> normal smoltcp ingress path
     let Ok(ethernet) = EthernetFrame::new_checked(frame) else {
         return FrameAction::Passthrough;
     };
@@ -323,6 +429,9 @@ fn classify_guest_frame(frame: &[u8]) -> FrameAction {
 }
 
 fn classify_tcp(payload: &[u8], source: Ipv4Addr, destination: Ipv4Addr) -> FrameAction {
+    // New outgoing guest TCP connections are identified by the initial
+    // SYN-without-ACK packet. That is the moment where we need a matching
+    // smoltcp socket and later a host relay thread.
     let Ok(tcp) = TcpPacket::new_checked(payload) else {
         return FrameAction::Passthrough;
     };
@@ -338,6 +447,7 @@ fn classify_tcp(payload: &[u8], source: Ipv4Addr, destination: Ipv4Addr) -> Fram
 }
 
 fn classify_udp(payload: &[u8]) -> FrameAction {
+    // Phase 1 treats DNS as the only supported guest UDP protocol.
     let Ok(udp) = UdpPacket::new_checked(payload) else {
         return FrameAction::Passthrough;
     };
