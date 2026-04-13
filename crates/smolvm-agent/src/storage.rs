@@ -31,6 +31,13 @@ const OVERLAYS_DIR: &str = "overlays";
 /// Set at startup if SMOLVM_PACKED_LAYERS env var is present.
 static PACKED_LAYERS_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+/// Global state for packed OCI layer order.
+///
+/// Packed launches pass the manifest's layer list through
+/// `SMOLVM_PACKED_LAYER_DIGESTS`. This preserves the original OCI ordering
+/// inside the guest so overlay lowerdirs can be built correctly.
+static PACKED_LAYER_DIGESTS: OnceLock<Vec<String>> = OnceLock::new();
+
 /// Global state for boot-time volume mounts.
 /// Set at startup if SMOLVM_MOUNT_COUNT env var is present.
 static BOOT_VOLUME_MOUNTS: OnceLock<Vec<(String, String, bool)>> = OnceLock::new();
@@ -103,6 +110,104 @@ pub fn get_packed_layers_dir() -> Option<&'static PathBuf> {
     PACKED_LAYERS_DIR.get_or_init(init_packed_layers).as_ref()
 }
 
+/// Initialize packed OCI layer order from the host launcher.
+///
+/// Format: `sha256:...,sha256:...` in the original manifest order
+/// (base layer first, top layer last).
+fn init_packed_layer_digests() -> Vec<String> {
+    let env_val = match std::env::var("SMOLVM_PACKED_LAYER_DIGESTS") {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let digests: Vec<String> = env_val
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+
+    if digests.is_empty() {
+        warn!("SMOLVM_PACKED_LAYER_DIGESTS was set but contained no digests");
+        return Vec::new();
+    }
+
+    debug!(layer_count = digests.len(), layers = ?digests, "using packed layer order from launcher");
+    digests
+}
+
+/// Get packed OCI layer digests in manifest order.
+fn get_packed_layer_digests() -> &'static [String] {
+    PACKED_LAYER_DIGESTS
+        .get_or_init(init_packed_layer_digests)
+        .as_slice()
+}
+
+/// Convert a full OCI layer digest into the short directory name used by packs.
+fn packed_layer_dir_name(digest: &str) -> &str {
+    let digest = digest.strip_prefix("sha256:").unwrap_or(digest);
+    digest.get(..12).unwrap_or(digest)
+}
+
+/// Find extracted packed layer directories by scanning the packed layers mount.
+///
+/// This is a fallback for older packed artifacts that do not pass
+/// `SMOLVM_PACKED_LAYER_DIGESTS`. The resulting order is only heuristic.
+fn scan_packed_layer_dirs(packed_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut layer_dirs: Vec<PathBuf> = Vec::new();
+
+    let entries = std::fs::read_dir(packed_dir)
+        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
+
+    for entry in entries {
+        let entry: std::fs::DirEntry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".tar") {
+                layer_dirs.push(path);
+            }
+        }
+    }
+
+    if layer_dirs.is_empty() {
+        return Err(StorageError::new(format!(
+            "no layer directories found in {}",
+            packed_dir.display()
+        )));
+    }
+
+    layer_dirs.sort();
+    Ok(layer_dirs)
+}
+
+/// Resolve extracted packed layer directories in OCI manifest order.
+fn get_ordered_packed_layer_dirs(packed_dir: &Path) -> Result<Vec<PathBuf>> {
+    let ordered_digests = get_packed_layer_digests();
+    if ordered_digests.is_empty() {
+        warn!(
+            packed_dir = %packed_dir.display(),
+            "packed layer order not provided; falling back to directory-name sort"
+        );
+        return scan_packed_layer_dirs(packed_dir);
+    }
+
+    let mut layer_dirs = Vec::with_capacity(ordered_digests.len());
+    for digest in ordered_digests {
+        let path = packed_dir.join(packed_layer_dir_name(digest));
+        if !path.is_dir() {
+            return Err(StorageError::new(format!(
+                "packed layer directory missing for digest {} at {}",
+                digest,
+                path.display()
+            )));
+        }
+        layer_dirs.push(path);
+    }
+
+    Ok(layer_dirs)
+}
+
 /// Initialize volume mounts at boot by reading SMOLVM_MOUNT_* env vars.
 ///
 /// The host launcher sets:
@@ -167,33 +272,23 @@ pub fn init_volume_mounts() -> &'static [(String, String, bool)] {
 /// Create a synthetic ImageInfo from packed layers.
 /// This is used when running from a packed binary where layers are pre-extracted.
 fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo> {
-    // Find all layer directories in packed_dir
-    let mut layer_dirs: Vec<String> = Vec::new();
-
-    let entries = std::fs::read_dir(packed_dir)
-        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
-
-    for entry in entries {
-        let entry: std::fs::DirEntry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // Skip .tar files, only use directories
-            if !name.ends_with(".tar") {
-                // Store as sha256:{short_digest} for consistency
-                layer_dirs.push(format!("sha256:{}", name));
-            }
-        }
-    }
-
-    // Sort for consistent ordering
-    layer_dirs.sort();
+    let layer_dirs = get_ordered_packed_layer_dirs(packed_dir)?;
+    let layer_digests: Vec<String> = if get_packed_layer_digests().is_empty() {
+        layer_dirs
+            .iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| format!("sha256:{}", name.to_string_lossy()))
+            })
+            .collect()
+    } else {
+        get_packed_layer_digests().to_vec()
+    };
 
     // Calculate approximate size
     let mut total_size = 0u64;
-    for layer_digest in &layer_dirs {
-        let short_id = layer_digest.strip_prefix("sha256:").unwrap_or(layer_digest);
-        let layer_path = packed_dir.join(short_id);
+    for layer_digest in &layer_digests {
+        let layer_path = packed_dir.join(packed_layer_dir_name(layer_digest));
         if let Ok(size) = dir_size(&layer_path) {
             total_size += size;
         }
@@ -214,8 +309,8 @@ fn create_packed_image_info(image: &str, packed_dir: &Path) -> Result<ImageInfo>
         created: None,
         architecture,
         os: "linux".to_string(),
-        layer_count: layer_dirs.len(),
-        layers: layer_dirs,
+        layer_count: layer_digests.len(),
+        layers: layer_digests,
         // Packed mode: config is in the PackManifest, not the image
         entrypoint: Vec::new(),
         cmd: Vec::new(),
@@ -1587,31 +1682,7 @@ fn prepare_overlay_from_packed(
     workload_id: &str,
     packed_dir: &Path,
 ) -> Result<OverlayInfo> {
-    // Find layer directories in packed_dir
-    // Packed layers are named by short digest (first 12 chars of sha256)
-    let mut layer_dirs: Vec<PathBuf> = Vec::new();
-
-    let entries = std::fs::read_dir(packed_dir)
-        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
-
-    for entry in entries {
-        let entry: std::fs::DirEntry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            // Skip .tar files, only use directories
-            if !name.ends_with(".tar") {
-                layer_dirs.push(path);
-            }
-        }
-    }
-
-    if layer_dirs.is_empty() {
-        return Err(StorageError::new(format!(
-            "no layer directories found in {}",
-            packed_dir.display()
-        )));
-    }
+    let layer_dirs = get_ordered_packed_layer_dirs(packed_dir)?;
 
     info!(
         image = %image,
@@ -1619,10 +1690,6 @@ fn prepare_overlay_from_packed(
         layers = ?layer_dirs.iter().map(|p| p.file_name().unwrap_or_default().to_string_lossy().to_string()).collect::<Vec<_>>(),
         "found packed layers"
     );
-
-    // Sort layer directories by name for consistent ordering
-    // The stub creates layers in order, so alphabetical sort should work
-    layer_dirs.sort();
 
     // Build lowerdir from layers (reversed for overlay order - top layer first)
     let lowerdirs: Vec<String> = layer_dirs
@@ -1654,30 +1721,7 @@ fn get_image_lowerdirs(image: &str) -> Result<Vec<String>> {
 
 /// Build lowerdir list from pre-packed layer directories.
 fn get_packed_lowerdirs(packed_dir: &Path) -> Result<Vec<String>> {
-    let mut layer_dirs: Vec<PathBuf> = Vec::new();
-
-    let entries = std::fs::read_dir(packed_dir)
-        .map_err(|e| StorageError::read_error(packed_dir.display().to_string(), e))?;
-
-    for entry in entries {
-        let entry: std::fs::DirEntry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".tar") {
-                layer_dirs.push(path);
-            }
-        }
-    }
-
-    if layer_dirs.is_empty() {
-        return Err(StorageError::new(format!(
-            "no layer directories found in {}",
-            packed_dir.display()
-        )));
-    }
-
-    layer_dirs.sort();
+    let layer_dirs = get_ordered_packed_layer_dirs(packed_dir)?;
     Ok(layer_dirs
         .iter()
         .rev()

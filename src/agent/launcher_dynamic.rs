@@ -179,6 +179,13 @@ pub struct PackedLaunchConfig<'a> {
     pub vsock_socket: &'a Path,
     /// Path to layers directory (for virtiofs).
     pub layers_dir: &'a Path,
+    /// OCI layer digests in manifest order (base layer first, top layer last).
+    ///
+    /// Packed mode extracts layers to digest-named directories and mounts them
+    /// into the guest via virtiofs. The guest must preserve the original OCI
+    /// layer order when building an overlay stack; directory iteration order or
+    /// alphabetical sorting are not valid substitutes.
+    pub layer_digests: &'a [String],
     /// Volume mounts.
     pub mounts: &'a [PackedMount],
     /// Port mappings (host, guest).
@@ -410,6 +417,14 @@ pub fn launch_agent_vm_dynamic(
     // Tell agent about packed layers mount
     if config.layers_dir.exists() {
         env_strings.push(cstr("SMOLVM_PACKED_LAYERS=smolvm_layers:/packed_layers"));
+    }
+
+    if !config.layer_digests.is_empty() {
+        let layer_order = format!(
+            "SMOLVM_PACKED_LAYER_DIGESTS={}",
+            config.layer_digests.join(",")
+        );
+        env_strings.push(cstr(&layer_order));
     }
 
     // Pass mount info to the agent via environment

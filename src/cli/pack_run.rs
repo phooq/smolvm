@@ -339,6 +339,12 @@ impl PackRunCmd {
         // 8. Fork child → launch VM with dynamically loaded libkrun
         smolvm::process::install_sigchld_handler();
 
+        let packed_layer_digests: Vec<String> = manifest
+            .assets
+            .layers
+            .iter()
+            .map(|layer| layer.digest.clone())
+            .collect();
         let console_log_path = runtime_dir.path().join("console.log");
         let vsock_path_clone = vsock_path.clone();
         let child_pid = smolvm::process::fork_session_leader(move || {
@@ -356,6 +362,7 @@ impl PackRunCmd {
                 storage_path: &storage_path,
                 vsock_socket: &vsock_path_clone,
                 layers_dir: &layers_dir,
+                layer_digests: &packed_layer_digests,
                 mounts: &packed_mounts,
                 port_mappings: &port_mappings,
                 resources,
@@ -1138,6 +1145,12 @@ fn run_from_cache(
 
     smolvm::process::install_sigchld_handler();
 
+    let packed_layer_digests: Vec<String> = manifest
+        .assets
+        .layers
+        .iter()
+        .map(|layer| layer.digest.clone())
+        .collect();
     let console_log_path = runtime_dir.path().join("console.log");
     let vsock_path_clone = vsock_path.clone();
     let child_pid = smolvm::process::fork_session_leader(move || {
@@ -1154,6 +1167,7 @@ fn run_from_cache(
             storage_path: &storage_path,
             vsock_socket: &vsock_path_clone,
             layers_dir: &layers_dir,
+            layer_digests: &packed_layer_digests,
             mounts: &packed_mounts,
             port_mappings: &port_mappings,
             resources,
@@ -1472,6 +1486,12 @@ fn daemon_start(
     // Fork child → launch VM
     smolvm::process::install_sigchld_handler();
 
+    let packed_layer_digests: Vec<String> = manifest
+        .assets
+        .layers
+        .iter()
+        .map(|layer| layer.digest.clone())
+        .collect();
     let console_log_path = daemon.join("console.log");
     let vsock_path_clone = vsock_path.clone();
     let child_pid = smolvm::process::fork_session_leader(move || {
@@ -1488,6 +1508,7 @@ fn daemon_start(
             storage_path: &storage_path,
             vsock_socket: &vsock_path_clone,
             layers_dir: &layers_dir,
+            layer_digests: &packed_layer_digests,
             mounts: &packed_mounts,
             port_mappings: &port_mappings,
             resources,

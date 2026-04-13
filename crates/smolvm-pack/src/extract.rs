@@ -118,6 +118,82 @@ fn normalize_path(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
+/// Repair executable mode bits in the extracted agent rootfs.
+///
+/// Some host-side rootfs builds on macOS produce package-installed binaries
+/// with their execute bits stripped in the source tree that gets packed.
+/// Packed execution depends on tools such as `crun`, `resize2fs`, and `e2fsck`
+/// being runnable inside the VM. Without execute bits, packed runs fail with
+/// `Permission denied (os error 13)` before the container command is entered.
+///
+/// We repair this narrowly by restoring `0755` on regular files under the
+/// standard executable directories. This keeps the fix local to packed-runtime
+/// extraction and avoids touching non-executable data paths.
+#[cfg(unix)]
+fn repair_agent_rootfs_exec_bits(rootfs_dir: &Path, debug: bool) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const EXEC_DIRS: &[&str] = &[
+        "bin",
+        "sbin",
+        "usr/bin",
+        "usr/sbin",
+        "usr/local/bin",
+        "usr/local/sbin",
+    ];
+
+    let mut repaired = 0usize;
+    let mut stack = Vec::new();
+    for rel in EXEC_DIRS {
+        let dir = rootfs_dir.join(rel);
+        if dir.is_dir() {
+            stack.push(dir);
+        }
+    }
+
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let metadata = fs::metadata(&path)?;
+            let current_mode = metadata.permissions().mode();
+            if current_mode & 0o111 != 0 {
+                continue;
+            }
+
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms)?;
+            repaired += 1;
+        }
+    }
+
+    if debug && repaired > 0 {
+        eprintln!(
+            "debug: repaired execute bits for {} packed rootfs files",
+            repaired
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn repair_agent_rootfs_exec_bits(_rootfs_dir: &Path, _debug: bool) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Marker file indicating extraction is complete.
 const EXTRACTION_MARKER: &str = ".smolvm-extracted";
 
@@ -346,6 +422,7 @@ fn post_process_extraction(cache_dir: &Path, debug: bool) -> std::io::Result<()>
         let tar_file = File::open(&rootfs_tar)?;
         let mut archive = tar::Archive::new(tar_file);
         safe_unpack(&mut archive, &rootfs_dir)?;
+        repair_agent_rootfs_exec_bits(&rootfs_dir, debug)?;
     }
 
     // Extract OCI layer tars to layers/{digest}/ directories
