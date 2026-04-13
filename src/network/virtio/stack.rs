@@ -9,6 +9,7 @@
 //! - receives raw Ethernet frames coming out of libkrun
 //! - feeds them into smoltcp as if smolvm were the guest's next-hop gateway
 //! - forwards or filters guest DNS queries at the gateway
+//! - relays guest UDP flows to host `UdpSocket`s
 //! - relays guest TCP streams to host `TcpStream`s
 //!
 //! Conceptually, it plays the role of a tiny virtual router/NAT-side gateway:
@@ -21,7 +22,7 @@
 //!   -> protocol-specific handling:
 //!        - TCP  -> host relay threads
 //!        - DNS  -> in-process allowlist filter or host UDP forward
-//!        - other supported egress -> future phases
+//!        - UDP  -> host UDP relay threads
 //!   -> outbound network
 //! ```
 //!
@@ -35,7 +36,7 @@
 //!   -> protocol-specific side effects
 //!        - TCP SYN  -> create relay/socket state or drop by CIDR policy
 //!        - DNS UDP  -> gateway DNS handling
-//!        - other UDP-> drop for now
+//!        - UDP  -> relay through host `UdpSocket`s
 //!   -> smoltcp egress
 //!   -> host_to_guest queue
 //!   -> FrameStream writer
@@ -45,7 +46,7 @@
 //!
 //! ```text
 //! new guest frame         -> guest_wake  -> poll loop
-//! host relay has data     -> relay_wake  -> poll loop
+//! host TCP/UDP relay data -> relay_wake  -> poll loop
 //! published host connect  -> relay_wake  -> poll loop
 //! smoltcp emitted frames  -> host_wake   -> frame writer
 //! ```
@@ -53,10 +54,10 @@
 //! Important limitation of the current MVP:
 //! - TCP is supported via host relay threads
 //! - DNS is supported via a gateway UDP socket plus host UDP forwarding
+//! - non-DNS UDP is supported via host UDP relay threads
 //! - published TCP ports are supported by accepting host sockets and creating
 //!   guest-facing smoltcp connections
 //! - CIDR and DNS hostname policy are enforced in-process
-//! - other UDP is intentionally dropped
 //!
 //! There is no single shell command equivalent for this module. The closest
 //! operational mental model is "userspace network stack + gateway daemon".
@@ -67,6 +68,7 @@ use crate::network::virtio::device::VirtioNetworkDevice;
 use crate::network::virtio::publisher::AcceptedPublishedConnection;
 use crate::network::virtio::queues::NetworkFrameQueues;
 use crate::network::virtio::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
+use crate::network::virtio::udp_relay::UdpRelayTable;
 use smoltcp::iface::{
     Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
 };
@@ -114,7 +116,10 @@ enum FrameAction {
         destination: SocketAddr,
     },
     DnsQuery,
-    UnsupportedUdp,
+    UdpDatagram {
+        source: SocketAddr,
+        destination: SocketAddr,
+    },
     Passthrough,
 }
 
@@ -164,7 +169,7 @@ fn run_network_stack(
     // 2. Pre-classify them so we can create relay/socket state before smoltcp
     //    consumes the frame.
     // 3. Poll smoltcp ingress/egress.
-    // 4. Forward DNS and relay TCP payloads.
+    // 4. Forward DNS plus relay TCP and UDP payloads.
     // 5. Sleep in poll(2) on wake pipes until guest frames, relay activity, or
     //    timers require more work.
     //
@@ -182,10 +187,11 @@ fn run_network_stack(
     let dns_socket_handle = add_dns_socket(&mut sockets, config.gateway_ipv4);
     let relay_wake = Arc::new(queues.relay_wake.clone());
     let mut relays = TcpRelayTable::new(None);
+    let mut udp_relays = UdpRelayTable::new(None, None);
 
     // The smoltcp loop is driven by fd-based wakeups rather than busy spinning.
     // guest_wake  -> new guest frame or shutdown
-    // relay_wake  -> host TCP relay thread produced data or shutdown
+    // relay_wake  -> host TCP/UDP relay thread produced data or shutdown
     let mut poll_fds = [
         libc::pollfd {
             fd: queues.guest_wake.as_raw_fd(),
@@ -201,17 +207,21 @@ fn run_network_stack(
 
     loop {
         if queues.is_shutting_down() {
-            return;
+            break;
         }
         let now = smoltcp_now(clock);
 
         while let Some(frame) = device.stage_next_frame() {
             // We inspect the frame before giving it to smoltcp because certain
             // flows need side effects first:
-            // - TCP SYN: pre-create a matching smoltcp socket + relay entry
-            // - DNS UDP: allow through for gateway-side forwarding
-            // - other UDP: currently unsupported in the MVP
-            match classify_guest_frame(frame) {
+            // - TCP SYN to a remote IP: pre-create a matching smoltcp socket
+            //   + relay entry
+            // - DNS UDP to the gateway: allow through for gateway-side
+            //   forwarding
+            // - other UDP to remote IPs: pre-create UDP relay state
+            // - traffic addressed to the gateway itself: keep it on the local
+            //   gateway path
+            match classify_guest_frame(frame, config.gateway_ipv4) {
                 FrameAction::TcpSyn {
                     source,
                     destination,
@@ -247,11 +257,34 @@ fn run_network_stack(
                         device.drop_staged_frame();
                     }
                 }
-                FrameAction::UnsupportedUdp => {
-                    // Phase 1 only supports DNS over UDP. Other UDP traffic is
-                    // intentionally dropped until a general UDP relay exists.
-                    eprintln!("virtio-net: dropping unsupported guest UDP datagram");
-                    device.drop_staged_frame();
+                FrameAction::UdpDatagram {
+                    source,
+                    destination,
+                } => {
+                    tracing::debug!(
+                        source = %source,
+                        destination = %destination,
+                        "virtio-net: guest UDP datagram received"
+                    );
+                    if !policy.allows_ip(destination.ip()) {
+                        tracing::warn!(
+                            source = %source,
+                            destination = %destination,
+                            "dropping guest UDP datagram because destination is blocked by policy"
+                        );
+                        device.drop_staged_frame();
+                        continue;
+                    }
+                    if !udp_relays.ensure_socket(destination, &mut sockets) {
+                        device.drop_staged_frame();
+                        continue;
+                    }
+                    if matches!(
+                        interface.poll_ingress_single(now, &mut device, &mut sockets),
+                        PollIngressSingleResult::None
+                    ) {
+                        device.drop_staged_frame();
+                    }
                 }
             }
         }
@@ -274,7 +307,9 @@ fn run_network_stack(
         // Move payloads between established smoltcp TCP sockets and host relay
         // threads, and service the DNS gateway socket.
         relays.relay_data(&mut sockets);
+        udp_relays.relay_guest_datagrams(&mut sockets, &relay_wake);
         process_dns_queries(dns_socket_handle, &policy, &mut sockets);
+        udp_relays.relay_host_datagrams(&mut sockets);
 
         // Once the guest-side TCP handshake is established inside smoltcp, we
         // can spawn the corresponding host relay thread.
@@ -290,6 +325,7 @@ fn run_network_stack(
         }
 
         relays.cleanup_closed(&mut sockets);
+        udp_relays.cleanup_idle(&mut sockets);
 
         // Second egress pass: DNS responses or relay data may have queued more
         // packets for the guest.
@@ -302,12 +338,18 @@ fn run_network_stack(
             .unwrap_or(DEFAULT_IDLE_TIMEOUT_MS);
 
         // SAFETY: both pollfds contain valid wake-pipe descriptors.
-        unsafe {
+        let poll_result = unsafe {
             libc::poll(
                 poll_fds.as_mut_ptr(),
                 poll_fds.len() as libc::nfds_t,
                 timeout_ms,
-            );
+            )
+        };
+        if poll_result < 0 {
+            let err = std::io::Error::last_os_error();
+            tracing::warn!(error = %err, "virtio-net poll loop failed while waiting for work");
+            queues.begin_shutdown();
+            break;
         }
 
         if poll_fds[0].revents & libc::POLLIN != 0 {
@@ -316,7 +358,22 @@ fn run_network_stack(
         if poll_fds[1].revents & libc::POLLIN != 0 {
             queues.relay_wake.drain();
         }
+
+        if poll_fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            tracing::debug!(
+                revents = poll_fds[0].revents,
+                "virtio-net guest wake pipe returned a terminal poll state"
+            );
+        }
+        if poll_fds[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            tracing::debug!(
+                revents = poll_fds[1].revents,
+                "virtio-net relay wake pipe returned a terminal poll state"
+            );
+        }
     }
+
+    log_shutdown_summary(&relays, &udp_relays);
 }
 
 fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig) -> Interface {
@@ -546,15 +603,16 @@ fn smoltcp_now(start: StdInstant) -> Instant {
     Instant::from_micros(start.elapsed().as_micros() as i64)
 }
 
-fn classify_guest_frame(frame: &[u8]) -> FrameAction {
+fn classify_guest_frame(frame: &[u8], gateway_ipv4: Ipv4Addr) -> FrameAction {
     // This pre-parser is intentionally shallow. It only looks far enough to
     // decide whether the poll loop needs special handling before smoltcp sees
     // the frame.
     //
     // Current policy:
-    // - TCP SYN  -> create relay/socket state before ingress
-    // - UDP/53   -> allow as DNS
-    // - other UDP-> drop in Phase 1
+    // - TCP SYN to non-gateway IP -> create relay/socket state before ingress
+    // - UDP to gateway:53         -> allow as DNS
+    // - UDP to non-gateway IP     -> create UDP relay state before ingress
+    // - traffic to the gateway IP -> stay local to the gateway stack
     // - anything else -> normal smoltcp ingress path
     let Ok(ethernet) = EthernetFrame::new_checked(frame) else {
         return FrameAction::Passthrough;
@@ -569,18 +627,40 @@ fn classify_guest_frame(frame: &[u8]) -> FrameAction {
     };
 
     match ipv4.next_header() {
-        smoltcp::wire::IpProtocol::Tcp => {
-            classify_tcp(ipv4.payload(), ipv4.src_addr(), ipv4.dst_addr())
-        }
-        smoltcp::wire::IpProtocol::Udp => classify_udp(ipv4.payload()),
+        smoltcp::wire::IpProtocol::Tcp => classify_tcp(
+            ipv4.payload(),
+            ipv4.src_addr(),
+            ipv4.dst_addr(),
+            gateway_ipv4,
+        ),
+        smoltcp::wire::IpProtocol::Udp => classify_udp(
+            ipv4.payload(),
+            ipv4.src_addr(),
+            ipv4.dst_addr(),
+            gateway_ipv4,
+        ),
         _ => FrameAction::Passthrough,
     }
 }
 
-fn classify_tcp(payload: &[u8], source: Ipv4Addr, destination: Ipv4Addr) -> FrameAction {
+fn classify_tcp(
+    payload: &[u8],
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    gateway_ipv4: Ipv4Addr,
+) -> FrameAction {
     // New outgoing guest TCP connections are identified by the initial
     // SYN-without-ACK packet. That is the moment where we need a matching
     // smoltcp socket and later a host relay thread.
+    //
+    // Traffic addressed to the gateway itself is not treated as an outbound
+    // relay candidate. That stays on the local gateway path so the guest sees
+    // a normal local reset/port-unreachable response instead of a bogus host
+    // connect attempt to the gateway IP.
+    if destination == gateway_ipv4 {
+        return FrameAction::Passthrough;
+    }
+
     let Ok(tcp) = TcpPacket::new_checked(payload) else {
         return FrameAction::Passthrough;
     };
@@ -595,13 +675,20 @@ fn classify_tcp(payload: &[u8], source: Ipv4Addr, destination: Ipv4Addr) -> Fram
     }
 }
 
-fn classify_udp(payload: &[u8]) -> FrameAction {
-    // Phase 1 treats DNS as the only supported guest UDP protocol.
+fn classify_udp(
+    payload: &[u8],
+    source: Ipv4Addr,
+    destination: Ipv4Addr,
+    gateway_ipv4: Ipv4Addr,
+) -> FrameAction {
+    // Guest DNS is special because the guest points `/etc/resolv.conf` at the
+    // gateway itself. Everything else addressed to a non-gateway destination is
+    // forwarded through the general UDP relay.
     let Ok(udp) = UdpPacket::new_checked(payload) else {
         return FrameAction::Passthrough;
     };
 
-    if udp.dst_port() == DNS_SOCKET_PORT {
+    if destination == gateway_ipv4 && udp.dst_port() == DNS_SOCKET_PORT {
         eprintln!(
             "virtio-net: guest DNS UDP datagram received src_port={} dst_port={} payload_len={}",
             udp.src_port(),
@@ -609,7 +696,26 @@ fn classify_udp(payload: &[u8]) -> FrameAction {
             udp.payload().len()
         );
         FrameAction::DnsQuery
+    } else if destination == gateway_ipv4 {
+        FrameAction::Passthrough
     } else {
-        FrameAction::UnsupportedUdp
+        FrameAction::UdpDatagram {
+            source: SocketAddr::new(source.into(), udp.src_port()),
+            destination: SocketAddr::new(destination.into(), udp.dst_port()),
+        }
     }
+}
+
+fn log_shutdown_summary(relays: &TcpRelayTable, udp_relays: &UdpRelayTable) {
+    let udp_stats = udp_relays.stats();
+    eprintln!(
+        "virtio-net: poll loop stopped active_tcp_relays={} active_udp_flows={} active_udp_sockets={} guest_udp_forwarded={} host_udp_forwarded={} guest_udp_dropped={} host_udp_dropped={}",
+        relays.active_connection_count(),
+        udp_relays.active_flow_count(),
+        udp_relays.active_socket_count(),
+        udp_stats.guest_datagrams_forwarded,
+        udp_stats.host_datagrams_forwarded,
+        udp_stats.guest_datagrams_dropped,
+        udp_stats.host_datagrams_dropped,
+    );
 }

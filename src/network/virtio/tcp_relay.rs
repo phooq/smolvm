@@ -450,6 +450,11 @@ impl TcpRelayTable {
         });
     }
 
+    /// Number of active guest TCP relay entries currently tracked by the poll loop.
+    pub fn active_connection_count(&self) -> usize {
+        self.connections.len()
+    }
+
     fn allocate_published_port(&mut self) -> Option<u16> {
         let start = self.next_published_port;
 

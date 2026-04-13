@@ -8,6 +8,7 @@
 //! - the Unix-stream writer thread
 //! - the smoltcp poll loop
 //! - TCP relay threads
+//! - UDP relay threads
 //!
 //! They need two kinds of coordination:
 //! 1. lock-free frame handoff between threads
@@ -25,7 +26,7 @@
 //!
 //! guest_wake: reader thread / shutdown -> smoltcp poll loop
 //! host_wake : smoltcp runtime / shutdown -> Unix-stream writer
-//! relay_wake: TCP relay threads / shutdown -> smoltcp poll loop
+//! relay_wake: TCP relay threads / UDP relay threads / shutdown -> smoltcp poll loop
 //! ```
 //!
 //! Thread interaction view:
@@ -46,6 +47,10 @@
 //!   -> host_to_guest.pop()
 //!
 //! TCP relay thread
+//!   -> to_smoltcp.send(payload)
+//!   -> relay_wake.wake()
+//!
+//! UDP relay thread
 //!   -> to_smoltcp.send(payload)
 //!   -> relay_wake.wake()
 //! ```
@@ -83,7 +88,7 @@ pub struct NetworkFrameQueues {
     pub guest_wake: WakePipe,
     /// Wake the libkrun writer thread when a host frame is ready.
     pub host_wake: WakePipe,
-    /// Wake the smoltcp poll loop when a TCP relay thread has new data.
+    /// Wake the smoltcp poll loop when a TCP or UDP relay thread has new data.
     pub relay_wake: WakePipe,
     /// Signals that the helper process should shut down.
     shutting_down: AtomicBool,
