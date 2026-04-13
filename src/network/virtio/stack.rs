@@ -8,7 +8,7 @@
 //! `smolvm-agent`. Instead, this module:
 //! - receives raw Ethernet frames coming out of libkrun
 //! - feeds them into smoltcp as if smolvm were the guest's next-hop gateway
-//! - forwards guest DNS queries to a host UDP socket
+//! - forwards or filters guest DNS queries at the gateway
 //! - relays guest TCP streams to host `TcpStream`s
 //!
 //! Conceptually, it plays the role of a tiny virtual router/NAT-side gateway:
@@ -20,7 +20,7 @@
 //!   -> smoltcp Interface (gateway MAC/IP)
 //!   -> protocol-specific handling:
 //!        - TCP  -> host relay threads
-//!        - DNS  -> host UDP socket
+//!        - DNS  -> in-process allowlist filter or host UDP forward
 //!        - other supported egress -> future phases
 //!   -> outbound network
 //! ```
@@ -33,8 +33,8 @@
 //!   -> classify_guest_frame()
 //!   -> smoltcp ingress
 //!   -> protocol-specific side effects
-//!        - TCP SYN  -> create relay/socket state
-//!        - DNS UDP  -> gateway UDP socket
+//!        - TCP SYN  -> create relay/socket state or drop by CIDR policy
+//!        - DNS UDP  -> gateway DNS handling
 //!        - other UDP-> drop for now
 //!   -> smoltcp egress
 //!   -> host_to_guest queue
@@ -55,13 +55,14 @@
 //! - DNS is supported via a gateway UDP socket plus host UDP forwarding
 //! - published TCP ports are supported by accepting host sockets and creating
 //!   guest-facing smoltcp connections
+//! - CIDR and DNS hostname policy are enforced in-process
 //! - other UDP is intentionally dropped
-//! - there is still no policy engine
 //!
 //! There is no single shell command equivalent for this module. The closest
 //! operational mental model is "userspace network stack + gateway daemon".
 
 use crate::data::network::DEFAULT_DNS_ADDR;
+use crate::network::policy::{LaunchEgressPolicy, ResolvedEgressPolicy};
 use crate::network::virtio::device::VirtioNetworkDevice;
 use crate::network::virtio::publisher::AcceptedPublishedConnection;
 use crate::network::virtio::queues::NetworkFrameQueues;
@@ -130,20 +131,32 @@ pub fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     published_connections: Option<Receiver<AcceptedPublishedConnection>>,
+    policy: LaunchEgressPolicy,
 ) -> std::io::Result<JoinHandle<()>> {
     eprintln!(
         "virtio-net: spawning poll thread guest_ip={} gateway_ip={} mtu={}",
         config.guest_ipv4, config.gateway_ipv4, config.mtu
     );
+    let upstream_dns = match DEFAULT_DNS_ADDR {
+        std::net::IpAddr::V4(ip) => ip,
+        std::net::IpAddr::V6(_) => {
+            return Err(std::io::Error::other(
+                "virtio DNS policy currently requires an IPv4 upstream resolver",
+            ));
+        }
+    };
+    let policy =
+        ResolvedEgressPolicy::compile(policy, upstream_dns).map_err(std::io::Error::other)?;
     thread::Builder::new()
         .name("smolvm-net-poll".into())
-        .spawn(move || run_network_stack(queues, config, published_connections))
+        .spawn(move || run_network_stack(queues, config, published_connections, policy))
 }
 
 fn run_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     mut published_connections: Option<Receiver<AcceptedPublishedConnection>>,
+    policy: ResolvedEgressPolicy,
 ) {
     // Poll loop overview:
     //
@@ -207,6 +220,15 @@ fn run_network_stack(
                         "virtio-net: guest TCP SYN source={} destination={}",
                         source, destination
                     );
+                    if !policy.allows_ip(destination.ip()) {
+                        tracing::warn!(
+                            source = %source,
+                            destination = %destination,
+                            "dropping guest TCP SYN because destination is blocked by policy"
+                        );
+                        device.drop_staged_frame();
+                        continue;
+                    }
                     if !relays.has_socket_for(&source, &destination) {
                         relays.create_tcp_socket(source, destination, &mut sockets);
                     }
@@ -252,7 +274,7 @@ fn run_network_stack(
         // Move payloads between established smoltcp TCP sockets and host relay
         // threads, and service the DNS gateway socket.
         relays.relay_data(&mut sockets);
-        process_dns_queries(dns_socket_handle, &mut sockets);
+        process_dns_queries(dns_socket_handle, &policy, &mut sockets);
 
         // Once the guest-side TCP handshake is established inside smoltcp, we
         // can spawn the corresponding host relay thread.
@@ -406,7 +428,11 @@ fn drain_published_connections(
     }
 }
 
-fn process_dns_queries(dns_socket_handle: SocketHandle, sockets: &mut SocketSet<'_>) {
+fn process_dns_queries(
+    dns_socket_handle: SocketHandle,
+    policy: &ResolvedEgressPolicy,
+    sockets: &mut SocketSet<'_>,
+) {
     // Phase 1 DNS model:
     // guest UDP/53 -> smoltcp gateway socket -> host UDP socket -> upstream DNS
     //               <-               response bytes               <-
@@ -428,11 +454,21 @@ fn process_dns_queries(dns_socket_handle: SocketHandle, sockets: &mut SocketSet<
             query.len(),
             upstream_dns
         );
-        let response = match forward_dns_query(upstream_dns, query) {
-            Ok(response) => response,
-            Err(err) => {
-                eprintln!("virtio-net: host DNS forwarding failed error={}", err);
-                continue;
+        let response = if policy.has_dns_filter() {
+            eprintln!(
+                "virtio-net: filtering guest DNS query against hostname allowlist query_len={}",
+                query.len()
+            );
+            policy
+                .filter_dns_query(query)
+                .expect("dns filter should be present when has_dns_filter() is true")
+        } else {
+            match forward_dns_query(upstream_dns, query) {
+                Ok(response) => response,
+                Err(err) => {
+                    eprintln!("virtio-net: host DNS forwarding failed error={}", err);
+                    continue;
+                }
             }
         };
         eprintln!(

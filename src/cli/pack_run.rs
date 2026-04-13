@@ -16,7 +16,7 @@ use smolvm::agent::launcher_dynamic::{
 use smolvm::agent::{AgentClient, RunConfig, VmResources};
 use smolvm::data::network::PortMapping;
 use smolvm::data::storage::HostMount;
-use smolvm::network::{plan_launch_network, NetworkBackend};
+use smolvm::network::NetworkBackend;
 use smolvm::Error;
 use smolvm::DEFAULT_SHELL_CMD;
 use smolvm_pack::detect::PackedMode;
@@ -30,21 +30,6 @@ use std::time::Duration;
 
 /// Timeout waiting for the agent to become ready.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn warn_backend_fallback(
-    requested_backend: Option<NetworkBackend>,
-    resources: &VmResources,
-    port_count: usize,
-) {
-    if requested_backend != Some(NetworkBackend::VirtioNet) {
-        return;
-    }
-
-    let plan = plan_launch_network(resources, None, port_count);
-    if let Some(reason) = plan.fallback_reason {
-        eprintln!("warning: {}", reason.user_message());
-    }
-}
 
 fn validate_network_backend_request(
     requested_backend: Option<NetworkBackend>,
@@ -363,7 +348,6 @@ impl PackRunCmd {
             overlay_gib: self.overlay,
             allowed_cidrs: None,
         };
-        warn_backend_fallback(self.net_backend, &resources, self.port.len());
 
         // Build packed mounts for the launcher
         let packed_mounts = mounts_to_packed(&mounts);
@@ -1187,7 +1171,6 @@ fn run_from_cache(
         overlay_gib: args.overlay,
         allowed_cidrs: None,
     };
-    warn_backend_fallback(args.net_backend, &resources, args.port.len());
 
     let packed_mounts = mounts_to_packed(&mounts);
 
@@ -1507,7 +1490,6 @@ fn daemon_start(
         overlay_gib: args.overlay,
         allowed_cidrs: None,
     };
-    warn_backend_fallback(args.net_backend, &resources, args.port.len());
 
     let packed_mounts = mounts_to_packed(&mounts);
 

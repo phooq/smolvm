@@ -52,14 +52,14 @@
 //! In Phase 1 this runtime is responsible for:
 //! - exchanging raw Ethernet frames with libkrun
 //! - presenting a gateway endpoint to the guest
-//! - handling DNS through a gateway UDP socket and host UDP forwarding
+//! - handling DNS through a gateway UDP socket, with optional hostname filtering
 //! - relaying guest TCP connections to host `TcpStream`s
 //! - accepting published host TCP ports and forwarding them into guest TCP
 //!   connections
+//! - enforcing CIDR-based egress policy for guest TCP destinations
 //!
 //! What is *not* here yet:
 //! - non-DNS UDP relay
-//! - policy enforcement / DNS filtering
 //! - TLS MITM or deeper packet rewriting
 //!
 //! So this module is the host data plane, but not yet the full user-visible
@@ -74,6 +74,7 @@ pub mod tcp_relay;
 
 use crate::data::network::PortMapping;
 use crate::network::addressing::GuestNetworkConfig;
+use crate::network::policy::LaunchEgressPolicy;
 use crate::network::virtio::frame_stream::{start_frame_stream_bridge, FrameStreamBridge};
 use crate::network::virtio::publisher::{accepted_connection_channel, PublishedPortListeners};
 use crate::network::virtio::queues::{NetworkFrameQueues, DEFAULT_FRAME_QUEUE_CAPACITY};
@@ -109,6 +110,8 @@ pub struct VirtioNetworkRuntime {
 ///   NIC.
 /// - `published_ports`: host->guest TCP port mappings that should be serviced
 ///   directly by the virtio runtime instead of TSI.
+/// - `policy`: CIDR and DNS hostname restrictions enforced inside the virtio
+///   runtime.
 ///
 /// High-level flow:
 ///
@@ -146,6 +149,7 @@ pub fn start_virtio_network(
     host_fd: RawFd,
     guest_network: GuestNetworkConfig,
     published_ports: &[PortMapping],
+    policy: LaunchEgressPolicy,
 ) -> io::Result<VirtioNetworkRuntime> {
     eprintln!(
         "virtio-net: starting runtime host_fd={} guest_ip={} gateway_ip={} dns_server={}",
@@ -173,6 +177,7 @@ pub fn start_virtio_network(
             mtu: 1500,
         },
         published_ports.as_ref().map(|_| accepted_rx),
+        policy,
     )?;
 
     Ok(VirtioNetworkRuntime {
