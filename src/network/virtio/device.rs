@@ -122,7 +122,8 @@ impl VirtioNetworkDevice {
     /// Drop the currently staged guest frame.
     ///
     /// This is used when the poll loop decides not to pass a frame into
-    /// smoltcp, for example when the MVP intentionally drops unsupported UDP.
+    /// smoltcp, for example when policy rejects a guest destination before the
+    /// frame should enter the gateway stack.
     pub fn drop_staged_frame(&mut self) {
         self.staged_guest_frame = None;
     }

@@ -36,7 +36,8 @@
 //!    ├─ VirtioNetworkDevice
 //!    ├─ smoltcp Interface
 //!    ├─ SocketSet
-//!    └─ TcpRelayTable
+//!    ├─ TcpRelayTable
+//!    └─ UdpRelayTable
 //! ```
 //!
 //! Component roles:
@@ -48,18 +49,19 @@
 //! - `VirtioNetworkDevice`: adapts those queues to smoltcp's `phy::Device`
 //! - poll thread: acts as the guest-visible gateway and protocol dispatcher
 //! - `TcpRelayTable`: maps guest TCP flows onto host-side relay threads
+//! - `UdpRelayTable`: maps guest UDP flows onto host-side UDP relay threads
 //!
 //! In Phase 1 this runtime is responsible for:
 //! - exchanging raw Ethernet frames with libkrun
 //! - presenting a gateway endpoint to the guest
 //! - handling DNS through a gateway UDP socket, with optional hostname filtering
+//! - relaying guest UDP traffic to host `UdpSocket`s
 //! - relaying guest TCP connections to host `TcpStream`s
 //! - accepting published host TCP ports and forwarding them into guest TCP
 //!   connections
-//! - enforcing CIDR-based egress policy for guest TCP destinations
+//! - enforcing CIDR-based egress policy for guest TCP and UDP destinations
 //!
 //! What is *not* here yet:
-//! - non-DNS UDP relay
 //! - TLS MITM or deeper packet rewriting
 //!
 //! So this module is the host data plane, but not yet the full user-visible
@@ -71,6 +73,7 @@ pub mod publisher;
 pub mod queues;
 pub mod stack;
 pub mod tcp_relay;
+pub mod udp_relay;
 
 use crate::data::network::PortMapping;
 use crate::network::addressing::GuestNetworkConfig;
