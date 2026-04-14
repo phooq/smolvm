@@ -26,6 +26,8 @@
 //! │  └─ writer thread
 //! ├─ PublishedPortListeners
 //! │  └─ one non-blocking accept loop per `-p HOST:GUEST`
+//! ├─ PublishedUdpListeners
+//! │  └─ one non-blocking datagram loop per `-p HOST:GUEST/udp`
 //! ├─ Arc<NetworkFrameQueues>
 //! │  ├─ guest_to_host
 //! │  ├─ host_to_guest
@@ -45,11 +47,15 @@
 //!   queue operations
 //! - `PublishedPortListeners`: accepts host TCP connections for published ports
 //!   and hands them to the poll loop
+//! - `PublishedUdpListeners`: receives host UDP datagrams for published UDP
+//!   ports and routes guest replies back through the same host port
 //! - `NetworkFrameQueues`: handoff boundary between threads
 //! - `VirtioNetworkDevice`: adapts those queues to smoltcp's `phy::Device`
 //! - poll thread: acts as the guest-visible gateway and protocol dispatcher
 //! - `TcpRelayTable`: maps guest TCP flows onto host-side relay threads
 //! - `UdpRelayTable`: maps guest UDP flows onto host-side UDP relay threads
+//! - `PublishedUdpTable`: maps host-originated UDP peers onto guest-facing
+//!   smoltcp UDP sockets
 //!
 //! In Phase 1 this runtime is responsible for:
 //! - exchanging raw Ethernet frames with libkrun
@@ -59,6 +65,8 @@
 //! - relaying guest TCP connections to host `TcpStream`s
 //! - accepting published host TCP ports and forwarding them into guest TCP
 //!   connections
+//! - accepting published host UDP datagrams and forwarding them into guest UDP
+//!   sockets
 //! - enforcing CIDR-based egress policy for guest TCP and UDP destinations
 //!
 //! What is *not* here yet:
@@ -73,13 +81,17 @@ pub mod publisher;
 pub mod queues;
 pub mod stack;
 pub mod tcp_relay;
+pub mod udp_publisher;
 pub mod udp_relay;
 
 use crate::data::network::PortMapping;
 use crate::network::addressing::GuestNetworkConfig;
 use crate::network::policy::LaunchEgressPolicy;
 use crate::network::virtio::frame_stream::{start_frame_stream_bridge, FrameStreamBridge};
-use crate::network::virtio::publisher::{accepted_connection_channel, PublishedPortListeners};
+use crate::network::virtio::publisher::{
+    accepted_connection_channel, published_udp_datagram_channel, PublishedPortListeners,
+    PublishedUdpListeners,
+};
 use crate::network::virtio::queues::{NetworkFrameQueues, DEFAULT_FRAME_QUEUE_CAPACITY};
 use crate::network::virtio::stack::{start_network_stack, VirtioPollConfig};
 use std::io;
@@ -100,6 +112,7 @@ pub struct VirtioNetworkRuntime {
     queues: std::sync::Arc<NetworkFrameQueues>,
     _frame_bridge: FrameStreamBridge,
     published_ports: Option<PublishedPortListeners>,
+    published_udp_ports: Option<PublishedUdpListeners>,
     poll_handle: Option<JoinHandle<()>>,
 }
 
@@ -111,8 +124,8 @@ pub struct VirtioNetworkRuntime {
 ///   `krun_add_net_unixstream()` setup path.
 /// - `guest_network`: the static guest/gateway addressing and MAC plan for this
 ///   NIC.
-/// - `published_ports`: host->guest TCP port mappings that should be serviced
-///   directly by the virtio runtime instead of TSI.
+/// - `published_ports`: host->guest published port mappings that should be
+///   serviced directly by the virtio runtime instead of TSI.
 /// - `policy`: CIDR and DNS hostname restrictions enforced inside the virtio
 ///   runtime.
 ///
@@ -137,6 +150,9 @@ pub struct VirtioNetworkRuntime {
 ///   -> PublishedPortListeners
 ///      -> accept host TcpStreams
 ///      -> send them to the poll loop over a bounded channel
+///   -> PublishedUdpListeners
+///      -> receive host UDP datagrams
+///      -> send them to the poll loop over a bounded channel
 ///   -> NetworkFrameQueues
 ///   -> start_network_stack(...)
 ///      -> poll thread owns smoltcp Interface + sockets
@@ -147,11 +163,12 @@ pub struct VirtioNetworkRuntime {
 /// - guest->host Ethernet frames start flowing into the queues
 /// - host->guest Ethernet frames emitted by smoltcp are written back to libkrun
 /// - published host TCP connections can be forwarded toward guest listeners
+/// - published host UDP datagrams can be forwarded toward guest UDP sockets
 /// - the poll loop starts acting as the guest-visible gateway
 pub fn start_virtio_network(
     host_fd: RawFd,
     guest_network: GuestNetworkConfig,
-    published_ports: &[PortMapping],
+    port_mappings: &[PortMapping],
     policy: LaunchEgressPolicy,
 ) -> io::Result<VirtioNetworkRuntime> {
     eprintln!(
@@ -161,14 +178,26 @@ pub fn start_virtio_network(
     let queues = NetworkFrameQueues::shared(DEFAULT_FRAME_QUEUE_CAPACITY);
     let frame_bridge = start_frame_stream_bridge(host_fd, queues.clone())?;
     let (accepted_tx, accepted_rx) = accepted_connection_channel();
-    let published_ports = if published_ports.is_empty() {
-        None
-    } else {
+    let (udp_datagram_tx, udp_datagram_rx) = published_udp_datagram_channel();
+    let has_published_tcp = port_mappings.iter().any(|mapping| !mapping.is_udp());
+    let has_published_udp = port_mappings.iter().any(PortMapping::is_udp);
+    let published_ports = if has_published_tcp {
         Some(PublishedPortListeners::start(
-            published_ports,
+            port_mappings,
             accepted_tx,
             queues.relay_wake.clone(),
         )?)
+    } else {
+        None
+    };
+    let published_udp_ports = if has_published_udp {
+        Some(PublishedUdpListeners::start(
+            port_mappings,
+            udp_datagram_tx,
+            queues.relay_wake.clone(),
+        )?)
+    } else {
+        None
     };
     let poll_handle = start_network_stack(
         queues.clone(),
@@ -180,6 +209,21 @@ pub fn start_virtio_network(
             mtu: 1500,
         },
         published_ports.as_ref().map(|_| accepted_rx),
+        published_udp_ports.as_ref().map(|_| udp_datagram_rx),
+        published_udp_ports
+            .as_ref()
+            .map(|listeners| {
+                port_mappings
+                    .iter()
+                    .filter(|mapping| mapping.is_udp())
+                    .filter_map(|mapping| {
+                        listeners
+                            .reply_sender(mapping.host)
+                            .map(|tx| (mapping.host, tx))
+                    })
+                    .collect::<std::collections::HashMap<_, _>>()
+            })
+            .unwrap_or_default(),
         policy,
     )?;
 
@@ -187,6 +231,7 @@ pub fn start_virtio_network(
         queues,
         _frame_bridge: frame_bridge,
         published_ports,
+        published_udp_ports,
         poll_handle: Some(poll_handle),
     })
 }
@@ -200,6 +245,7 @@ impl Drop for VirtioNetworkRuntime {
     fn drop(&mut self) {
         self.queues.begin_shutdown();
         self.published_ports = None;
+        self.published_udp_ports = None;
         if let Some(handle) = self.poll_handle.take() {
             let _ = handle.join();
         }

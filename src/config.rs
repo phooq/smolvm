@@ -7,13 +7,36 @@
 //! For backward compatibility, `SmolvmConfig` maintains an in-memory cache of VMs
 //! and provides the same API as the old confy-based implementation.
 
-use crate::data::network::DEFAULT_DNS;
+use crate::data::network::{PortMapping, DEFAULT_DNS};
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
 use crate::error::Result;
 use crate::network::NetworkBackend;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredPortMapping {
+    Legacy((u16, u16)),
+    Current(PortMapping),
+}
+
+fn deserialize_port_mappings<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<PortMapping>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let stored = Vec::<StoredPortMapping>::deserialize(deserializer)?;
+    Ok(stored
+        .into_iter()
+        .map(|mapping| match mapping {
+            StoredPortMapping::Legacy((host, guest)) => PortMapping::new(host, guest),
+            StoredPortMapping::Current(mapping) => mapping,
+        })
+        .collect())
+}
 
 /// VM lifecycle state.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -347,9 +370,9 @@ pub struct VmRecord {
     #[serde(default)]
     pub mounts: Vec<(String, String, bool)>,
 
-    /// Port mappings (host_port, guest_port).
-    #[serde(default)]
-    pub ports: Vec<(u16, u16)>,
+    /// Port mappings.
+    #[serde(default, deserialize_with = "deserialize_port_mappings")]
+    pub ports: Vec<PortMapping>,
 
     /// Enable outbound network access (TSI).
     #[serde(default)]
@@ -452,7 +475,7 @@ impl VmRecord {
         cpus: u8,
         mem: u32,
         mounts: Vec<(String, String, bool)>,
-        ports: Vec<(u16, u16)>,
+        ports: Vec<PortMapping>,
         network: bool,
     ) -> Self {
         Self {
@@ -495,7 +518,7 @@ impl VmRecord {
         cpus: u8,
         mem: u32,
         mounts: Vec<(String, String, bool)>,
-        ports: Vec<(u16, u16)>,
+        ports: Vec<PortMapping>,
         network: bool,
         restart: RestartConfig,
     ) -> Self {
@@ -572,10 +595,7 @@ impl VmRecord {
 
     /// Convert stored ports to PortMapping format.
     pub fn port_mappings(&self) -> Vec<crate::data::network::PortMapping> {
-        self.ports
-            .iter()
-            .map(|(host, guest)| crate::data::network::PortMapping::new(*host, *guest))
-            .collect()
+        self.ports.clone()
     }
 
     /// Convert record fields to VmResources.
@@ -603,7 +623,7 @@ mod tests {
             2,
             512,
             vec![("/host".to_string(), "/guest".to_string(), false)],
-            vec![(8080, 80)],
+            vec![PortMapping::new(8080, 80)],
             false,
         );
 
@@ -611,6 +631,7 @@ mod tests {
         let deserialized: VmRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, record.name);
         assert_eq!(deserialized.mounts, record.mounts);
+        assert_eq!(deserialized.ports, record.ports);
     }
 
     #[test]

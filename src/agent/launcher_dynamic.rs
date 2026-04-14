@@ -6,6 +6,7 @@
 //!
 //! The static FFI path in `launcher.rs` remains untouched for normal operations.
 
+use crate::data::network::PortMapping;
 use crate::network::addressing::GuestNetworkConfig;
 use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::virtio::{start_virtio_network, VirtioNetworkRuntime};
@@ -200,8 +201,8 @@ pub struct PackedLaunchConfig<'a> {
     pub layers_dir: &'a Path,
     /// Volume mounts.
     pub mounts: &'a [PackedMount],
-    /// Port mappings (host, guest).
-    pub port_mappings: &'a [(u16, u16)],
+    /// Published port mappings.
+    pub port_mappings: &'a [PortMapping],
     /// VM resources.
     pub resources: VmResources,
     /// Debug logging.
@@ -313,6 +314,9 @@ pub fn launch_agent_vm_dynamic(
             None
         }
         EffectiveNetworkBackend::Tsi => {
+            if config.port_mappings.iter().any(|mapping| mapping.is_udp()) {
+                return Err("UDP published ports require --net-backend virtio".to_string());
+            }
             if unsafe { (krun.disable_implicit_vsock)(ctx) } < 0 {
                 free_ctx_on_err!("krun_disable_implicit_vsock failed");
             }
@@ -323,8 +327,9 @@ pub fn launch_agent_vm_dynamic(
             let port_cstrings: Vec<CString> = config
                 .port_mappings
                 .iter()
-                .map(|(host, guest)| {
-                    CString::new(format!("{}:{}", host, guest))
+                .filter(|mapping| !mapping.is_udp())
+                .map(|mapping| {
+                    CString::new(format!("{}:{}", mapping.host, mapping.guest))
                         .expect("port mapping cannot contain null bytes")
                 })
                 .collect();
@@ -390,19 +395,11 @@ pub fn launch_agent_vm_dynamic(
             } else {
                 let (host_fd, guest_fd) =
                     create_unix_stream_pair().map_err(|e| format!("socketpair failed: {e}"))?;
-                let port_mappings: Vec<crate::data::network::PortMapping> = config
-                    .port_mappings
-                    .iter()
-                    .map(|(host, guest)| crate::data::network::PortMapping {
-                        host: *host,
-                        guest: *guest,
-                    })
-                    .collect();
 
                 let runtime = match start_virtio_network(
                     host_fd,
                     guest_network,
-                    &port_mappings,
+                    config.port_mappings,
                     LaunchEgressPolicy::default(),
                 ) {
                     Ok(runtime) => runtime,

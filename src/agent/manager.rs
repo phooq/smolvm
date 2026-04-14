@@ -790,6 +790,15 @@ impl AgentManager {
         ports: &[PortMapping],
         resources: VmResources,
     ) -> Result<()> {
+        if ports.iter().any(PortMapping::is_udp)
+            && resources.network_backend != Some(crate::network::NetworkBackend::VirtioNet)
+        {
+            return Err(Error::config(
+                "start agent",
+                "UDP published ports require --net-backend virtio",
+            ));
+        }
+
         // Check and update state
         {
             let mut inner = self.inner.lock();

@@ -161,8 +161,8 @@ pub fn create_vm(params: CreateVmParams) -> smolvm::Result<()> {
         .map(|m| m.to_storage_tuple())
         .collect();
 
-    // Convert port mappings to tuple format for storage
-    let ports = PortMapping::to_tuples(&params.port);
+    // Store the full published-port mapping so protocol survives restarts.
+    let ports = params.port.clone();
 
     // Parse environment variables for init
     let env = smolvm::util::parse_env_list(&params.env);
@@ -434,7 +434,7 @@ pub struct DefaultVmOverrides {
     pub cpus: u8,
     pub mem: u32,
     pub mounts: Vec<(String, String, bool)>,
-    pub ports: Vec<(u16, u16)>,
+    pub ports: Vec<PortMapping>,
     pub network: bool,
     pub network_backend: Option<NetworkBackend>,
     pub storage_gb: Option<u64>,
@@ -750,8 +750,11 @@ pub fn list_vms(verbose: bool, json: bool) -> smolvm::Result<()> {
                     let ro_str = if *ro { " (ro)" } else { "" };
                     println!("  Mount: {} -> {}{}", host, guest, ro_str);
                 }
-                for (host, guest) in &record.ports {
-                    println!("  Port: {} -> {}", host, guest);
+                for mapping in &record.ports {
+                    println!(
+                        "  Port: {} -> {} ({})",
+                        mapping.host, mapping.guest, mapping.protocol
+                    );
                 }
                 if record.network {
                     println!("  Network: enabled");

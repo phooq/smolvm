@@ -2,7 +2,9 @@
 
 use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
 use crate::api::error::ApiError;
-use crate::api::types::{MachineInfo, MountSpec, PortSpec, ResourceSpec, RestartSpec};
+use crate::api::types::{
+    MachineInfo, MountSpec, PortProtocolSpec, PortSpec, ResourceSpec, RestartSpec,
+};
 use crate::config::{RecordState, RestartConfig, RestartPolicy, VmRecord};
 use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
 use crate::db::SmolvmDb;
@@ -176,14 +178,7 @@ impl ApiState {
                 })
                 .collect();
 
-            let ports: Vec<PortSpec> = record
-                .ports
-                .iter()
-                .map(|(host, guest)| PortSpec {
-                    host: *host,
-                    guest: *guest,
-                })
-                .collect();
+            let ports: Vec<PortSpec> = record.ports.iter().map(PortSpec::from).collect();
 
             let resources = ResourceSpec {
                 cpus: Some(record.cpus),
@@ -448,7 +443,7 @@ impl ApiState {
                 .iter()
                 .map(|m| (m.source.clone(), m.target.clone(), m.readonly))
                 .collect(),
-            reg.ports.iter().map(|p| (p.host, p.guest)).collect(),
+            reg.ports.iter().map(PortMapping::from).collect(),
             reg.network,
             reg.restart.clone(),
         );
@@ -717,7 +712,14 @@ impl From<&HostMount> for MountSpec {
 
 impl From<&PortSpec> for PortMapping {
     fn from(spec: &PortSpec) -> Self {
-        PortMapping::new(spec.host, spec.guest)
+        PortMapping::with_protocol(
+            spec.host,
+            spec.guest,
+            match spec.protocol {
+                PortProtocolSpec::Tcp => crate::data::network::PortProtocol::Tcp,
+                PortProtocolSpec::Udp => crate::data::network::PortProtocol::Udp,
+            },
+        )
     }
 }
 
@@ -726,6 +728,10 @@ impl From<&PortMapping> for PortSpec {
         PortSpec {
             host: mapping.host,
             guest: mapping.guest,
+            protocol: match mapping.protocol {
+                crate::data::network::PortProtocol::Tcp => PortProtocolSpec::Tcp,
+                crate::data::network::PortProtocol::Udp => PortProtocolSpec::Udp,
+            },
         }
     }
 }

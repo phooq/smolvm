@@ -7,13 +7,54 @@ pub const DEFAULT_DNS: &str = "1.1.1.1";
 /// Default DNS server as `IpAddr`.
 pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 
-/// TCP port mapping from host to guest.
+/// Published port protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PortProtocol {
+    /// Published TCP port.
+    Tcp,
+    /// Published UDP port.
+    Udp,
+}
+
+impl Default for PortProtocol {
+    fn default() -> Self {
+        Self::Tcp
+    }
+}
+
+impl PortProtocol {
+    /// Parse a lowercase protocol name.
+    pub fn parse(spec: &str) -> Result<Self, String> {
+        match spec {
+            "tcp" => Ok(Self::Tcp),
+            "udp" => Ok(Self::Udp),
+            _ => Err(format!(
+                "invalid port protocol: {spec} (expected tcp or udp)"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for PortProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp => write!(f, "tcp"),
+            Self::Udp => write!(f, "udp"),
+        }
+    }
+}
+
+/// Port mapping from host to guest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PortMapping {
     /// Port on the host.
     pub host: u16,
     /// Port inside the guest.
     pub guest: u16,
+    /// Published protocol. Defaults to TCP for older stored configs.
+    #[serde(default)]
+    pub protocol: PortProtocol,
 }
 
 /// Check if any CIDR in the list covers the given IP address.
@@ -41,42 +82,60 @@ pub fn ensure_dns_in_cidrs(cidrs: &mut Vec<String>) {
 impl PortMapping {
     /// Create a new port mapping.
     pub fn new(host: u16, guest: u16) -> Self {
-        Self { host, guest }
+        Self::with_protocol(host, guest, PortProtocol::Tcp)
+    }
+
+    /// Create a new port mapping with an explicit protocol.
+    pub fn with_protocol(host: u16, guest: u16, protocol: PortProtocol) -> Self {
+        Self {
+            host,
+            guest,
+            protocol,
+        }
     }
 
     /// Create a port mapping where host and guest ports are the same.
     pub fn same(port: u16) -> Self {
-        Self {
-            host: port,
-            guest: port,
-        }
+        Self::with_protocol(port, port, PortProtocol::Tcp)
     }
 
-    /// Convert to `(host, guest)` tuple for storage.
+    /// Create a same-port mapping with an explicit protocol.
+    pub fn same_with_protocol(port: u16, protocol: PortProtocol) -> Self {
+        Self::with_protocol(port, port, protocol)
+    }
+
+    /// Convert to the legacy `(host, guest)` tuple shape.
     pub fn to_tuple(&self) -> (u16, u16) {
         (self.host, self.guest)
     }
 
-    /// Batch convert port mappings to tuple format.
-    pub fn to_tuples(ports: &[Self]) -> Vec<(u16, u16)> {
-        ports.iter().map(|p| p.to_tuple()).collect()
+    /// Whether this mapping publishes UDP.
+    pub fn is_udp(&self) -> bool {
+        self.protocol == PortProtocol::Udp
     }
 
-    /// Parse a port mapping specification (`HOST:GUEST` or `PORT`).
+    /// Parse a port mapping specification (`HOST:GUEST[/PROTO]` or `PORT[/PROTO]`).
     pub fn parse(spec: &str) -> Result<Self, String> {
-        if let Some((host, guest)) = spec.split_once(':') {
+        let (port_spec, protocol) = if let Some((port_spec, protocol_spec)) = spec.rsplit_once('/')
+        {
+            (port_spec, PortProtocol::parse(protocol_spec)?)
+        } else {
+            (spec, PortProtocol::Tcp)
+        };
+
+        if let Some((host, guest)) = port_spec.split_once(':') {
             let host: u16 = host
                 .parse()
                 .map_err(|_| format!("invalid host port: {}", host))?;
             let guest: u16 = guest
                 .parse()
                 .map_err(|_| format!("invalid guest port: {}", guest))?;
-            Ok(Self::new(host, guest))
+            Ok(Self::with_protocol(host, guest, protocol))
         } else {
-            let port: u16 = spec
+            let port: u16 = port_spec
                 .parse()
-                .map_err(|_| format!("invalid port: {}", spec))?;
-            Ok(Self::same(port))
+                .map_err(|_| format!("invalid port: {}", port_spec))?;
+            Ok(Self::same_with_protocol(port, protocol))
         }
     }
 }
@@ -125,5 +184,30 @@ mod tests {
         let mut cidrs = vec!["10.0.0.0/8".to_string(), "1.1.1.1/32".to_string()];
         ensure_dns_in_cidrs(&mut cidrs);
         assert_eq!(cidrs.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_default_tcp_port_mapping() {
+        let mapping = PortMapping::parse("8080:80").unwrap();
+        assert_eq!(mapping, PortMapping::new(8080, 80));
+        assert_eq!(mapping.protocol, PortProtocol::Tcp);
+    }
+
+    #[test]
+    fn test_parse_udp_port_mapping() {
+        let mapping = PortMapping::parse("5353:53/udp").unwrap();
+        assert_eq!(
+            mapping,
+            PortMapping::with_protocol(5353, 53, PortProtocol::Udp)
+        );
+    }
+
+    #[test]
+    fn test_parse_same_port_udp_mapping() {
+        let mapping = PortMapping::parse("5353/udp").unwrap();
+        assert_eq!(
+            mapping,
+            PortMapping::same_with_protocol(5353, PortProtocol::Udp)
+        );
     }
 }

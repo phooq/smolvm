@@ -95,10 +95,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         ports: record
             .ports
             .iter()
-            .map(|(host, guest)| crate::api::types::PortSpec {
-                host: *host,
-                guest: *guest,
-            })
+            .map(crate::api::types::PortSpec::from)
             .collect(),
         network: record.network,
         storage_gb: record.storage_gb,
@@ -122,14 +119,7 @@ fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> Machin
             readonly: *ro,
         })
         .collect();
-    let ports = record
-        .ports
-        .iter()
-        .map(|(h, g)| PortSpec {
-            host: *h,
-            guest: *g,
-        })
-        .collect();
+    let ports = record.ports.iter().map(PortSpec::from).collect();
     MachineEntry {
         manager,
         mounts,
@@ -754,7 +744,10 @@ mod tests {
                 ("/host/path".to_string(), "/guest/path".to_string(), false),
                 ("/host/ro".to_string(), "/guest/ro".to_string(), true),
             ],
-            vec![(8080, 80), (3000, 3000)],
+            vec![
+                crate::data::network::PortMapping::new(8080, 80),
+                crate::data::network::PortMapping::new(3000, 3000),
+            ],
             false,
         );
 

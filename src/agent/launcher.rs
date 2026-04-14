@@ -277,6 +277,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 None
             }
             EffectiveNetworkBackend::Tsi => {
+                if port_mappings.iter().any(|mapping| mapping.is_udp()) {
+                    krun_free_ctx(ctx);
+                    return Err(Error::config(
+                        "set port mapping",
+                        "UDP published ports require --net-backend virtio",
+                    ));
+                }
                 if krun_disable_implicit_vsock(ctx) < 0 {
                     krun_free_ctx(ctx);
                     return Err(Error::agent(
