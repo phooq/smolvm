@@ -67,10 +67,12 @@
 //!   connections
 //! - accepting published host UDP datagrams and forwarding them into guest UDP
 //!   sockets
+//! - answering guest ICMP echo requests addressed to the gateway IP
 //! - enforcing CIDR-based egress policy for guest TCP and UDP destinations
 //!
 //! What is *not* here yet:
 //! - TLS MITM or deeper packet rewriting
+//! - general outbound ICMP relay beyond the gateway-local echo-reply path
 //!
 //! So this module is the host data plane, but not yet the full user-visible
 //! networking feature.

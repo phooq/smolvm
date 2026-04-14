@@ -59,7 +59,10 @@
 //!   guest-facing smoltcp connections
 //! - published UDP ports are supported by accepting host datagrams and creating
 //!   guest-facing smoltcp UDP sockets
+//! - ICMP echo requests addressed to the gateway IP are answered locally by
+//!   smoltcp
 //! - CIDR and DNS hostname policy are enforced in-process
+//! - general outbound ICMP relay is still out of scope
 //!
 //! There is no single shell command equivalent for this module. The closest
 //! operational mental model is "userspace network stack + gateway daemon".
