@@ -92,8 +92,10 @@ pub struct ResourceSpec {
     #[serde(default)]
     #[schema(example = 1024)]
     pub memory_mb: Option<u32>,
-    /// Enable outbound network access (TSI).
-    /// Note: Only TCP/UDP supported, not ICMP (ping).
+    /// Enable outbound network access.
+    /// Note: TCP/UDP are supported. The virtio-net backend also answers ICMP
+    /// echo requests to the guest-visible gateway IP, but general outbound
+    /// ICMP relay (for example `ping 1.1.1.1`) is still unsupported.
     #[serde(default)]
     pub network: Option<bool>,
     /// Storage disk size in GiB (default: 20).
@@ -356,8 +358,10 @@ pub struct CreateMachineRequest {
     /// Port mappings (host:guest).
     #[serde(default)]
     pub ports: Vec<PortSpec>,
-    /// Enable outbound network access (TSI).
-    /// Note: Only TCP/UDP supported, not ICMP (ping).
+    /// Enable outbound network access.
+    /// Note: TCP/UDP are supported. The virtio-net backend also answers ICMP
+    /// echo requests to the guest-visible gateway IP, but general outbound
+    /// ICMP relay (for example `ping 1.1.1.1`) is still unsupported.
     #[serde(default)]
     pub network: bool,
     /// Storage disk size in GiB (default: 20).

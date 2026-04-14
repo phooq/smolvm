@@ -145,7 +145,7 @@ Platform Support
 Known Limitations
 -----------------
 
-* Network is opt-in (`--net` on `machine create`). TCP/UDP only, no ICMP.
+* Network is opt-in (`--net` on `machine create`). General outbound ICMP is not supported. The virtio-net backend does answer ICMP echo requests to the guest-visible gateway IP.
 * Volume mounts: directories only (no single files).
 * macOS: binary must be signed with Hypervisor.framework entitlements.
 * `--ssh-agent` requires an SSH agent running on the host (`SSH_AUTH_SOCK` must be set).

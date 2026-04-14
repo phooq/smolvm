@@ -65,6 +65,7 @@ crossbeam-queue = "0.3"
 smoltcp = { version = "0.13", default-features = false, features = [
     "std",
     "log",
+    "auto-icmp-echo-reply",
     "medium-ethernet",
     "proto-ipv4",
     "socket-tcp",
