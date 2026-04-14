@@ -57,6 +57,8 @@
 //! - non-DNS UDP is supported via host UDP relay threads
 //! - published TCP ports are supported by accepting host sockets and creating
 //!   guest-facing smoltcp connections
+//! - published UDP ports are supported by accepting host datagrams and creating
+//!   guest-facing smoltcp UDP sockets
 //! - CIDR and DNS hostname policy are enforced in-process
 //!
 //! There is no single shell command equivalent for this module. The closest
@@ -65,9 +67,12 @@
 use crate::data::network::DEFAULT_DNS_ADDR;
 use crate::network::policy::{LaunchEgressPolicy, ResolvedEgressPolicy};
 use crate::network::virtio::device::VirtioNetworkDevice;
-use crate::network::virtio::publisher::AcceptedPublishedConnection;
+use crate::network::virtio::publisher::{
+    AcceptedPublishedConnection, PublishedUdpDatagram, PublishedUdpReply,
+};
 use crate::network::virtio::queues::NetworkFrameQueues;
 use crate::network::virtio::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
+use crate::network::virtio::udp_publisher::PublishedUdpTable;
 use crate::network::virtio::udp_relay::UdpRelayTable;
 use smoltcp::iface::{
     Config, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
@@ -78,6 +83,7 @@ use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
     Ipv4Packet, TcpPacket, UdpPacket,
 };
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket as HostUdpSocket};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -136,6 +142,8 @@ pub fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     published_connections: Option<Receiver<AcceptedPublishedConnection>>,
+    published_udp_datagrams: Option<Receiver<PublishedUdpDatagram>>,
+    published_udp_reply_routes: HashMap<u16, std::sync::mpsc::SyncSender<PublishedUdpReply>>,
     policy: LaunchEgressPolicy,
 ) -> std::io::Result<JoinHandle<()>> {
     eprintln!(
@@ -154,13 +162,24 @@ pub fn start_network_stack(
         ResolvedEgressPolicy::compile(policy, upstream_dns).map_err(std::io::Error::other)?;
     thread::Builder::new()
         .name("smolvm-net-poll".into())
-        .spawn(move || run_network_stack(queues, config, published_connections, policy))
+        .spawn(move || {
+            run_network_stack(
+                queues,
+                config,
+                published_connections,
+                published_udp_datagrams,
+                published_udp_reply_routes,
+                policy,
+            )
+        })
 }
 
 fn run_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     mut published_connections: Option<Receiver<AcceptedPublishedConnection>>,
+    mut published_udp_datagrams: Option<Receiver<PublishedUdpDatagram>>,
+    published_udp_reply_routes: HashMap<u16, std::sync::mpsc::SyncSender<PublishedUdpReply>>,
     policy: ResolvedEgressPolicy,
 ) {
     // Poll loop overview:
@@ -188,6 +207,7 @@ fn run_network_stack(
     let relay_wake = Arc::new(queues.relay_wake.clone());
     let mut relays = TcpRelayTable::new(None);
     let mut udp_relays = UdpRelayTable::new(None, None);
+    let mut published_udp = PublishedUdpTable::new(None);
 
     // The smoltcp loop is driven by fd-based wakeups rather than busy spinning.
     // guest_wake  -> new guest frame or shutdown
@@ -297,6 +317,13 @@ fn run_network_stack(
             config.gateway_ipv4,
             config.guest_ipv4,
         );
+        published_udp.relay_host_datagrams(
+            &mut published_udp_datagrams,
+            &published_udp_reply_routes,
+            config.gateway_ipv4,
+            config.guest_ipv4,
+            &mut sockets,
+        );
 
         // First egress pass: let smoltcp emit any packets caused by the most
         // recent ingress work before we service higher-level relays.
@@ -310,6 +337,7 @@ fn run_network_stack(
         udp_relays.relay_guest_datagrams(&mut sockets, &relay_wake);
         process_dns_queries(dns_socket_handle, &policy, &mut sockets);
         udp_relays.relay_host_datagrams(&mut sockets);
+        published_udp.relay_guest_replies(&mut sockets);
 
         // Once the guest-side TCP handshake is established inside smoltcp, we
         // can spawn the corresponding host relay thread.
@@ -326,6 +354,7 @@ fn run_network_stack(
 
         relays.cleanup_closed(&mut sockets);
         udp_relays.cleanup_idle(&mut sockets);
+        published_udp.cleanup_idle(&mut sockets);
 
         // Second egress pass: DNS responses or relay data may have queued more
         // packets for the guest.
@@ -373,7 +402,7 @@ fn run_network_stack(
         }
     }
 
-    log_shutdown_summary(&relays, &udp_relays);
+    log_shutdown_summary(&relays, &udp_relays, &published_udp);
 }
 
 fn create_interface(device: &mut VirtioNetworkDevice, config: &VirtioPollConfig) -> Interface {
@@ -706,16 +735,26 @@ fn classify_udp(
     }
 }
 
-fn log_shutdown_summary(relays: &TcpRelayTable, udp_relays: &UdpRelayTable) {
+fn log_shutdown_summary(
+    relays: &TcpRelayTable,
+    udp_relays: &UdpRelayTable,
+    published_udp: &PublishedUdpTable,
+) {
     let udp_stats = udp_relays.stats();
+    let published_udp_stats = published_udp.stats();
     eprintln!(
-        "virtio-net: poll loop stopped active_tcp_relays={} active_udp_flows={} active_udp_sockets={} guest_udp_forwarded={} host_udp_forwarded={} guest_udp_dropped={} host_udp_dropped={}",
+        "virtio-net: poll loop stopped active_tcp_relays={} active_udp_flows={} active_udp_sockets={} active_published_udp_flows={} guest_udp_forwarded={} host_udp_forwarded={} guest_udp_dropped={} host_udp_dropped={} published_host_udp_forwarded={} published_guest_udp_forwarded={} published_host_udp_dropped={} published_guest_udp_dropped={}",
         relays.active_connection_count(),
         udp_relays.active_flow_count(),
         udp_relays.active_socket_count(),
+        published_udp.active_flow_count(),
         udp_stats.guest_datagrams_forwarded,
         udp_stats.host_datagrams_forwarded,
         udp_stats.guest_datagrams_dropped,
         udp_stats.host_datagrams_dropped,
+        published_udp_stats.host_datagrams_forwarded,
+        published_udp_stats.guest_datagrams_forwarded,
+        published_udp_stats.host_datagrams_dropped,
+        published_udp_stats.guest_datagrams_dropped,
     );
 }

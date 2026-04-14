@@ -49,6 +49,22 @@ pub struct MountInfo {
     pub readonly: bool,
 }
 
+/// Published port protocol.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PortProtocolSpec {
+    /// TCP port publishing.
+    Tcp,
+    /// UDP port publishing.
+    Udp,
+}
+
+impl Default for PortProtocolSpec {
+    fn default() -> Self {
+        Self::Tcp
+    }
+}
+
 /// Port mapping specification.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 pub struct PortSpec {
@@ -58,6 +74,10 @@ pub struct PortSpec {
     /// Port inside the machine.
     #[schema(example = 80)]
     pub guest: u16,
+    /// Published protocol.
+    #[serde(default)]
+    #[schema(value_type = String, example = "tcp")]
+    pub protocol: PortProtocolSpec,
 }
 
 /// VM resource specification.

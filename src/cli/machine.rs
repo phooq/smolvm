@@ -224,7 +224,7 @@ pub struct RunCmd {
     pub volume: Vec<String>,
 
     /// Expose port from container to host (can be used multiple times)
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST", help_heading = "Network")]
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST[/PROTO]", help_heading = "Network")]
     pub port: Vec<PortMapping>,
 
     /// Enable outbound network access
@@ -500,8 +500,7 @@ impl RunCmd {
                             )
                         })
                         .collect();
-                    let port_tuples: Vec<(u16, u16)> =
-                        params.port.iter().map(|p| (p.host, p.guest)).collect();
+                    let port_mappings = params.port.clone();
                     if let Ok(mut config) = SmolvmConfig::load() {
                         vm_common::persist_default_running(
                             &mut config,
@@ -510,7 +509,7 @@ impl RunCmd {
                                 cpus: params.cpus,
                                 mem: params.mem,
                                 mounts: mount_tuples,
-                                ports: port_tuples,
+                                ports: port_mappings,
                                 network: params.net,
                                 network_backend: params.network_backend,
                                 storage_gb: params.storage_gb,
@@ -609,8 +608,7 @@ impl RunCmd {
                             )
                         })
                         .collect();
-                    let port_tuples: Vec<(u16, u16)> =
-                        params.port.iter().map(|p| (p.host, p.guest)).collect();
+                    let port_mappings = params.port.clone();
                     if let Ok(mut config) = SmolvmConfig::load() {
                         vm_common::persist_default_running(
                             &mut config,
@@ -619,7 +617,7 @@ impl RunCmd {
                                 cpus: params.cpus,
                                 mem: params.mem,
                                 mounts: mount_tuples,
-                                ports: port_tuples,
+                                ports: port_mappings,
                                 network: params.net,
                                 network_backend: params.network_backend,
                                 storage_gb: params.storage_gb,
@@ -873,7 +871,7 @@ pub struct CreateCmd {
     pub volume: Vec<String>,
 
     /// Expose port from VM to host (can be used multiple times)
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST[/PROTO]")]
     pub port: Vec<PortMapping>,
 
     /// Enable outbound network access

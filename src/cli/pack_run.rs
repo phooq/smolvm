@@ -169,7 +169,7 @@ pub struct PackRunCmd {
         short = 'p',
         long = "port",
         value_parser = PortMapping::parse,
-        value_name = "HOST:GUEST",
+        value_name = "HOST:GUEST[/PROTO]",
         help_heading = "Network"
     )]
     pub port: Vec<PortMapping>,
@@ -336,7 +336,7 @@ impl PackRunCmd {
 
         // 7. Parse CLI args
         let mounts = HostMount::parse(&self.volume)?;
-        let port_mappings = PortMapping::to_tuples(&self.port);
+        let port_mappings = self.port.clone();
         validate_network_backend_request(self.net_backend, self.net, self.port.len())?;
 
         let resources = VmResources {
@@ -851,7 +851,7 @@ struct PackedRunArgs {
     volume: Vec<String>,
 
     /// Expose port from container to host
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST[/PROTO]")]
     port: Vec<PortMapping>,
 
     /// Enable outbound network access
@@ -903,7 +903,7 @@ struct PackedStartArgs {
     volume: Vec<String>,
 
     /// Expose port from container to host
-    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST")]
+    #[arg(short = 'p', long = "port", value_parser = PortMapping::parse, value_name = "HOST:GUEST[/PROTO]")]
     port: Vec<PortMapping>,
 
     /// Enable outbound network access
@@ -1159,7 +1159,7 @@ fn run_from_cache(
     )?;
 
     let mounts = HostMount::parse(&args.volume)?;
-    let port_mappings = PortMapping::to_tuples(&args.port);
+    let port_mappings = args.port.clone();
     validate_network_backend_request(args.net_backend, args.net, args.port.len())?;
 
     let resources = VmResources {
@@ -1478,7 +1478,7 @@ fn daemon_start(
 
     // Parse CLI args
     let mounts = HostMount::parse(&args.volume)?;
-    let port_mappings = PortMapping::to_tuples(&args.port);
+    let port_mappings = args.port.clone();
     validate_network_backend_request(args.net_backend, args.net, args.port.len())?;
 
     let resources = VmResources {

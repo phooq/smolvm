@@ -34,7 +34,7 @@ impl MachineSpec {
                 .iter()
                 .map(HostMount::to_storage_tuple)
                 .collect(),
-            self.ports.iter().map(PortMapping::to_tuple).collect(),
+            self.ports.clone(),
             self.resources.network,
         );
         record.storage_gb = self.resources.storage_gib;

@@ -437,7 +437,7 @@ mod tests {
             2,
             1024,
             vec![("/host".to_string(), "/guest".to_string(), false)],
-            vec![(8080, 80)],
+            vec![crate::data::network::PortMapping::new(8080, 80)],
             false,
         );
 
