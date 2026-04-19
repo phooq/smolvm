@@ -270,6 +270,7 @@ fn init_argv(cmd: &str) -> Vec<String> {
 /// CLI/Smolfile/persisted machine config override those defaults by key, while
 /// workdir uses the explicit value when present and otherwise falls back to the
 /// image's `WorkingDir`.
+/// TODO: need to ensure using the USER in image as well if image is provided.
 pub(crate) fn resolve_image_runtime_defaults(
     image_info: Option<&ImageInfo>,
     explicit_env: &[(String, String)],
@@ -1544,6 +1545,20 @@ mod init_runner_tests {
             ]
         );
         assert_eq!(workdir.as_deref(), Some("/image-workdir"));
+    }
+
+    #[test]
+    fn image_workdir_flows_into_init_run_config_when_no_explicit_workdir_is_set() {
+        let image_info = sample_image_info(vec!["FOO=from-image"], Some("/image-workdir"));
+        let (env, workdir) = resolve_image_runtime_defaults(Some(&image_info), &[], None);
+        let config =
+            build_init_run_config("alpine:latest", "pwd", &env, workdir.as_deref(), &[], "vm");
+
+        assert_eq!(config.workdir.as_deref(), Some("/image-workdir"));
+        assert_eq!(
+            config.env,
+            vec![("FOO".to_string(), "from-image".to_string())]
+        );
     }
 
     #[test]
