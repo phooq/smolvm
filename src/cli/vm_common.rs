@@ -197,6 +197,15 @@ pub fn print_output_and_exit(
 ///   `client.vm_exec`. There's no container, so `record_mounts` and
 ///   `overlay_id` are unused on this branch.
 ///
+pub(crate) struct InitRunContext<'a> {
+    pub(crate) image: Option<&'a str>,
+    pub(crate) image_info: Option<&'a ImageInfo>,
+    pub(crate) env: &'a [(String, String)],
+    pub(crate) workdir: Option<&'a str>,
+    pub(crate) record_mounts: &'a [(String, String, bool)],
+    pub(crate) overlay_id: &'a str,
+}
+
 /// On the first non-zero exit, returns an error containing the command
 /// index, exit code, and any stdout/stderr the command produced.
 /// **Both** streams are surfaced because package managers often write
@@ -207,35 +216,30 @@ pub fn print_output_and_exit(
 pub(crate) fn run_init_commands(
     client: &mut smolvm::agent::AgentClient,
     init: &[String],
-    image: Option<&str>,
-    image_info: Option<&ImageInfo>,
-    env: &[(String, String)],
-    workdir: Option<&str>,
-    record_mounts: &[(String, String, bool)],
-    overlay_id: &str,
+    context: InitRunContext<'_>,
 ) -> smolvm::Result<()> {
     if init.is_empty() {
         return Ok(());
     }
     println!("Running {} init command(s)...", init.len());
     for (i, cmd) in init.iter().enumerate() {
-        let (exit_code, stdout, stderr) = if let Some(image) = image {
+        let (exit_code, stdout, stderr) = if let Some(image) = context.image {
             let (effective_env, effective_workdir) =
-                resolve_image_runtime_defaults(image_info, env, workdir);
+                resolve_image_runtime_defaults(context.image_info, context.env, context.workdir);
             let config = build_init_run_config(
                 image,
                 cmd,
                 &effective_env,
                 effective_workdir.as_deref(),
-                record_mounts,
-                overlay_id,
+                context.record_mounts,
+                context.overlay_id,
             );
             client.run_non_interactive(config)?
         } else {
             client.vm_exec(
                 init_argv(cmd),
-                env.to_vec(),
-                workdir.map(|s| s.to_string()),
+                context.env.to_vec(),
+                context.workdir.map(|s| s.to_string()),
                 None,
             )?
         };
@@ -632,12 +636,14 @@ pub fn start_vm_named(name: &str) -> smolvm::Result<()> {
     if let Err(e) = run_init_commands(
         &mut client,
         &record.init,
-        record.image.as_deref(),
-        image_info.as_ref(),
-        &record.env,
-        record.workdir.as_deref(),
-        &record.mounts,
-        name,
+        InitRunContext {
+            image: record.image.as_deref(),
+            image_info: image_info.as_ref(),
+            env: &record.env,
+            workdir: record.workdir.as_deref(),
+            record_mounts: &record.mounts,
+            overlay_id: name,
+        },
     ) {
         if let Err(stop_err) = manager.stop() {
             tracing::warn!(error = %stop_err, "failed to stop machine after init failure");
@@ -846,12 +852,14 @@ pub fn start_vm_default() -> smolvm::Result<()> {
             if let Err(e) = run_init_commands(
                 &mut client,
                 &record.init,
-                record.image.as_deref(),
-                image_info.as_ref(),
-                &record.env,
-                record.workdir.as_deref(),
-                &record.mounts,
-                "default",
+                InitRunContext {
+                    image: record.image.as_deref(),
+                    image_info: image_info.as_ref(),
+                    env: &record.env,
+                    workdir: record.workdir.as_deref(),
+                    record_mounts: &record.mounts,
+                    overlay_id: "default",
+                },
             ) {
                 if let Err(stop_err) = manager.stop() {
                     tracing::warn!(error = %stop_err, "failed to stop machine after init failure");

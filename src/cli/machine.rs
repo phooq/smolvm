@@ -481,12 +481,14 @@ impl RunCmd {
             if let Err(e) = vm_common::run_init_commands(
                 &mut client,
                 &params.init,
-                image.as_deref(),
-                image_info.as_ref(),
-                &init_env,
-                params.workdir.as_deref(),
-                &record_mounts,
-                "default",
+                vm_common::InitRunContext {
+                    image: image.as_deref(),
+                    image_info: image_info.as_ref(),
+                    env: &init_env,
+                    workdir: params.workdir.as_deref(),
+                    record_mounts: &record_mounts,
+                    overlay_id: "default",
+                },
             ) {
                 // Ephemeral VMs have no state to preserve — `kill()`
                 // matches the success path's lifetime semantics
