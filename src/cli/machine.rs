@@ -531,7 +531,7 @@ impl RunCmd {
 
         // Two modes: with image or bare VM (no image)
         if let Some(ref img) = image {
-            let (resolved_env, resolved_workdir) = vm_common::resolve_image_runtime_defaults(
+            let defaults = vm_common::resolve_image_runtime_defaults(
                 image_info.as_ref(),
                 &explicit_env,
                 params.workdir.as_deref(),
@@ -604,16 +604,18 @@ impl RunCmd {
 
                 let exit_code = if interactive || tty {
                     let config = RunConfig::new(img, command)
-                        .with_env(resolved_env.clone())
-                        .with_workdir(resolved_workdir.clone())
+                        .with_env(defaults.env.clone())
+                        .with_workdir(defaults.workdir.clone())
+                        .with_user(defaults.user.clone())
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout)
                         .with_tty(tty);
                     client.run_interactive(config)?
                 } else {
                     let config = RunConfig::new(img, command)
-                        .with_env(resolved_env)
-                        .with_workdir(resolved_workdir)
+                        .with_env(defaults.env)
+                        .with_workdir(defaults.workdir)
+                        .with_user(defaults.user)
                         .with_mounts(mount_bindings)
                         .with_timeout(self.timeout);
                     let (exit_code, stdout, stderr) = client.run_non_interactive(config)?;
@@ -866,7 +868,7 @@ impl ExecCmd {
                 record.as_ref().map(|r| r.env.as_slice()).unwrap_or(&[]),
                 &explicit_env,
             );
-            let (resolved_env, resolved_workdir) = vm_common::resolve_image_runtime_defaults(
+            let defaults = vm_common::resolve_image_runtime_defaults(
                 image_info.as_ref(),
                 &configured_env,
                 workdir.as_deref(),
@@ -877,8 +879,9 @@ impl ExecCmd {
             let machine_name = name.clone();
             if self.interactive || self.tty {
                 let config = smolvm::agent::RunConfig::new(image, self.command.clone())
-                    .with_env(resolved_env.clone())
-                    .with_workdir(resolved_workdir.clone())
+                    .with_env(defaults.env.clone())
+                    .with_workdir(defaults.workdir.clone())
+                    .with_user(defaults.user.clone())
                     .with_mounts(mount_bindings)
                     .with_timeout(self.timeout)
                     .with_tty(self.tty)
@@ -888,8 +891,9 @@ impl ExecCmd {
             }
 
             let config = smolvm::agent::RunConfig::new(image, self.command.clone())
-                .with_env(resolved_env)
-                .with_workdir(resolved_workdir)
+                .with_env(defaults.env)
+                .with_workdir(defaults.workdir)
+                .with_user(defaults.user)
                 .with_mounts(mount_bindings)
                 .with_timeout(self.timeout)
                 .with_persistent_overlay(Some(machine_name));

@@ -1477,6 +1477,7 @@ fn handle_request(
             command,
             env,
             workdir,
+            user,
             mounts,
             timeout_ms,
             interactive: false,
@@ -1487,6 +1488,7 @@ fn handle_request(
             &command,
             &env,
             workdir.as_deref(),
+            user.as_deref(),
             &mounts,
             timeout_ms,
             persistent_overlay_id.as_deref(),
@@ -2159,13 +2161,14 @@ fn handle_interactive_run(
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_storage_mounted();
-    let (image, command, env, workdir, mounts, timeout_ms, tty, persistent_overlay_id) =
+    let (image, command, env, workdir, user, mounts, timeout_ms, tty, persistent_overlay_id) =
         match request {
             AgentRequest::Run {
                 image,
                 command,
                 env,
                 workdir,
+                user,
                 mounts,
                 timeout_ms,
                 tty,
@@ -2176,6 +2179,7 @@ fn handle_interactive_run(
                 command,
                 env,
                 workdir,
+                user,
                 mounts,
                 timeout_ms,
                 tty,
@@ -2229,6 +2233,7 @@ fn handle_interactive_run(
         &command,
         &env,
         workdir.as_deref(),
+        user.as_deref(),
         &mounts,
         tty,
     ) {
@@ -2284,10 +2289,11 @@ fn spawn_interactive_command(
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
+    user: Option<&str>,
     mounts: &[(String, String, bool)],
     tty: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
-    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::io::AsRawFd as _;
     use std::path::Path;
 
     if command.is_empty() {
@@ -2306,7 +2312,8 @@ fn spawn_interactive_command(
 
     let workdir_str = workdir.unwrap_or("/");
     // terminal: true tells crun to set up a controlling terminal (setsid + TIOCSCTTY)
-    let mut spec = oci::OciSpec::new(command, env, workdir_str, tty);
+    let identity = oci::resolve_process_identity(rootfs_path, user)?;
+    let mut spec = oci::OciSpec::new(command, env, workdir_str, tty, &identity);
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
@@ -2376,6 +2383,7 @@ fn spawn_interactive_command(
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
+    user: Option<&str>,
     mounts: &[(String, String, bool)],
     _tty: bool,
 ) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
@@ -2396,7 +2404,8 @@ fn spawn_interactive_command(
     }
 
     let workdir_str = workdir.unwrap_or("/");
-    let mut spec = oci::OciSpec::new(command, env, workdir_str, false);
+    let identity = oci::resolve_process_identity(rootfs_path, user)?;
+    let mut spec = oci::OciSpec::new(command, env, workdir_str, false, &identity);
 
     for (tag, container_path, read_only) in mounts {
         let virtiofs_mount = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
@@ -3153,6 +3162,7 @@ fn handle_run(
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
+    user: Option<&str>,
     mounts: &[(String, String, bool)],
     timeout_ms: Option<u64>,
     persistent_overlay_id: Option<&str>,
@@ -3165,6 +3175,7 @@ fn handle_run(
         command,
         env,
         workdir,
+        user,
         mounts,
         timeout_ms,
         persistent_overlay_id,

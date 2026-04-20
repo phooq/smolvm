@@ -4,6 +4,8 @@
 //! config.json files used by crun to execute containers.
 
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -57,12 +59,280 @@ pub struct OciProcess {
 }
 
 /// User configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OciUser {
     pub uid: u32,
     pub gid: u32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_gids: Vec<u32>,
+}
+
+/// Resolved process identity for container execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessIdentity {
+    pub user: OciUser,
+    pub home: Option<String>,
+}
+
+impl ProcessIdentity {
+    pub fn root() -> Self {
+        Self {
+            user: OciUser {
+                uid: 0,
+                gid: 0,
+                additional_gids: vec![],
+            },
+            home: Some("/root".to_string()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasswdEntry {
+    username: String,
+    uid: u32,
+    gid: u32,
+    home: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupEntry {
+    name: String,
+    gid: u32,
+    members: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedUser {
+    uid: u32,
+    username: Option<String>,
+    primary_gid: Option<u32>,
+    home: Option<String>,
+}
+
+pub fn resolve_process_identity(
+    rootfs: &Path,
+    user_spec: Option<&str>,
+) -> Result<ProcessIdentity, String> {
+    let normalized = user_spec.map(str::trim).filter(|s| !s.is_empty());
+    let passwd_entries = load_passwd_entries(rootfs)?;
+    let group_entries = load_group_entries(rootfs)?;
+
+    if normalized.is_none() {
+        return Ok(resolve_default_root_identity(
+            &passwd_entries,
+            &group_entries,
+        ));
+    }
+
+    let spec = normalized.expect("checked above");
+    let (user_token, group_token) = match spec.split_once(':') {
+        Some((user, group)) => {
+            if user.is_empty() {
+                return Err("invalid empty user in OCI image config".to_string());
+            }
+            if group.is_empty() {
+                return Err("invalid empty group in OCI image config".to_string());
+            }
+            (user, Some(group))
+        }
+        None => (spec, None),
+    };
+
+    let resolved_user = resolve_user_token(user_token, &passwd_entries)?;
+    let primary_gid = match group_token {
+        Some(group) => resolve_group_token(group, &group_entries)?,
+        None => resolved_user.primary_gid.unwrap_or(0),
+    };
+
+    let additional_gids = supplemental_group_ids(
+        &group_entries,
+        resolved_user.username.as_deref(),
+        primary_gid,
+    );
+    let home = resolved_user.home.or_else(|| {
+        if resolved_user.uid == 0 {
+            Some("/root".to_string())
+        } else {
+            None
+        }
+    });
+
+    Ok(ProcessIdentity {
+        user: OciUser {
+            uid: resolved_user.uid,
+            gid: primary_gid,
+            additional_gids,
+        },
+        home,
+    })
+}
+
+fn resolve_default_root_identity(
+    passwd_entries: &[PasswdEntry],
+    group_entries: &[GroupEntry],
+) -> ProcessIdentity {
+    if let Some(root) = passwd_entries.iter().find(|entry| entry.username == "root") {
+        return ProcessIdentity {
+            user: OciUser {
+                uid: root.uid,
+                gid: root.gid,
+                additional_gids: supplemental_group_ids(
+                    group_entries,
+                    Some(root.username.as_str()),
+                    root.gid,
+                ),
+            },
+            home: Some(root.home.clone()),
+        };
+    }
+
+    ProcessIdentity::root()
+}
+
+fn resolve_user_token(user: &str, passwd_entries: &[PasswdEntry]) -> Result<ResolvedUser, String> {
+    if let Ok(uid) = user.parse::<u32>() {
+        if let Some(entry) = passwd_entries.iter().find(|entry| entry.uid == uid) {
+            return Ok(ResolvedUser {
+                uid,
+                username: Some(entry.username.clone()),
+                primary_gid: Some(entry.gid),
+                home: Some(entry.home.clone()),
+            });
+        }
+
+        return Ok(ResolvedUser {
+            uid,
+            username: None,
+            primary_gid: None,
+            home: None,
+        });
+    }
+
+    let entry = passwd_entries
+        .iter()
+        .find(|entry| entry.username == user)
+        .ok_or_else(|| format!("user '{}' not found in container rootfs", user))?;
+
+    Ok(ResolvedUser {
+        uid: entry.uid,
+        username: Some(entry.username.clone()),
+        primary_gid: Some(entry.gid),
+        home: Some(entry.home.clone()),
+    })
+}
+
+fn resolve_group_token(group: &str, group_entries: &[GroupEntry]) -> Result<u32, String> {
+    if let Ok(gid) = group.parse::<u32>() {
+        return Ok(gid);
+    }
+
+    group_entries
+        .iter()
+        .find(|entry| entry.name == group)
+        .map(|entry| entry.gid)
+        .ok_or_else(|| format!("group '{}' not found in container rootfs", group))
+}
+
+fn supplemental_group_ids(
+    group_entries: &[GroupEntry],
+    username: Option<&str>,
+    primary_gid: u32,
+) -> Vec<u32> {
+    let Some(username) = username else {
+        return Vec::new();
+    };
+
+    let mut gids = Vec::new();
+    for entry in group_entries {
+        if entry.gid != primary_gid
+            && entry.members.iter().any(|member| member == username)
+            && !gids.contains(&entry.gid)
+        {
+            gids.push(entry.gid);
+        }
+    }
+    gids
+}
+
+fn load_passwd_entries(rootfs: &Path) -> Result<Vec<PasswdEntry>, String> {
+    load_entries(rootfs.join("etc/passwd"), parse_passwd_entries)
+}
+
+fn load_group_entries(rootfs: &Path) -> Result<Vec<GroupEntry>, String> {
+    load_entries(rootfs.join("etc/group"), parse_group_entries)
+}
+
+fn load_entries<T>(
+    path: std::path::PathBuf,
+    parse: impl FnOnce(&str) -> Vec<T>,
+) -> Result<Vec<T>, String> {
+    match fs::read_to_string(&path) {
+        Ok(contents) => Ok(parse(&contents)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(format!("failed to read {}: {}", path.display(), error)),
+    }
+}
+
+fn parse_passwd_entries(contents: &str) -> Vec<PasswdEntry> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+
+            let mut parts = line.splitn(7, ':');
+            let username = parts.next()?;
+            let _password = parts.next()?;
+            let uid = parts.next()?.parse().ok()?;
+            let gid = parts.next()?.parse().ok()?;
+            let _gecos = parts.next()?;
+            let home = parts.next()?;
+            let _shell = parts.next()?;
+
+            Some(PasswdEntry {
+                username: username.to_string(),
+                uid,
+                gid,
+                home: home.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn parse_group_entries(contents: &str) -> Vec<GroupEntry> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+
+            let mut parts = line.splitn(4, ':');
+            let name = parts.next()?;
+            let _password = parts.next()?;
+            let gid = parts.next()?.parse().ok()?;
+            let members = parts
+                .next()
+                .map(|field| {
+                    field
+                        .split(',')
+                        .filter(|member| !member.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            Some(GroupEntry {
+                name: name.to_string(),
+                gid,
+                members,
+            })
+        })
+        .collect()
 }
 
 /// Linux capabilities configuration.
@@ -166,16 +436,25 @@ impl OciSpec {
     /// * `env` - Environment variables as (key, value) pairs
     /// * `workdir` - Working directory inside the container
     /// * `tty` - Whether to allocate a pseudo-terminal
-    pub fn new(command: &[String], env: &[(String, String)], workdir: &str, tty: bool) -> Self {
+    /// * `identity` - Resolved process uid/gid/home for the container
+    pub fn new(
+        command: &[String],
+        env: &[(String, String)],
+        workdir: &str,
+        tty: bool,
+        identity: &ProcessIdentity,
+    ) -> Self {
         // Build environment variables
-        let env_strings: Vec<String> = [
+        let mut env_strings = vec![
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-            "HOME=/root".to_string(),
             "TERM=xterm-256color".to_string(),
-        ]
-        .into_iter()
-        .chain(env.iter().map(|(k, v)| format!("{}={}", k, v)))
-        .collect();
+        ];
+        if !env.iter().any(|(key, _)| key == "HOME") {
+            if let Some(home) = &identity.home {
+                env_strings.push(format!("HOME={home}"));
+            }
+        }
+        env_strings.extend(env.iter().map(|(k, v)| format!("{}={}", k, v)));
 
         // Default capabilities for root containers
         let capabilities = OciCapabilities {
@@ -194,11 +473,7 @@ impl OciSpec {
             },
             process: OciProcess {
                 terminal: tty,
-                user: OciUser {
-                    uid: 0,
-                    gid: 0,
-                    additional_gids: vec![],
-                },
+                user: identity.user.clone(),
                 args: command.to_vec(),
                 env: env_strings,
                 cwd: workdir.to_string(),
@@ -656,6 +931,7 @@ fn default_mounts() -> Vec<OciMount> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_validate_image_reference_valid() {
@@ -725,17 +1001,25 @@ mod tests {
             &[("FOO".to_string(), "bar".to_string())],
             "/",
             false,
+            &ProcessIdentity::root(),
         );
 
         assert_eq!(spec.oci_version, "1.0.2");
         assert_eq!(spec.process.args, vec!["echo", "hello"]);
         assert!(spec.process.env.contains(&"FOO=bar".to_string()));
+        assert!(spec.process.env.contains(&"HOME=/root".to_string()));
         assert!(!spec.process.terminal);
     }
 
     #[test]
     fn test_add_bind_mount() {
-        let mut spec = OciSpec::new(&["sh".to_string()], &[], "/", false);
+        let mut spec = OciSpec::new(
+            &["sh".to_string()],
+            &[],
+            "/",
+            false,
+            &ProcessIdentity::root(),
+        );
         spec.add_bind_mount("/host/path", "/container/path", true);
 
         let mount = spec.mounts.last().unwrap();
@@ -770,6 +1054,66 @@ mod tests {
         assert!(validate_env_vars(&[("FOO.BAR".to_string(), "value".to_string())]).is_err());
         assert!(validate_env_vars(&[("FOO BAR".to_string(), "value".to_string())]).is_err());
         assert!(validate_env_vars(&[("FOO=BAR".to_string(), "value".to_string())]).is_err());
+    }
+
+    #[test]
+    fn test_resolve_process_identity_named_user_uses_passwd_and_groups() {
+        let rootfs = tempdir().unwrap();
+        let etc = rootfs.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(
+            etc.join("passwd"),
+            "root:x:0:0:root:/root:/bin/sh\nsteam:x:1000:1000::/home/steam:/bin/sh\n",
+        )
+        .unwrap();
+        std::fs::write(
+            etc.join("group"),
+            "root:x:0:\nsteam:x:1000:\naudio:x:29:steam\nvideo:x:44:steam\n",
+        )
+        .unwrap();
+
+        let identity = resolve_process_identity(rootfs.path(), Some("steam")).unwrap();
+
+        assert_eq!(identity.user.uid, 1000);
+        assert_eq!(identity.user.gid, 1000);
+        assert_eq!(identity.user.additional_gids, vec![29, 44]);
+        assert_eq!(identity.home.as_deref(), Some("/home/steam"));
+    }
+
+    #[test]
+    fn test_resolve_process_identity_numeric_uid_gid_without_passwd() {
+        let rootfs = tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("etc")).unwrap();
+
+        let identity = resolve_process_identity(rootfs.path(), Some("1234:2345")).unwrap();
+
+        assert_eq!(identity.user.uid, 1234);
+        assert_eq!(identity.user.gid, 2345);
+        assert!(identity.user.additional_gids.is_empty());
+        assert!(identity.home.is_none());
+    }
+
+    #[test]
+    fn test_oci_spec_uses_identity_home_when_env_does_not_override_it() {
+        let spec = OciSpec::new(
+            &["id".to_string()],
+            &[("FOO".to_string(), "bar".to_string())],
+            "/home/steam",
+            false,
+            &ProcessIdentity {
+                user: OciUser {
+                    uid: 1000,
+                    gid: 1000,
+                    additional_gids: vec![29],
+                },
+                home: Some("/home/steam".to_string()),
+            },
+        );
+
+        assert!(spec.process.env.contains(&"HOME=/home/steam".to_string()));
+        assert_eq!(spec.process.user.uid, 1000);
+        assert_eq!(spec.process.user.gid, 1000);
+        assert_eq!(spec.process.user.additional_gids, vec![29]);
     }
 
     #[test]

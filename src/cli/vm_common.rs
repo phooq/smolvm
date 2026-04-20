@@ -224,13 +224,12 @@ pub(crate) fn run_init_commands(
     println!("Running {} init command(s)...", init.len());
     for (i, cmd) in init.iter().enumerate() {
         let (exit_code, stdout, stderr) = if let Some(image) = context.image {
-            let (effective_env, effective_workdir) =
+            let defaults =
                 resolve_image_runtime_defaults(context.image_info, context.env, context.workdir);
             let config = build_init_run_config(
                 image,
                 cmd,
-                &effective_env,
-                effective_workdir.as_deref(),
+                &defaults,
                 context.record_mounts,
                 context.overlay_id,
             );
@@ -273,13 +272,19 @@ fn init_argv(cmd: &str) -> Vec<String> {
 /// Image metadata provides the baseline defaults. Explicit values from the
 /// CLI/Smolfile/persisted machine config override those defaults by key, while
 /// workdir uses the explicit value when present and otherwise falls back to the
-/// image's `WorkingDir`.
-/// TODO: need to ensure using the USER in image as well if image is provided.
+/// image's `WorkingDir`. Image `User` flows through unchanged because there is
+/// no CLI or persisted override for it today.
+pub(crate) struct ImageRuntimeDefaults {
+    pub(crate) env: Vec<(String, String)>,
+    pub(crate) workdir: Option<String>,
+    pub(crate) user: Option<String>,
+}
+
 pub(crate) fn resolve_image_runtime_defaults(
     image_info: Option<&ImageInfo>,
     explicit_env: &[(String, String)],
     explicit_workdir: Option<&str>,
-) -> (Vec<(String, String)>, Option<String>) {
+) -> ImageRuntimeDefaults {
     let mut env = Vec::new();
 
     if let Some(image_info) = image_info {
@@ -296,7 +301,9 @@ pub(crate) fn resolve_image_runtime_defaults(
         .map(str::to_string)
         .or_else(|| image_info.and_then(|info| info.workdir.clone()));
 
-    (env, workdir)
+    let user = image_info.and_then(|info| info.user.clone());
+
+    ImageRuntimeDefaults { env, workdir, user }
 }
 
 pub(crate) fn merge_env_overrides(
@@ -326,15 +333,15 @@ fn apply_env_override(env: &mut Vec<(String, String)>, key: String, value: Strin
 fn build_init_run_config(
     image: &str,
     cmd: &str,
-    env: &[(String, String)],
-    workdir: Option<&str>,
+    defaults: &ImageRuntimeDefaults,
     record_mounts: &[(String, String, bool)],
     overlay_id: &str,
 ) -> smolvm::agent::RunConfig {
     let mounts = crate::cli::parsers::record_mounts_to_runconfig_bindings(record_mounts);
     smolvm::agent::RunConfig::new(image, init_argv(cmd))
-        .with_env(env.to_vec())
-        .with_workdir(workdir.map(|s| s.to_string()))
+        .with_env(defaults.env.clone())
+        .with_workdir(defaults.workdir.clone())
+        .with_user(defaults.user.clone())
         .with_mounts(mounts)
         .with_persistent_overlay(Some(overlay_id.to_string()))
 }
@@ -1390,7 +1397,7 @@ pub fn cleanup_orphaned_ephemeral_vms() {
 mod init_runner_tests {
     use super::*;
 
-    fn sample_image_info(env: Vec<&str>, workdir: Option<&str>) -> ImageInfo {
+    fn sample_image_info(env: Vec<&str>, workdir: Option<&str>, user: Option<&str>) -> ImageInfo {
         ImageInfo {
             reference: "alpine:latest".to_string(),
             digest: "sha256:test".to_string(),
@@ -1404,6 +1411,7 @@ mod init_runner_tests {
             cmd: Vec::new(),
             env: env.into_iter().map(str::to_string).collect(),
             workdir: workdir.map(str::to_string),
+            user: user.map(str::to_string),
         }
     }
 
@@ -1480,7 +1488,17 @@ mod init_runner_tests {
         // succeed but `git --version` post-start would fail with "not
         // found" — exactly the user-confusing regression we're guarding
         // against.
-        let config = build_init_run_config("alpine", "true", &[], None, &[], "my-vm");
+        let config = build_init_run_config(
+            "alpine",
+            "true",
+            &ImageRuntimeDefaults {
+                env: vec![],
+                workdir: None,
+                user: None,
+            },
+            &[],
+            "my-vm",
+        );
         assert_eq!(config.persistent_overlay_id.as_deref(), Some("my-vm"));
     }
 
@@ -1491,11 +1509,21 @@ mod init_runner_tests {
         // refactor, the user's `[dev].env` or `[dev].workdir` would
         // silently stop applying to init.
         let env = vec![("HTTP_PROXY".to_string(), "http://proxy:3128".to_string())];
-        let config =
-            build_init_run_config("debian:slim", "apt update", &env, Some("/work"), &[], "vm");
+        let config = build_init_run_config(
+            "debian:slim",
+            "apt update",
+            &ImageRuntimeDefaults {
+                env: env.clone(),
+                workdir: Some("/work".to_string()),
+                user: Some("steam".to_string()),
+            },
+            &[],
+            "vm",
+        );
         assert_eq!(config.image, "debian:slim");
         assert_eq!(config.env, env);
         assert_eq!(config.workdir.as_deref(), Some("/work"));
+        assert_eq!(config.user.as_deref(), Some("steam"));
         // Command is sh-wrapped; assert the wrapped form arrives.
         assert_eq!(
             config.command,
@@ -1513,7 +1541,17 @@ mod init_runner_tests {
             ("/host/src".to_string(), "/app".to_string(), false),
             ("/host/data".to_string(), "/data".to_string(), true),
         ];
-        let config = build_init_run_config("alpine", "true", &[], None, &mounts, "vm");
+        let config = build_init_run_config(
+            "alpine",
+            "true",
+            &ImageRuntimeDefaults {
+                env: vec![],
+                workdir: None,
+                user: None,
+            },
+            &mounts,
+            "vm",
+        );
         assert_eq!(
             config.mounts,
             vec![
@@ -1529,40 +1567,57 @@ mod init_runner_tests {
         // a valid init invocation. No mounts, no workdir, no env — must
         // still produce a usable RunConfig (vs. e.g. panicking on
         // `unwrap` somewhere in the builder).
-        let config = build_init_run_config("alpine", "echo hi", &[], None, &[], "vm");
+        let config = build_init_run_config(
+            "alpine",
+            "echo hi",
+            &ImageRuntimeDefaults {
+                env: vec![],
+                workdir: None,
+                user: None,
+            },
+            &[],
+            "vm",
+        );
         assert!(config.mounts.is_empty());
         assert!(config.workdir.is_none());
         assert!(config.env.is_empty());
+        assert!(config.user.is_none());
         assert_eq!(config.persistent_overlay_id.as_deref(), Some("vm"));
     }
 
     #[test]
-    fn resolve_image_runtime_defaults_uses_image_env_and_workdir() {
+    fn resolve_image_runtime_defaults_uses_image_env_workdir_and_user() {
         let image_info = sample_image_info(
             vec!["FOO=from-image", "BAR=from-image"],
             Some("/image-workdir"),
+            Some("steam"),
         );
 
-        let (env, workdir) = resolve_image_runtime_defaults(Some(&image_info), &[], None);
+        let defaults = resolve_image_runtime_defaults(Some(&image_info), &[], None);
 
         assert_eq!(
-            env,
+            defaults.env,
             vec![
                 ("FOO".to_string(), "from-image".to_string()),
                 ("BAR".to_string(), "from-image".to_string()),
             ]
         );
-        assert_eq!(workdir.as_deref(), Some("/image-workdir"));
+        assert_eq!(defaults.workdir.as_deref(), Some("/image-workdir"));
+        assert_eq!(defaults.user.as_deref(), Some("steam"));
     }
 
     #[test]
     fn image_workdir_flows_into_init_run_config_when_no_explicit_workdir_is_set() {
-        let image_info = sample_image_info(vec!["FOO=from-image"], Some("/image-workdir"));
-        let (env, workdir) = resolve_image_runtime_defaults(Some(&image_info), &[], None);
-        let config =
-            build_init_run_config("alpine:latest", "pwd", &env, workdir.as_deref(), &[], "vm");
+        let image_info = sample_image_info(
+            vec!["FOO=from-image"],
+            Some("/image-workdir"),
+            Some("steam"),
+        );
+        let defaults = resolve_image_runtime_defaults(Some(&image_info), &[], None);
+        let config = build_init_run_config("alpine:latest", "pwd", &defaults, &[], "vm");
 
         assert_eq!(config.workdir.as_deref(), Some("/image-workdir"));
+        assert_eq!(config.user.as_deref(), Some("steam"));
         assert_eq!(
             config.env,
             vec![("FOO".to_string(), "from-image".to_string())]
@@ -1574,27 +1629,29 @@ mod init_runner_tests {
         let image_info = sample_image_info(
             vec!["FOO=from-image", "BAR=from-image"],
             Some("/image-workdir"),
+            Some("steam"),
         );
         let explicit_env = vec![
             ("BAR".to_string(), "from-cli".to_string()),
             ("BAZ".to_string(), "from-cli".to_string()),
         ];
 
-        let (env, workdir) = resolve_image_runtime_defaults(
+        let defaults = resolve_image_runtime_defaults(
             Some(&image_info),
             &explicit_env,
             Some("/explicit-workdir"),
         );
 
         assert_eq!(
-            env,
+            defaults.env,
             vec![
                 ("FOO".to_string(), "from-image".to_string()),
                 ("BAR".to_string(), "from-cli".to_string()),
                 ("BAZ".to_string(), "from-cli".to_string()),
             ]
         );
-        assert_eq!(workdir.as_deref(), Some("/explicit-workdir"));
+        assert_eq!(defaults.workdir.as_deref(), Some("/explicit-workdir"));
+        assert_eq!(defaults.user.as_deref(), Some("steam"));
     }
 
     #[test]
@@ -1602,33 +1659,36 @@ mod init_runner_tests {
         let image_info = sample_image_info(
             vec!["BROKEN", "=empty-key", "FOO=from-image", "FOO=last-image"],
             Some("/image-workdir"),
+            Some("1000:1000"),
         );
         let explicit_env = vec![
             ("BAR".to_string(), "from-cli".to_string()),
             ("BAR".to_string(), "last-cli".to_string()),
         ];
 
-        let (env, workdir) = resolve_image_runtime_defaults(Some(&image_info), &explicit_env, None);
+        let defaults = resolve_image_runtime_defaults(Some(&image_info), &explicit_env, None);
 
         assert_eq!(
-            env,
+            defaults.env,
             vec![
                 ("FOO".to_string(), "last-image".to_string()),
                 ("BAR".to_string(), "last-cli".to_string()),
             ]
         );
-        assert_eq!(workdir.as_deref(), Some("/image-workdir"));
+        assert_eq!(defaults.workdir.as_deref(), Some("/image-workdir"));
+        assert_eq!(defaults.user.as_deref(), Some("1000:1000"));
     }
 
     #[test]
     fn resolve_image_runtime_defaults_falls_back_to_explicit_values_without_image_info() {
         let explicit_env = vec![("FOO".to_string(), "from-explicit".to_string())];
 
-        let (env, workdir) =
+        let defaults =
             resolve_image_runtime_defaults(None, &explicit_env, Some("/explicit-workdir"));
 
-        assert_eq!(env, explicit_env);
-        assert_eq!(workdir.as_deref(), Some("/explicit-workdir"));
+        assert_eq!(defaults.env, explicit_env);
+        assert_eq!(defaults.workdir.as_deref(), Some("/explicit-workdir"));
+        assert!(defaults.user.is_none());
     }
 
     #[test]

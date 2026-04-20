@@ -113,6 +113,8 @@ pub struct RunConfig {
     pub env: Vec<(String, String)>,
     /// Working directory inside the container.
     pub workdir: Option<String>,
+    /// User to execute as inside the container.
+    pub user: Option<String>,
     /// Volume mounts as (tag, guest_path, read_only) tuples.
     pub mounts: Vec<(String, String, bool)>,
     /// Timeout for command execution.
@@ -132,6 +134,7 @@ impl RunConfig {
             command,
             env: Vec::new(),
             workdir: None,
+            user: None,
             mounts: Vec::new(),
             timeout: None,
             tty: false,
@@ -148,6 +151,12 @@ impl RunConfig {
     /// Set working directory.
     pub fn with_workdir(mut self, workdir: Option<String>) -> Self {
         self.workdir = workdir;
+        self
+    }
+
+    /// Set container user.
+    pub fn with_user(mut self, user: Option<String>) -> Self {
+        self.user = user;
         self
     }
 
@@ -1012,6 +1021,7 @@ impl AgentClient {
             command: config.command,
             env: config.env,
             workdir: config.workdir,
+            user: config.user,
             mounts: config.mounts,
             timeout_ms,
             interactive: false,
@@ -1043,6 +1053,7 @@ impl AgentClient {
                 command: config.command,
                 env: config.env,
                 workdir: config.workdir,
+                user: config.user,
                 mounts: config.mounts,
                 timeout_ms,
                 interactive: true,

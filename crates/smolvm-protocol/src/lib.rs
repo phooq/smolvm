@@ -234,6 +234,9 @@ pub enum AgentRequest {
         env: Vec<(String, String)>,
         /// Working directory inside the rootfs.
         workdir: Option<String>,
+        /// User inside the rootfs. If omitted, the OCI image default applies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user: Option<String>,
         /// Volume mounts to bind into the container.
         /// Each tuple is (virtiofs_tag, container_path, read_only).
         #[serde(default)]
@@ -599,6 +602,9 @@ pub struct ImageInfo {
     /// Image working directory (from OCI config).
     #[serde(default)]
     pub workdir: Option<String>,
+    /// Image default user (from OCI config).
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 /// Overlay preparation result.
