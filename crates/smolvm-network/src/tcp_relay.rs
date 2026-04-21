@@ -503,7 +503,13 @@ fn run_tcp_relay(
         "virtio-net: host TCP relay thread started destination={}",
         destination
     );
-    match tcp_relay_loop(destination, from_smoltcp, to_smoltcp, relay_wake) {
+    match tcp_relay_loop(
+        destination,
+        relay_target,
+        from_smoltcp,
+        to_smoltcp,
+        relay_wake,
+    ) {
         Ok(mode) => {
             virtio_net_log!(
                 "virtio-net: host TCP relay thread exited destination={} mode={:?}",
@@ -525,6 +531,7 @@ fn run_tcp_relay(
 
 fn tcp_relay_loop(
     destination: SocketAddr,
+    relay_target: RelayTarget,
     from_smoltcp: Receiver<Vec<u8>>,
     to_smoltcp: SyncSender<Vec<u8>>,
     relay_wake: Arc<WakePipe>,
