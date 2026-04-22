@@ -38,6 +38,8 @@ OUTPUT_DIR="${POSITIONAL_ARGS[0]:-$PROJECT_ROOT/target/agent-rootfs}"
 
 # Alpine version
 ALPINE_VERSION="3.19"
+ALPINE_RUN_IMAGE="${ALPINE_RUN_IMAGE:-public.ecr.aws/docker/library/alpine:${ALPINE_VERSION}}"
+RUST_BUILD_IMAGE="${RUST_BUILD_IMAGE:-public.ecr.aws/docker/library/rust:alpine}"
 
 # Detect or override architecture
 DETECTED_ARCH="${OVERRIDE_ARCH:-$(uname -m)}"
@@ -68,6 +70,8 @@ CRANE_URL="https://github.com/google/go-containerregistry/releases/download/v${C
 
 echo "Building agent rootfs..."
 echo "  Alpine: ${ALPINE_VERSION} (${ALPINE_ARCH})"
+echo "  Alpine image: ${ALPINE_RUN_IMAGE}"
+echo "  Rust build image: ${RUST_BUILD_IMAGE}"
 echo "  Crane: ${CRANE_VERSION}"
 echo "  Output: ${OUTPUT_DIR}"
 
@@ -184,7 +188,7 @@ elif [[ "$CROSS_ARCH" == "1" ]]; then
     exit 1
 elif command -v smolvm &> /dev/null; then
     echo "  Using smolvm..."
-    smolvm machine run --net -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_VERSION}" \
+    smolvm machine run --net -v "$OUTPUT_DIR:/rootfs" --image "$ALPINE_RUN_IMAGE" \
         -- sh -c "apk add --root /rootfs --initdb --no-cache $APK_PACKAGES"
     echo "Packages installed successfully"
 else
@@ -231,8 +235,8 @@ else
     # Strategy 2: smolvm with rust:alpine (dogfooding)
     if [[ -z "$AGENT_BINARY" ]] || [[ ! -f "$AGENT_BINARY" ]]; then
         if command -v smolvm &> /dev/null; then
-            echo "Building via smolvm (rust:alpine)..."
-            smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image rust:alpine \
+            echo "Building via smolvm (${RUST_BUILD_IMAGE})..."
+            smolvm machine run --net --mem 2048 -v "$PROJECT_ROOT:/work" --image "$RUST_BUILD_IMAGE" \
                 -- sh -c ". /usr/local/cargo/env && apk add musl-dev && cd /work && cargo build --profile $PROFILE -p smolvm-agent"
             AGENT_BINARY="$PROJECT_ROOT/target/$PROFILE/smolvm-agent"
         else
