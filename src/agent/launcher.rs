@@ -10,18 +10,18 @@ use crate::error::{Error, Result};
 use crate::network::backend::{COMPAT_NET_FEATURES, TSI_FEATURE_HIJACK_INET};
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
 use crate::storage::{OverlayDisk, StorageDisk};
-use crate::util::libkrunfw_filename;
+use crate::util::{libkrun_filename, libkrunfw_filename};
 
 use smolvm_network::{
     guest_env, start_virtio_network, GuestNetworkConfig, PortMapping as VirtioPortMapping,
     VirtioNetworkRuntime,
 };
 use smolvm_protocol::ports;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::os::fd::RawFd;
 use std::path::{Path, PathBuf};
 
-use super::{PortMapping, VmResources};
+use super::{KrunFunctions, PortMapping, VmResources};
 
 /// Maximum number of CIDR entries held in the live egress allow-list.
 /// Protects the muxer's per-packet O(n) scan from unbounded growth when
@@ -39,42 +39,7 @@ pub struct VmDisks<'a> {
     pub overlay: Option<&'a OverlayDisk>,
 }
 
-// FFI bindings to libkrun
-extern "C" {
-    fn krun_set_log_level(level: u32) -> i32;
-    fn krun_create_ctx() -> i32;
-    fn krun_free_ctx(ctx: u32);
-    fn krun_set_vm_config(ctx: u32, num_vcpus: u8, ram_mib: u32) -> i32;
-    fn krun_set_root(ctx: u32, root_path: *const libc::c_char) -> i32;
-    fn krun_set_workdir(ctx: u32, workdir: *const libc::c_char) -> i32;
-    fn krun_set_exec(
-        ctx: u32,
-        exec_path: *const libc::c_char,
-        argv: *const *const libc::c_char,
-        envp: *const *const libc::c_char,
-    ) -> i32;
-    fn krun_add_disk2(
-        ctx: u32,
-        block_id: *const libc::c_char,
-        disk_path: *const libc::c_char,
-        disk_format: u32,
-        read_only: bool,
-    ) -> i32;
-    fn krun_add_vsock_port2(
-        ctx: u32,
-        port: u32,
-        filepath: *const libc::c_char,
-        listen: bool,
-    ) -> i32;
-    fn krun_set_console_output(ctx: u32, filepath: *const libc::c_char) -> i32;
-    fn krun_set_port_map(ctx: u32, port_map: *const *const libc::c_char) -> i32;
-    fn krun_add_virtiofs(ctx: u32, tag: *const libc::c_char, path: *const libc::c_char) -> i32;
-    fn krun_start_enter(ctx: u32) -> i32;
-    fn krun_disable_implicit_vsock(ctx: u32) -> i32;
-    fn krun_add_vsock(ctx: u32, tsi_features: u32) -> i32;
-}
-
-/// Find the directory containing libkrunfw by checking explicit overrides and
+/// Find the directory containing libkrun/libkrunfw by checking explicit overrides and
 /// paths relative to the current executable.
 ///
 /// Checks:
@@ -83,17 +48,16 @@ extern "C" {
 /// - `<exe_dir>/../lib/` (alternative layout)
 /// - `<exe_dir>/../../lib/linux-<arch>/` (source tree dev builds)
 pub fn find_lib_dir() -> Option<PathBuf> {
-    let lib_name = libkrunfw_filename();
+    let lib_names = [libkrun_filename(), libkrunfw_filename()];
     if let Ok(explicit_dir) = std::env::var(ENV_SMOLVM_LIB_DIR) {
         let path = PathBuf::from(explicit_dir);
-        if path.join(lib_name).exists() {
+        if lib_names.iter().all(|lib| path.join(lib).exists()) {
             return path.canonicalize().ok().or(Some(path));
         }
 
         tracing::warn!(
             path = %path.display(),
-            lib = lib_name,
-            "{} does not contain the expected libkrunfw library", ENV_SMOLVM_LIB_DIR
+            "{} does not contain the expected libkrun/libkrunfw libraries", ENV_SMOLVM_LIB_DIR
         );
     }
 
@@ -108,46 +72,12 @@ pub fn find_lib_dir() -> Option<PathBuf> {
     ];
 
     for dir in &candidates {
-        if dir.join(lib_name).exists() {
+        if lib_names.iter().all(|lib| dir.join(lib).exists()) {
             return dir.canonicalize().ok();
         }
     }
 
     None
-}
-
-/// Preload libkrunfw with `RTLD_GLOBAL` so libkrun's internal `dlopen("libkrunfw.so.5")` finds it.
-///
-/// Setting `LD_LIBRARY_PATH` via `std::env::set_var` is insufficient because glibc caches
-/// library search paths at process startup and `dlopen()` never re-reads the environment.
-/// Instead, we load libkrunfw ourselves with `RTLD_GLOBAL`, which makes it visible to all
-/// subsequent `dlopen()` calls by soname — matching how `launcher_dynamic.rs` handles this.
-///
-/// This is a no-op if libkrunfw is not found in any candidate directory (e.g., it's already
-/// in a system library path).
-fn preload_libkrunfw() {
-    let Some(lib_dir) = find_lib_dir() else {
-        return;
-    };
-
-    let lib_path = lib_dir.join(libkrunfw_filename());
-    let Ok(lib_path_c) = CString::new(lib_path.to_string_lossy().as_bytes()) else {
-        return;
-    };
-
-    unsafe {
-        let handle = libc::dlopen(lib_path_c.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL);
-        if handle.is_null() {
-            let err = libc::dlerror();
-            let err_msg = if err.is_null() {
-                "unknown error".to_string()
-            } else {
-                CStr::from_ptr(err).to_string_lossy().to_string()
-            };
-            tracing::warn!(path = %lib_path.display(), error = %err_msg, "failed to preload libkrunfw");
-        }
-        // Intentionally leak the handle — libkrunfw must stay loaded for libkrun to use it.
-    }
 }
 
 /// Launch the agent VM (call in the forked child process).
@@ -239,10 +169,32 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
     // Raise file descriptor limits
     raise_fd_limits();
 
-    // Preload libkrunfw so libkrun's internal dlopen can find it
-    preload_libkrunfw();
+    let lib_dir = find_lib_dir().ok_or_else(|| {
+        Error::agent(
+            "find libraries",
+            "libkrun/libkrunfw not found. Install smolvm with bundled libraries or set SMOLVM_LIB_DIR.",
+        )
+    })?;
+    let krun =
+        unsafe { KrunFunctions::load(&lib_dir) }.map_err(|e| Error::agent("load libkrun", e))?;
 
     unsafe {
+        let krun_set_log_level = krun.set_log_level;
+        let krun_create_ctx = krun.create_ctx;
+        let krun_free_ctx = krun.free_ctx;
+        let krun_set_vm_config = krun.set_vm_config;
+        let krun_set_root = krun.set_root;
+        let krun_set_workdir = krun.set_workdir;
+        let krun_set_exec = krun.set_exec;
+        let krun_add_disk2 = krun.add_disk2;
+        let krun_add_vsock_port2 = krun.add_vsock_port2;
+        let krun_set_console_output = krun.set_console_output;
+        let krun_set_port_map = krun.set_port_map;
+        let krun_add_virtiofs = krun.add_virtiofs;
+        let krun_start_enter = krun.start_enter;
+        let krun_disable_implicit_vsock = krun.disable_implicit_vsock;
+        let krun_add_vsock = krun.add_vsock;
+
         // Set log level (0 = off, 1 = error, 2 = warn, 3 = info, 4 = debug)
         // Enable debug logging to trace vsock timing issues
         let log_level = std::env::var(ENV_SMOLVM_KRUN_LOG_LEVEL)
@@ -345,22 +297,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
 
                 if let Some(ref cidrs) = resources.allowed_cidrs {
-                    type SetEgressPolicyFn =
-                        unsafe extern "C" fn(u32, *const *const libc::c_char) -> i32;
-
-                    let sym_name =
-                        CString::new("krun_set_egress_policy").expect("symbol name is static");
-                    let sym = libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr());
-                    if sym.is_null() {
+                    let Some(set_egress) = krun.set_egress_policy else {
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
                             "set egress policy",
                             "libkrun does not support egress policy (krun_set_egress_policy not found). \
                              Update libkrun or remove --allow-cidr flags.",
                         ));
-                    }
-                    #[allow(clippy::missing_transmute_annotations)]
-                    let set_egress: SetEgressPolicyFn = std::mem::transmute(sym);
+                    };
 
                     let mut all_cidrs = cidrs.clone();
                     crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
@@ -386,7 +330,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 None
             }
             EffectiveNetworkBackend::VirtioNet => {
-                let add_net_unixstream = load_krun_add_net_unixstream().ok_or_else(|| {
+                let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                     Error::agent(
                         "configure virtio-net",
                         "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi",
@@ -712,13 +656,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Each cycle: resolve all hosts → build fresh list → single write-lock
         // swap. If all hosts fail to resolve, the previous list is kept intact.
         if let Some(hosts) = egress_refresh_hosts.as_ref().filter(|h| !h.is_empty()) {
-            type GetHandleFn = unsafe extern "C" fn(u32) -> *mut libc::c_void;
-            let get_sym = CString::new("krun_get_egress_handle").expect("symbol name is static");
-            let get_ptr = libc::dlsym(libc::RTLD_DEFAULT, get_sym.as_ptr());
-
-            if !get_ptr.is_null() {
-                #[allow(clippy::missing_transmute_annotations)]
-                let krun_get_egress_handle: GetHandleFn = std::mem::transmute(get_ptr);
+            if let Some(krun_get_egress_handle) = krun.get_egress_handle {
                 let raw_handle = krun_get_egress_handle(ctx);
 
                 if !raw_handle.is_null() {
@@ -805,21 +743,6 @@ fn cstr(s: &str) -> CString {
 fn path_to_cstring(path: &Path) -> Result<CString> {
     CString::new(path.to_string_lossy().as_bytes())
         .map_err(|_| Error::agent("convert path", "path contains null byte"))
-}
-
-type AddNetUnixstreamFn =
-    unsafe extern "C" fn(u32, *const libc::c_char, libc::c_int, *mut u8, u32, u32) -> i32;
-
-fn load_krun_add_net_unixstream() -> Option<AddNetUnixstreamFn> {
-    let sym_name = CString::new("krun_add_net_unixstream").expect("symbol name is static");
-    // SAFETY: `RTLD_DEFAULT` searches already loaded libraries.
-    let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr()) };
-    if sym.is_null() {
-        None
-    } else {
-        #[allow(clippy::missing_transmute_annotations)]
-        Some(unsafe { std::mem::transmute(sym) })
-    }
 }
 
 fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
