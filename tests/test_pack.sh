@@ -14,6 +14,30 @@
 source "$(dirname "$0")/common.sh"
 init_smolvm
 
+# Pack tests must not inherit the repo-local libkrun search path from
+# common.sh. Packed stubs are expected to start without host-provided libkrun.
+if [[ "$(uname -s)" == "Linux" ]]; then
+    repo_lib_dir="$PROJECT_ROOT/lib/linux-$(uname -m)"
+    if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
+        filtered_ld_library_path=""
+        IFS=':' read -r -a ld_library_path_entries <<< "$LD_LIBRARY_PATH"
+        for entry in "${ld_library_path_entries[@]}"; do
+            [[ "$entry" == "$repo_lib_dir" ]] && continue
+            if [[ -z "$filtered_ld_library_path" ]]; then
+                filtered_ld_library_path="$entry"
+            else
+                filtered_ld_library_path="${filtered_ld_library_path}:$entry"
+            fi
+        done
+
+        if [[ -n "$filtered_ld_library_path" ]]; then
+            export LD_LIBRARY_PATH="$filtered_ld_library_path"
+        else
+            unset LD_LIBRARY_PATH
+        fi
+    fi
+fi
+
 # Pre-flight: Kill any existing smolvm processes that might hold database lock
 log_info "Pre-flight cleanup: killing orphan processes..."
 kill_orphan_smolvm_processes
