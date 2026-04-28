@@ -2540,11 +2540,18 @@ fn extract_registry_from_image(image: &str) -> String {
     if let Some(slash_pos) = image.find('/') {
         let potential_registry = &image[..slash_pos];
         if potential_registry.contains('.') || potential_registry.contains(':') {
-            return potential_registry.to_string();
+            return docker_config_registry_key(potential_registry).to_string();
         }
     }
     // Docker Hub uses this URL in config.json
     "https://index.docker.io/v1/".to_string()
+}
+
+fn docker_config_registry_key(registry: &str) -> &str {
+    match registry {
+        "docker.io" | "index.docker.io" | "registry-1.docker.io" => "https://index.docker.io/v1/",
+        _ => registry,
+    }
 }
 
 /// Simple base64 encoding for auth string.
@@ -2839,6 +2846,42 @@ mod tests {
         assert_eq!(
             sanitize_image_name("ghcr.io/owner/repo@sha256:abc123"),
             "ghcr.io_owner_repo_sha256_abc123"
+        );
+    }
+
+    #[test]
+    fn test_extract_registry_from_image_normalizes_docker_hub() {
+        assert_eq!(
+            extract_registry_from_image("alpine:latest"),
+            "https://index.docker.io/v1/"
+        );
+        assert_eq!(
+            extract_registry_from_image("library/alpine:latest"),
+            "https://index.docker.io/v1/"
+        );
+        assert_eq!(
+            extract_registry_from_image("docker.io/nginxinc/nginx-unprivileged:stable-alpine"),
+            "https://index.docker.io/v1/"
+        );
+        assert_eq!(
+            extract_registry_from_image("index.docker.io/library/alpine:latest"),
+            "https://index.docker.io/v1/"
+        );
+        assert_eq!(
+            extract_registry_from_image("registry-1.docker.io/library/alpine:latest"),
+            "https://index.docker.io/v1/"
+        );
+    }
+
+    #[test]
+    fn test_extract_registry_from_image_preserves_non_docker_hub_registry() {
+        assert_eq!(
+            extract_registry_from_image("ghcr.io/owner/repo:tag"),
+            "ghcr.io"
+        );
+        assert_eq!(
+            extract_registry_from_image("registry.example.com:5000/image:tag"),
+            "registry.example.com:5000"
         );
     }
 
